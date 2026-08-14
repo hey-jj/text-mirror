@@ -5,9 +5,26 @@
 # version must match the version in formats.toml and is recorded in
 # every manifest record as rules_version.
 
-version = "1"
+version = "2"
 
 [[converters]]
 id = "text-passthrough"
 version = "1.0.0"
 formats = ["text", "markdown", "csv"]
+
+[[converters]]
+id = "anydoc-document"
+version = "1.0.0"
+formats = ["docx", "doc", "pptx", "ppt", "rtf", "odt", "odp", "epub", "pdf"]
+
+[[converters]]
+id = "workbook-ir"
+version = "1.0.0"
+formats = ["xls", "xlsx", "xlsm", "ods"]
+
+# Spreadsheet formats with no row and column visibility reader yet.
+# They record unsupported with this reason until a reader lands, and
+# the rules bump that lands one re-runs every such record.
+[[unsupported]]
+reason = "hidden-visibility-unresolved"
+formats = ["xlsb", "xla", "xlam"]

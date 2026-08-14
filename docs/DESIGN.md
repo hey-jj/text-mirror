@@ -26,6 +26,14 @@ Fail closed everywhere. A format no converter claims, a converter error, a timeo
 
 Determinism: `rules/converters.toml` pins converter versions, model hashes, and decode options. The registry is data, so a rules bump is a visible versioned event, and same inputs plus same rules re-run byte-identical. All output is UTF-8, NFC-normalized, LF line endings. Normalization is NFC. NFKC is prohibited because it rewrites identifiers.
 
+In-process coverage today: the text-native passthrough, a document adapter for Office documents, presentations, rich text, OpenDocument files, EPUB, and text-layer PDF, and a workbook converter for xls, xlsx, xlsm, and ods. A PDF with no extractable text layer fails with reason `pdf_no_text_layer`. Failed records re-run every pass, so those files convert automatically once an OCR converter lands.
+
+Legacy Office conversions run a differential check against a second, independent extraction. Agreement is silent, and disagreement appends a structured warning while the artifact stands. When the primary extracted under half of what the secondary found, the conversion fails with reason `differential-divergence`, because an artifact missing that much content must not present as converted. A secondary crash appends `differential-unavailable` and never sinks a sound primary conversion.
+
+Workbooks render cell values row by row, and a formula cell renders its cached value with the formula as inert text, never evaluated. Hidden sheets, rows, and columns render inline, unmarked. The marks live out of band in the segments file: a span for every sheet with its hidden flag, and hidden-true spans over hidden rows and hidden-column cells. A workbook whose visibility cannot be resolved fails instead of emitting unmarked content, and a spreadsheet format with no visibility reader yet records `unsupported` with reason `hidden-visibility-unresolved` in the error field.
+
+Each segments record is one JSONL line with these fields: `schema` (the literal `text-mirror/segments@1`), `kind` (`span`, or the zero-width boundaries `page`, `sheet`, `slide`), `start` and `end` as half-open offsets, `unit` (`utf8_bytes`), and the optional `source` (`document`, `sheet`, `row`, `column`), `name`, and `hidden`. Records are ordered by start, then end. A passthrough text file emits one whole-file `document` span, so every converted artifact has a segments file.
+
 ## The mirror tree
 
 The mirror parallels the source tree exactly, with the text extension appended: `Q3 Budget.xlsx` becomes `Q3 Budget.xlsx.txt`. Appending preserves source identity and keeps sources that differ only by extension from colliding on one output path.

@@ -23,6 +23,7 @@ pub mod manifest;
 pub mod mirror;
 pub mod pipeline;
 pub mod report;
+pub mod segments;
 pub mod walk;
 
 /// Errors returned by this library.

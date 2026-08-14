@@ -4,7 +4,40 @@
 //! `rules/converters.toml` maps format ids to converters. A format no
 //! converter claims is unsupported. A converter error or invalid
 //! output is a failure with a machine-readable reason and no text
-//! artifact. There is no silent skip and no silently empty file.
+//! artifact. There is no silent skip and no silently empty file. A
+//! non-empty source that converts to empty text fails with reason
+//! `empty_output` in every converter.
+//!
+//! In-process conversion runs under a panic boundary and explicit
+//! ceilings that apply before allocation in this crate's own code:
+//! the source size before read, the decompressed size of every
+//! archive part and compound stream, the cell extent of every sheet
+//! before the workbook parser runs, and the rendered output size. A
+//! caught panic or an exceeded ceiling becomes one failed record and
+//! the run continues. The panic boundary requires the default
+//! `panic = "unwind"` profile. A downstream `panic = "abort"` build
+//! turns any converter panic into process death, so keep unwinding
+//! enabled wherever this crate converts untrusted bytes.
+
+/// Ceiling on source bytes read for conversion, checked before read.
+pub const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Ceiling on the decompressed bytes of one archive part or one
+/// compound file stream.
+pub const MAX_PART_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Ceiling on rendered artifact text bytes.
+pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Ceiling on 0-based row indexes in one sheet.
+pub const MAX_SHEET_ROWS: u32 = 1_048_576;
+
+/// Ceiling on 0-based column indexes in one sheet.
+pub const MAX_SHEET_COLUMNS: u32 = 16_384;
+
+/// Ceiling on the row-column product of one sheet, checked from the
+/// source's own references before the workbook parser allocates.
+pub const MAX_SHEET_CELLS: u64 = 10_000_000;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -12,7 +45,20 @@ use std::fmt;
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::segments::Segment;
 use crate::{Error, Result};
+
+mod differential;
+mod document;
+mod visibility;
+mod workbook;
+
+pub use differential::{
+    DiffMetrics, DiffVerdict, DifferentialOutcome, compare_texts, normalize_for_diff,
+};
+pub use document::{AnydocDocument, markdown_to_plain};
+pub use visibility::{IndexRange, SheetVisibility, WorkbookVisibility, read_visibility};
+pub use workbook::WorkbookIr;
 
 /// What every converter returns on success.
 #[derive(Debug, Clone)]
@@ -27,6 +73,8 @@ pub struct Outcome {
     pub text: String,
     /// Non-fatal notes about the conversion.
     pub warnings: Vec<String>,
+    /// Structure spans over `text` for the segments file.
+    pub segments: Vec<Segment>,
 }
 
 /// A conversion failure with a machine-readable reason.
@@ -131,12 +179,14 @@ impl Converter for PlainTextPassthrough {
                 message: format!("source is {source_len} bytes but conversion produced no text"),
             });
         }
+        let segments = vec![Segment::span(0, text.len(), "document")];
         Ok(Outcome {
             converter_id: PASSTHROUGH_ID.to_string(),
             converter_version: PASSTHROUGH_VERSION.to_string(),
             detected_format: detected_format.to_string(),
             text,
             warnings,
+            segments,
         })
     }
 }
@@ -146,6 +196,8 @@ impl Converter for PlainTextPassthrough {
 struct RawRegistry {
     version: String,
     converters: Vec<RawEntry>,
+    #[serde(default)]
+    unsupported: Vec<RawUnsupported>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +205,13 @@ struct RawRegistry {
 struct RawEntry {
     id: String,
     version: String,
+    formats: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUnsupported {
+    reason: String,
     formats: Vec<String>,
 }
 
@@ -165,12 +224,16 @@ pub struct Registry {
     version: String,
     converters: Vec<Box<dyn Converter>>,
     by_format: HashMap<String, usize>,
+    unsupported_reasons: HashMap<String, String>,
 }
 
 impl Registry {
     /// The registry compiled into the binary from `rules/converters.toml`.
     pub fn builtin() -> Result<Self> {
-        Self::parse(include_str!("../rules/converters.toml"), "converters.toml")
+        Self::parse(
+            include_str!("../../rules/converters.toml"),
+            "converters.toml",
+        )
     }
 
     /// Parses a registry and binds entries to implementations.
@@ -184,6 +247,8 @@ impl Registry {
         for entry in &raw.converters {
             let converter: Box<dyn Converter> = match entry.id.as_str() {
                 PASSTHROUGH_ID => Box::new(PlainTextPassthrough),
+                document::ANYDOC_ID => Box::new(AnydocDocument),
+                workbook::WORKBOOK_ID => Box::new(WorkbookIr),
                 other => {
                     return Err(Error::Rules {
                         name: name.to_string(),
@@ -213,10 +278,26 @@ impl Registry {
                 }
             }
         }
+        let mut unsupported_reasons = HashMap::new();
+        for entry in &raw.unsupported {
+            for format in &entry.formats {
+                if by_format.contains_key(format)
+                    || unsupported_reasons
+                        .insert(format.clone(), entry.reason.clone())
+                        .is_some()
+                {
+                    return Err(Error::Rules {
+                        name: name.to_string(),
+                        message: format!("format {format:?} claimed twice"),
+                    });
+                }
+            }
+        }
         Ok(Registry {
             version: raw.version,
             converters,
             by_format,
+            unsupported_reasons,
         })
     }
 
@@ -230,6 +311,38 @@ impl Registry {
         self.by_format
             .get(format_id)
             .map(|index| self.converters[*index].as_ref())
+    }
+
+    /// The declared reason a format is unsupported, when the registry
+    /// names one, such as a spreadsheet format with no visibility
+    /// reader yet.
+    pub fn unsupported_reason(&self, format_id: &str) -> Option<&str> {
+        self.unsupported_reasons.get(format_id).map(String::as_str)
+    }
+
+    /// A registry built directly from converter instances, for tests
+    /// that need behavior no shipped converter exhibits, such as a
+    /// panicking converter.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        version: &str,
+        entries: Vec<(Box<dyn Converter>, Vec<&str>)>,
+    ) -> Registry {
+        let mut converters = Vec::new();
+        let mut by_format = HashMap::new();
+        for (converter, formats) in entries {
+            let index = converters.len();
+            converters.push(converter);
+            for format in formats {
+                by_format.insert(format.to_string(), index);
+            }
+        }
+        Registry {
+            version: version.to_string(),
+            converters,
+            by_format,
+            unsupported_reasons: HashMap::new(),
+        }
     }
 }
 
@@ -283,12 +396,20 @@ mod tests {
     #[test]
     fn builtin_registry_claims_the_text_family() {
         let registry = Registry::builtin().unwrap();
-        assert_eq!(registry.version(), "1");
+        assert_eq!(registry.version(), "2");
         assert!(registry.converter_for("text").is_some());
         assert!(registry.converter_for("markdown").is_some());
         assert!(registry.converter_for("csv").is_some());
-        assert!(registry.converter_for("pdf").is_none());
+        assert!(registry.converter_for("pdf").is_some());
+        assert!(registry.converter_for("docx").is_some());
+        assert!(registry.converter_for("xlsx").is_some());
         assert!(registry.converter_for("html").is_none());
+        assert!(registry.converter_for("xlsb").is_none());
+        assert_eq!(
+            registry.unsupported_reason("xlsb"),
+            Some("hidden-visibility-unresolved")
+        );
+        assert_eq!(registry.unsupported_reason("html"), None);
     }
 
     #[test]

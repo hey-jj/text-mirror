@@ -5,7 +5,7 @@
 # rules_version, so a change here is a visible versioned event. It must
 # match the version in converters.toml.
 
-version = "1"
+version = "2"
 
 [[formats]]
 id = "text"
@@ -28,6 +28,31 @@ name = "Comma-separated values"
 extensions = ["csv"]
 
 [[formats]]
+id = "rtf"
+name = "Rich Text Format"
+extensions = ["rtf"]
+
+[[formats]]
+id = "odt"
+name = "OpenDocument text"
+extensions = ["odt"]
+
+[[formats]]
+id = "ods"
+name = "OpenDocument spreadsheet"
+extensions = ["ods"]
+
+[[formats]]
+id = "odp"
+name = "OpenDocument presentation"
+extensions = ["odp"]
+
+[[formats]]
+id = "epub"
+name = "EPUB ebook"
+extensions = ["epub"]
+
+[[formats]]
 id = "docx"
 name = "Office Open XML document"
 extensions = ["docx"]
@@ -36,6 +61,26 @@ extensions = ["docx"]
 id = "xlsx"
 name = "Office Open XML spreadsheet"
 extensions = ["xlsx"]
+
+[[formats]]
+id = "xlsm"
+name = "Office Open XML macro-enabled spreadsheet"
+extensions = ["xlsm"]
+
+[[formats]]
+id = "xlsb"
+name = "Excel binary spreadsheet"
+extensions = ["xlsb"]
+
+[[formats]]
+id = "xla"
+name = "Excel legacy add-in"
+extensions = ["xla"]
+
+[[formats]]
+id = "xlam"
+name = "Excel macro-enabled add-in"
+extensions = ["xlam"]
 
 [[formats]]
 id = "pptx"

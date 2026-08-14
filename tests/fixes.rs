@@ -76,24 +76,36 @@ fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<String>)> {
     out
 }
 
-// B1: identical bytes under a format no converter claims must not
-// borrow the canonical artifact.
+// B1: identical bytes under a format handled by a different converter
+// must not borrow the canonical artifact.
 #[test]
 fn dedup_respects_format_ownership() {
     let setup = setup();
     fs::write(setup.root.join("a.txt"), "shared payload\n").unwrap();
     fs::write(setup.root.join("b.pdf"), "shared payload\n").unwrap();
+    fs::write(setup.root.join("c.xlsb"), "shared payload\n").unwrap();
 
     let rules = Rules::builtin().unwrap();
     let report = run(&setup, &rules);
     assert_eq!(report.counts.converted, 1);
     assert_eq!(report.counts.dedup, 0);
-    assert_eq!(report.counts.unsupported, 1);
 
-    let duplicate = terminal(&setup, "b.pdf");
-    assert_eq!(duplicate.status, Status::Unsupported);
-    assert!(duplicate.text_path.is_none());
+    // The pdf converter owns b.pdf, and these bytes are no pdf.
+    let pdf = terminal(&setup, "b.pdf");
+    assert_eq!(pdf.status, Status::Failed);
+    assert!(pdf.text_path.is_none());
     assert!(!setup.mirror.join("b.pdf.txt").exists());
+
+    // No converter claims xlsb, so it cannot borrow the artifact
+    // either, and it carries the declared interim reason.
+    let unclaimed = terminal(&setup, "c.xlsb");
+    assert_eq!(unclaimed.status, Status::Unsupported);
+    assert_eq!(
+        unclaimed.error.as_deref(),
+        Some("hidden-visibility-unresolved")
+    );
+    assert!(unclaimed.text_path.is_none());
+    assert!(!setup.mirror.join("c.xlsb.txt").exists());
 }
 
 // B2 and B4: a seed from another rules version never becomes the
@@ -144,7 +156,7 @@ fn stale_seed_is_ignored_and_dedup_hashes_written_bytes() {
     // The rules bump reconverted the canonical instead of trusting it.
     let canonical = terminal(&setup, "a.txt");
     assert_eq!(canonical.status, Status::Converted);
-    assert_eq!(canonical.rules_version, "1");
+    assert_eq!(canonical.rules_version, "2");
     assert_eq!(
         fs::read_to_string(setup.mirror.join("a.txt.txt")).unwrap(),
         "payload\n"

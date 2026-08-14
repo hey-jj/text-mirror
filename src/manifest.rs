@@ -163,7 +163,9 @@ pub struct Record {
     /// Non-fatal notes from conversion.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
-    /// Machine-readable reason for a `failed` record.
+    /// Machine-readable reason for a `failed` record, or the declared
+    /// capability gap on an `unsupported` record. Forbidden on every
+    /// other status.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
     /// Wall-clock milliseconds spent on this source.
@@ -187,13 +189,18 @@ impl Record {
     /// A record with a text-bearing status must carry `text_path` and
     /// `text_hash`. A `failed` or `unsupported` record must not. A
     /// `dedup` record must name `dedup_of`, and a `failed` record must
-    /// name `error`.
+    /// name `error`. An `unsupported` record may carry `error` to name
+    /// a declared capability gap, such as a spreadsheet format with no
+    /// visibility reader yet.
     pub fn validate(&self) -> std::result::Result<(), String> {
         let name = status_name(self.status);
         match self.status {
             Status::Converted | Status::SkippedUnchanged | Status::Dedup => {
                 if self.text_path.is_none() || self.text_hash.is_none() {
                     return Err(format!("status {name} requires text_path and text_hash"));
+                }
+                if self.error.is_some() {
+                    return Err(format!("status {name} forbids error"));
                 }
             }
             Status::Failed | Status::Unsupported => {
@@ -607,5 +614,27 @@ mod tests {
         let bad = serde_json::to_string(&dedup).unwrap();
         std::fs::write(&path, format!("{bad}\n")).unwrap();
         assert!(read_shard(&path).is_err());
+    }
+
+    #[test]
+    fn error_is_forbidden_on_success_statuses() {
+        for status in [Status::Converted, Status::SkippedUnchanged, Status::Dedup] {
+            let mut record = sample_record();
+            record.status = status;
+            if status == Status::Dedup {
+                record.dedup_of = Some("other.txt".to_string());
+            }
+            record.error = Some("stray reason".to_string());
+            let message = record.validate().unwrap_err();
+            assert!(message.contains("forbids error"), "{message}");
+        }
+
+        // Unsupported may carry the declared capability gap.
+        let mut unsupported = sample_record();
+        unsupported.status = Status::Unsupported;
+        unsupported.text_path = None;
+        unsupported.text_hash = None;
+        unsupported.error = Some("hidden-visibility-unresolved".to_string());
+        unsupported.validate().unwrap();
     }
 }

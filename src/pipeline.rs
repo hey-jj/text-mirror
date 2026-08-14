@@ -19,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::convert::Registry;
+use crate::convert::{self, Registry};
 use crate::detect::{self, Detection, FormatTable, UNKNOWN_FORMAT};
 use crate::hash::{self, CanonicalArtifact, DedupIndex};
 use crate::manifest::{self, ArtifactKind, ManifestSchema, ManifestWriter, Record, Status};
@@ -28,6 +28,7 @@ use crate::report::{
     DivisionStatus, ExplainEntry, FormatCount, RunReport, ScanReport, SizeOutlier, StatusCounts,
     StatusReport,
 };
+use crate::segments;
 use crate::walk::{self, EntryKind, WalkOptions};
 use crate::{Error, Result};
 
@@ -346,19 +347,37 @@ fn record_outcome(
     Ok(())
 }
 
-/// Removes any artifact left behind for a source whose terminal
-/// outcome carries no text, so the mirror never contradicts the
-/// manifest.
-fn remove_stale_artifact(text_absolute: &Path, record: &mut Record) {
-    match fs::remove_file(text_absolute) {
-        Ok(()) => {}
-        Err(e)
-            if e.kind() == std::io::ErrorKind::NotFound
-                || e.kind() == std::io::ErrorKind::NotADirectory => {}
-        Err(e) => record
-            .warnings
-            .push(format!("stale_artifact_not_removed: {e}")),
+/// Removes any artifact and segments file left behind for a source
+/// whose terminal outcome carries no text, so the mirror never
+/// contradicts the manifest.
+fn remove_stale_artifact(text_absolute: &Path, segments_absolute: &Path, record: &mut Record) {
+    for stale in [text_absolute, segments_absolute] {
+        match fs::remove_file(stale) {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::NotADirectory => {}
+            Err(e) => record
+                .warnings
+                .push(format!("stale_artifact_not_removed: {e}")),
+        }
     }
+}
+
+/// True when an artifact and its sidecar still match the recorded
+/// hash: the text bytes hash to `text_hash` and the sidecar parses as
+/// segments@1 and validates against the text.
+fn envelope_intact(artifact: &Path, text_hash: &str, segments_path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(artifact) else {
+        return false;
+    };
+    if hash::hash_bytes(text.as_bytes()) != text_hash {
+        return false;
+    }
+    let Ok(sidecar) = fs::read_to_string(segments_path) else {
+        return false;
+    };
+    segments::parse_jsonl(&sidecar).is_ok_and(|segs| segments::validate(&segs, &text).is_ok())
 }
 
 fn source_front(absolute: &Path, table: &FormatTable) -> Result<(String, u64, Detection)> {
@@ -411,6 +430,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
         let relative = &entry.path;
         let absolute = options.root.join(relative);
         let text_absolute = mirror::mirror_path(options.mirror_root, relative);
+        let segments_absolute = segments::segments_path(options.mirror_root, relative);
 
         if entry.kind == EntryKind::Other {
             special_entries += 1;
@@ -436,7 +456,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
             );
             record.error = Some("non_utf8_path: source path is not valid UTF-8".to_string());
             record.duration_ms = Some(elapsed_ms(started));
-            remove_stale_artifact(&text_absolute, &mut record);
+            remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
             record_outcome(&mut writer, &mut terminal, &mut counts, record)?;
             continue;
         };
@@ -473,7 +493,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                 }
             };
             record.duration_ms = Some(elapsed_ms(started));
-            remove_stale_artifact(&text_absolute, &mut record);
+            remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
             record_outcome(&mut writer, &mut terminal, &mut counts, record)?;
             continue;
         }
@@ -496,7 +516,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                 );
                 record.error = Some(format!("source_io_error: {e}"));
                 record.duration_ms = Some(elapsed_ms(started));
-                remove_stale_artifact(&text_absolute, &mut record);
+                remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
                 record_outcome(&mut writer, &mut terminal, &mut counts, record)?;
                 continue;
             }
@@ -518,7 +538,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                 let intact = match (&previous.text_path, &previous.text_hash) {
                     (Some(text_path), Some(text_hash)) => {
                         let artifact = options.mirror_root.join(text_path);
-                        hash::hash_file(&artifact).is_ok_and(|actual| actual == *text_hash)
+                        envelope_intact(&artifact, text_hash, &segments_absolute)
                     }
                     _ => false,
                 };
@@ -544,10 +564,21 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
             })
         {
             let canonical = canonical.clone();
-            let canonical_absolute = options.mirror_root.join(&canonical.text_path);
-            // An unreadable canonical artifact falls through to a real
-            // conversion of this source.
-            if let Ok(text) = fs::read_to_string(&canonical_absolute) {
+            let canonical_text = options.mirror_root.join(&canonical.text_path);
+            let canonical_segments =
+                segments::segments_path(options.mirror_root, Path::new(&canonical.source_path));
+            // The canonical pair must still match its record: text
+            // bytes hashing to the recorded hash and a sidecar that
+            // validates against them. A tampered or unreadable
+            // canonical falls through to a real conversion instead of
+            // propagating.
+            if let (Ok(text), Ok(segment_lines)) = (
+                fs::read_to_string(&canonical_text),
+                fs::read_to_string(&canonical_segments),
+            ) && hash::hash_bytes(text.as_bytes()) == canonical.text_hash
+                && segments::parse_jsonl(&segment_lines)
+                    .is_ok_and(|segs| segments::validate(&segs, &text).is_ok())
+            {
                 let mut record = new_record(
                     &source_path,
                     &source_hash,
@@ -556,7 +587,9 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                     rules.version(),
                     Status::Dedup,
                 );
-                match mirror::write_atomic(&text_absolute, &text) {
+                match mirror::write_atomic(&text_absolute, &text)
+                    .and_then(|()| mirror::write_atomic(&segments_absolute, &segment_lines))
+                {
                     Ok(()) => {
                         record.text_path = Some(text_relative);
                         record.text_hash = Some(hash::hash_bytes(text.as_bytes()));
@@ -568,7 +601,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                     Err(e) => {
                         record.status = Status::Failed;
                         record.error = Some(format!("mirror_write_error: {e}"));
-                        remove_stale_artifact(&text_absolute, &mut record);
+                        remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
                     }
                 }
                 record.duration_ms = Some(elapsed_ms(started));
@@ -586,8 +619,12 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                 rules.version(),
                 Status::Unsupported,
             );
+            record.error = rules
+                .registry
+                .unsupported_reason(&detection.detected)
+                .map(str::to_string);
             record.duration_ms = Some(elapsed_ms(started));
-            remove_stale_artifact(&text_absolute, &mut record);
+            remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
             record_outcome(&mut writer, &mut terminal, &mut counts, record)?;
             continue;
         };
@@ -602,21 +639,53 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
         );
         // One byte snapshot feeds both the recorded hash and the
         // converter, so the record describes exactly what converted.
-        let outcome = fs::read(&absolute)
-            .map_err(|e| format!("source_io_error: read: {e}"))
-            .and_then(|bytes| {
-                if hash::hash_bytes(&bytes) != source_hash {
-                    return Err(
-                        "source_changed_during_run: bytes changed between hash and conversion"
-                            .to_string(),
-                    );
-                }
-                converter
-                    .convert(&bytes, &detection.detected)
-                    .map_err(|e| e.to_string())
-            });
+        // The size ceiling applies before the read, the converter runs
+        // under a panic boundary, and the outcome must pass the output
+        // ceiling and segments validation before anything is written.
+        let outcome = if source_size > convert::MAX_SOURCE_BYTES {
+            Err(format!(
+                "resource_limit: source is {source_size} bytes over the {} byte ceiling",
+                convert::MAX_SOURCE_BYTES
+            ))
+        } else {
+            fs::read(&absolute)
+                .map_err(|e| format!("source_io_error: read: {e}"))
+                .and_then(|bytes| {
+                    if hash::hash_bytes(&bytes) != source_hash {
+                        return Err(
+                            "source_changed_during_run: bytes changed between hash and conversion"
+                                .to_string(),
+                        );
+                    }
+                    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        converter.convert(&bytes, &detection.detected)
+                    }));
+                    match guarded {
+                        Ok(result) => result.map_err(|e| e.to_string()),
+                        Err(_) => Err("converter_panic: conversion panicked".to_string()),
+                    }
+                })
+                .and_then(|outcome| {
+                    if outcome.text.len() > convert::MAX_OUTPUT_BYTES {
+                        return Err(format!(
+                            "resource_limit: output is {} bytes over the {} byte ceiling",
+                            outcome.text.len(),
+                            convert::MAX_OUTPUT_BYTES
+                        ));
+                    }
+                    segments::validate(&outcome.segments, &outcome.text)
+                        .map_err(|detail| format!("invalid_segments: {detail}"))?;
+                    Ok(outcome)
+                })
+        };
         match outcome {
-            Ok(outcome) => match mirror::write_atomic(&text_absolute, &outcome.text) {
+            Ok(outcome) => match segments::to_jsonl(&outcome.segments)
+                .map_err(|e| e.to_string())
+                .and_then(|lines| {
+                    mirror::write_atomic(&text_absolute, &outcome.text)
+                        .and_then(|()| mirror::write_atomic(&segments_absolute, &lines))
+                        .map_err(|e| e.to_string())
+                }) {
                 Ok(()) => {
                     let text_hash = hash::hash_bytes(outcome.text.as_bytes());
                     record.text_path = Some(text_relative.clone());
@@ -637,12 +706,12 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                         },
                     );
                 }
-                Err(e) => {
+                Err(detail) => {
                     record.status = Status::Failed;
                     record.converter_id = Some(converter.id().to_string());
                     record.converter_version = Some(converter.version().to_string());
-                    record.error = Some(format!("mirror_write_error: {e}"));
-                    remove_stale_artifact(&text_absolute, &mut record);
+                    record.error = Some(format!("mirror_write_error: {detail}"));
+                    remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
                 }
             },
             Err(reason) => {
@@ -650,7 +719,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                 record.converter_id = Some(converter.id().to_string());
                 record.converter_version = Some(converter.version().to_string());
                 record.error = Some(reason);
-                remove_stale_artifact(&text_absolute, &mut record);
+                remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
             }
         }
         record.duration_ms = Some(elapsed_ms(started));
@@ -751,7 +820,163 @@ mod tests {
     #[test]
     fn builtin_rules_agree_on_a_version() {
         let rules = Rules::builtin().unwrap();
-        assert_eq!(rules.version(), "1");
+        assert_eq!(rules.version(), "2");
+    }
+
+    use crate::convert::{ConvertError, Converter, Outcome, PlainTextPassthrough};
+    use crate::segments::Segment;
+
+    /// A converter that panics, for the boundary test. No shipped
+    /// converter panics on purpose, so the test registry injects one.
+    struct PanicConverter;
+
+    impl Converter for PanicConverter {
+        fn id(&self) -> &'static str {
+            "panic-test"
+        }
+        fn version(&self) -> &'static str {
+            "1.0.0"
+        }
+        fn convert(
+            &self,
+            _source: &[u8],
+            _detected_format: &str,
+        ) -> std::result::Result<Outcome, ConvertError> {
+            panic!("deliberate test panic");
+        }
+    }
+
+    /// A converter whose segments do not fit its text.
+    struct BadSegmentsConverter;
+
+    impl Converter for BadSegmentsConverter {
+        fn id(&self) -> &'static str {
+            "bad-segments-test"
+        }
+        fn version(&self) -> &'static str {
+            "1.0.0"
+        }
+        fn convert(
+            &self,
+            _source: &[u8],
+            detected_format: &str,
+        ) -> std::result::Result<Outcome, ConvertError> {
+            Ok(Outcome {
+                converter_id: self.id().to_string(),
+                converter_version: self.version().to_string(),
+                detected_format: detected_format.to_string(),
+                text: "ok".to_string(),
+                warnings: Vec::new(),
+                segments: vec![Segment::span(0, 999, "document")],
+            })
+        }
+    }
+
+    fn injected_rules() -> Rules {
+        let table = FormatTable::parse(
+            r#"
+version = "9"
+
+[[formats]]
+id = "text"
+name = "Plain text"
+extensions = ["txt"]
+
+[[formats]]
+id = "panicfmt"
+name = "Panic trigger"
+extensions = ["panicfmt"]
+
+[[formats]]
+id = "badseg"
+name = "Bad segments trigger"
+extensions = ["badseg"]
+"#,
+            "formats.toml",
+        )
+        .unwrap();
+        let registry = Registry::for_tests(
+            "9",
+            vec![
+                (Box::new(PlainTextPassthrough), vec!["text"]),
+                (Box::new(PanicConverter), vec!["panicfmt"]),
+                (Box::new(BadSegmentsConverter), vec!["badseg"]),
+            ],
+        );
+        Rules { table, registry }
+    }
+
+    #[test]
+    fn a_panicking_converter_fails_one_source_and_the_division_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("boom.panicfmt"), "trigger\n").unwrap();
+        fs::write(root.join("fine.txt"), "safe content\n").unwrap();
+
+        let rules = injected_rules();
+        let report = run(
+            &rules,
+            &RunOptions {
+                root: &root,
+                mirror_root: &dir.path().join("mirror"),
+                manifest_dir: &dir.path().join("manifest"),
+                division: "unit",
+                walk: WalkOptions::default(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.counts.failed, 1);
+        assert_eq!(report.counts.converted, 1);
+        let records = manifest::read_shard(&dir.path().join("manifest/unit.jsonl"))
+            .unwrap()
+            .records;
+        let failed = records.iter().find(|r| r.status == Status::Failed).unwrap();
+        assert_eq!(failed.source_path, "boom.panicfmt");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("converter_panic")
+        );
+        assert!(!dir.path().join("mirror/boom.panicfmt.txt").exists());
+    }
+
+    #[test]
+    fn invalid_segments_from_a_converter_fail_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("bad.badseg"), "trigger\n").unwrap();
+
+        let rules = injected_rules();
+        let report = run(
+            &rules,
+            &RunOptions {
+                root: &root,
+                mirror_root: &dir.path().join("mirror"),
+                manifest_dir: &dir.path().join("manifest"),
+                division: "unit",
+                walk: WalkOptions::default(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.counts.failed, 1);
+        let records = manifest::read_shard(&dir.path().join("manifest/unit.jsonl"))
+            .unwrap()
+            .records;
+        assert!(
+            records[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("invalid_segments")
+        );
+        assert!(!dir.path().join("mirror/bad.badseg.txt").exists());
+        assert!(!dir.path().join("mirror/bad.badseg.segments.jsonl").exists());
     }
 
     #[test]
