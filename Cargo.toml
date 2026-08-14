@@ -1,0 +1,18 @@
+[package]
+name = "text-mirror"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Converts binary and rich files into text and builds a replica text-mirror tree with a provenance manifest"
+keywords = ["conversion", "text-extraction", "corpus", "provenance", "manifest"]
+categories = ["command-line-utilities", "parsing"]
+
+[lib]
+name = "text_mirror"
+path = "src/lib.rs"
+
+[[bin]]
+name = "text-mirror"
+path = "src/main.rs"
+
+[dependencies]
