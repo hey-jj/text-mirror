@@ -114,7 +114,7 @@ fn pdf_converts_behind_the_runner_and_records_the_subprocess_converter() {
     assert_eq!(record.converter_id.as_deref(), Some("pdf-subprocess"));
     assert_eq!(record.converter_version.as_deref(), Some("1.0.0"));
     assert_eq!(record.rules_version, "3");
-    let text = fs::read_to_string(setup.mirror.join("brief.pdf.txt")).unwrap();
+    let text = fs::read_to_string(setup.mirror.join("alpha/brief.pdf.txt")).unwrap();
     assert!(text.contains("Runner carried text"), "text: {text:?}");
 }
 
@@ -191,7 +191,7 @@ fn a_scanned_pdf_fails_closed_behind_the_runner() {
         "error: {:?}",
         record.error
     );
-    assert!(!setup.mirror.join("scan.pdf.txt").exists());
+    assert!(!setup.mirror.join("alpha/scan.pdf.txt").exists());
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn media_formats_record_unsupported_with_engine_unpinned() {
         );
         assert!(record.text_path.is_none(), "{source} has no artifact");
         assert!(
-            !setup.mirror.join(format!("{source}.txt")).exists(),
+            !setup.mirror.join(format!("alpha/{source}.txt")).exists(),
             "{source} wrote no text file"
         );
     }

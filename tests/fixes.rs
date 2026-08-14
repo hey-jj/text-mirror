@@ -94,7 +94,7 @@ fn dedup_respects_format_ownership() {
     let pdf = terminal(&setup, "b.pdf");
     assert_eq!(pdf.status, Status::Failed);
     assert!(pdf.text_path.is_none());
-    assert!(!setup.mirror.join("b.pdf.txt").exists());
+    assert!(!setup.mirror.join("alpha/b.pdf.txt").exists());
 
     // No converter claims xlsb, so it cannot borrow the artifact
     // either, and it carries the declared interim reason.
@@ -105,7 +105,7 @@ fn dedup_respects_format_ownership() {
         Some("hidden-visibility-unresolved")
     );
     assert!(unclaimed.text_path.is_none());
-    assert!(!setup.mirror.join("c.xlsb.txt").exists());
+    assert!(!setup.mirror.join("alpha/c.xlsb.txt").exists());
 }
 
 // B2 and B4: a seed from another rules version never becomes the
@@ -118,8 +118,8 @@ fn stale_seed_is_ignored_and_dedup_hashes_written_bytes() {
 
     // A prior shard from an older rules version, whose recorded text
     // hash matches nothing on disk.
-    fs::create_dir_all(&setup.mirror).unwrap();
-    fs::write(setup.mirror.join("a.txt.txt"), "old artifact\n").unwrap();
+    fs::create_dir_all(setup.mirror.join("alpha")).unwrap();
+    fs::write(setup.mirror.join("alpha/a.txt.txt"), "old artifact\n").unwrap();
     let stale = Record {
         schema: ManifestSchema,
         source_path: "a.txt".to_string(),
@@ -129,7 +129,7 @@ fn stale_seed_is_ignored_and_dedup_hashes_written_bytes() {
         detected_format: "text".to_string(),
         format_mismatch: false,
         status: Status::Converted,
-        text_path: Some("a.txt.txt".to_string()),
+        text_path: Some("alpha/a.txt.txt".to_string()),
         text_hash: Some(hash::hash_bytes(b"old artifact\n")),
         artifact_kind: Some(ArtifactKind::Text),
         converter_id: Some("text-passthrough".to_string()),
@@ -158,7 +158,7 @@ fn stale_seed_is_ignored_and_dedup_hashes_written_bytes() {
     assert_eq!(canonical.status, Status::Converted);
     assert_eq!(canonical.rules_version, "3");
     assert_eq!(
-        fs::read_to_string(setup.mirror.join("a.txt.txt")).unwrap(),
+        fs::read_to_string(setup.mirror.join("alpha/a.txt.txt")).unwrap(),
         "payload\n"
     );
 
@@ -167,7 +167,7 @@ fn stale_seed_is_ignored_and_dedup_hashes_written_bytes() {
     let duplicate = terminal(&setup, "b.txt");
     assert_eq!(duplicate.status, Status::Dedup);
     assert_eq!(duplicate.dedup_of.as_deref(), Some("a.txt"));
-    let written = fs::read(setup.mirror.join("b.txt.txt")).unwrap();
+    let written = fs::read(setup.mirror.join("alpha/b.txt.txt")).unwrap();
     assert_eq!(
         duplicate.text_hash.as_deref(),
         Some(hash::hash_bytes(&written).as_str())
@@ -191,8 +191,8 @@ fn vanished_canonical_falls_through_to_conversion() {
 
     // The canonical source and both artifacts disappear.
     fs::remove_file(setup.root.join("a.txt")).unwrap();
-    fs::remove_file(setup.mirror.join("a.txt.txt")).unwrap();
-    fs::remove_file(setup.mirror.join("b.txt.txt")).unwrap();
+    fs::remove_file(setup.mirror.join("alpha/a.txt.txt")).unwrap();
+    fs::remove_file(setup.mirror.join("alpha/b.txt.txt")).unwrap();
 
     let report = run(&setup, &rules);
     assert_eq!(report.counts.converted, 1);
@@ -201,7 +201,7 @@ fn vanished_canonical_falls_through_to_conversion() {
     let record = terminal(&setup, "b.txt");
     assert_eq!(record.status, Status::Converted);
     assert_eq!(
-        fs::read_to_string(setup.mirror.join("b.txt.txt")).unwrap(),
+        fs::read_to_string(setup.mirror.join("alpha/b.txt.txt")).unwrap(),
         "twin content\n"
     );
 }
@@ -242,7 +242,7 @@ fn stale_artifact_is_removed_after_a_failed_outcome() {
 
     let rules = Rules::builtin().unwrap();
     run(&setup, &rules);
-    assert!(setup.mirror.join("report.txt.txt").is_file());
+    assert!(setup.mirror.join("alpha/report.txt.txt").is_file());
 
     fs::write(&source, b"broken \xff bytes").unwrap();
     let report = run(&setup, &rules);
@@ -251,7 +251,7 @@ fn stale_artifact_is_removed_after_a_failed_outcome() {
     let record = terminal(&setup, "report.txt");
     assert_eq!(record.status, Status::Failed);
     assert!(record.text_path.is_none());
-    assert!(!setup.mirror.join("report.txt.txt").exists());
+    assert!(!setup.mirror.join("alpha/report.txt.txt").exists());
 }
 
 // B7: a mirror path collision fails one source and the run continues.
@@ -364,7 +364,7 @@ fn symlink_entries_are_recorded_not_skipped() {
     assert_eq!(record.source_hash, hash::hash_bytes(b"real.txt"));
     assert_eq!(record.source_size, "real.txt".len() as u64);
     assert!(record.text_path.is_none());
-    assert!(!setup.mirror.join("link.txt.txt").exists());
+    assert!(!setup.mirror.join("alpha/link.txt.txt").exists());
 }
 
 // B11 and F3: output roots inside the division root are refused
@@ -539,13 +539,13 @@ fn corrupted_artifact_is_reconverted_not_skipped() {
 
     let rules = Rules::builtin().unwrap();
     run(&setup, &rules);
-    fs::write(setup.mirror.join("a.txt.txt"), "tampered\n").unwrap();
+    fs::write(setup.mirror.join("alpha/a.txt.txt"), "tampered\n").unwrap();
 
     let report = run(&setup, &rules);
     assert_eq!(report.counts.skipped_unchanged, 0);
     assert_eq!(report.counts.converted, 1);
     assert_eq!(
-        fs::read_to_string(setup.mirror.join("a.txt.txt")).unwrap(),
+        fs::read_to_string(setup.mirror.join("alpha/a.txt.txt")).unwrap(),
         "true content\n"
     );
 }

@@ -9,14 +9,17 @@
 //!   still exits 0, because those are recorded outcomes.
 //! - 1: the verb could not complete. stdout carries `{"error": ...}`.
 //! - 2: usage error from argument parsing.
-//! - 3: the verb is not yet implemented. stdout carries
-//!   `{"error": "not_implemented"}`.
+//! - 3: the verb examined its input and refused it. stdout carries
+//!   `{"error": "refused", "verb": ..., "problems": [...]}` naming
+//!   every offender: a failed bundle verification, a torn shard at
+//!   packaging time, or a rejected merge input.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use text_mirror::bundle;
 use text_mirror::pipeline::{self, Rules, RunOptions};
 use text_mirror::walk::WalkOptions;
 
@@ -67,23 +70,33 @@ enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
-    /// Package a division for handoff (not yet implemented)
+    /// Package one division into a self-contained bundle
     Bundle {
-        /// Ignored until the verb ships
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-        args: Vec<String>,
+        /// The division to package
+        division: String,
+        /// The mirror tree root the run wrote into
+        #[arg(long)]
+        mirror: PathBuf,
+        /// The directory holding manifest shards
+        #[arg(long)]
+        manifest: PathBuf,
+        /// The bundle output directory, created empty
+        #[arg(long)]
+        output: PathBuf,
     },
-    /// Check a bundle on the receiving side (not yet implemented)
+    /// Check a bundle on the receiving side
     Verify {
-        /// Ignored until the verb ships
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-        args: Vec<String>,
+        /// The bundle root to verify
+        bundle: PathBuf,
     },
-    /// Combine per-division bundles (not yet implemented)
+    /// Combine verified per-division bundles into one
     Merge {
-        /// Ignored until the verb ships
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-        args: Vec<String>,
+        /// Two or more input bundle roots
+        #[arg(required = true, num_args = 2..)]
+        inputs: Vec<PathBuf>,
+        /// The merged bundle output directory, created empty
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -120,8 +133,27 @@ fn execute(command: Command) -> Result<String, text_mirror::Error> {
             let entries = pipeline::explain(&manifest, &path)?;
             serde_json::to_string_pretty(&entries)
         }
-        Command::Bundle { .. } | Command::Verify { .. } | Command::Merge { .. } => {
-            unreachable!("handled before execute")
+        Command::Bundle {
+            division,
+            mirror,
+            manifest,
+            output,
+        } => {
+            let report = bundle::bundle(&bundle::BundleOptions {
+                mirror_root: &mirror,
+                manifest_dir: &manifest,
+                division: &division,
+                output: &output,
+            })?;
+            serde_json::to_string_pretty(&report)
+        }
+        Command::Verify { bundle: root } => {
+            let report = bundle::verify(&root)?;
+            serde_json::to_string_pretty(&report)
+        }
+        Command::Merge { inputs, output } => {
+            let report = bundle::merge(&inputs, &output)?;
+            serde_json::to_string_pretty(&report)
         }
     };
     json.map_err(|e| text_mirror::Error::Encode {
@@ -132,17 +164,17 @@ fn execute(command: Command) -> Result<String, text_mirror::Error> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if matches!(
-        cli.command,
-        Command::Bundle { .. } | Command::Verify { .. } | Command::Merge { .. }
-    ) {
-        println!("{}", serde_json::json!({ "error": "not_implemented" }));
-        return ExitCode::from(3);
-    }
     match execute(cli.command) {
         Ok(json) => {
             println!("{json}");
             ExitCode::SUCCESS
+        }
+        Err(text_mirror::Error::Refused { verb, problems }) => {
+            println!(
+                "{}",
+                serde_json::json!({ "error": "refused", "verb": verb, "problems": problems })
+            );
+            ExitCode::from(3)
         }
         Err(e) => {
             println!("{}", serde_json::json!({ "error": e.to_string() }));

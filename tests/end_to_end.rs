@@ -59,14 +59,14 @@ fn run_converts_skips_and_counts_the_true_denominator() {
     // The mirror parallels the source tree with .txt appended, and
     // conversion normalized CRLF to LF.
     assert_eq!(
-        fs::read_to_string(mirror.join("docs/crlf.txt.txt")).unwrap(),
+        fs::read_to_string(mirror.join("alpha/docs/crlf.txt.txt")).unwrap(),
         "line one\nline two\n"
     );
-    assert!(mirror.join("docs/notes.md.txt").is_file());
-    assert!(mirror.join("docs/sub/table.csv.txt").is_file());
-    assert!(mirror.join("docs/dup-b.txt.txt").is_file());
-    assert!(!mirror.join("image.png.txt").exists());
-    assert!(!mirror.join("broken.txt.txt").exists());
+    assert!(mirror.join("alpha/docs/notes.md.txt").is_file());
+    assert!(mirror.join("alpha/docs/sub/table.csv.txt").is_file());
+    assert!(mirror.join("alpha/docs/dup-b.txt.txt").is_file());
+    assert!(!mirror.join("alpha/image.png.txt").exists());
+    assert!(!mirror.join("alpha/broken.txt.txt").exists());
 
     let shard = manifest_dir.join("alpha.jsonl");
     let after_first = manifest::read_shard(&shard).unwrap().records;
@@ -80,7 +80,7 @@ fn run_converts_skips_and_counts_the_true_denominator() {
     assert_eq!(duplicate.status, Status::Dedup);
     assert_eq!(duplicate.dedup_of.as_deref(), Some("docs/dup-b.txt"));
     assert_eq!(
-        fs::read_to_string(mirror.join("dup-a.txt.txt")).unwrap(),
+        fs::read_to_string(mirror.join("alpha/dup-a.txt.txt")).unwrap(),
         "duplicate payload\n"
     );
 
@@ -140,7 +140,7 @@ fn run_converts_skips_and_counts_the_true_denominator() {
     assert_eq!(third.counts.converted, 1);
     assert_eq!(third.counts.skipped_unchanged, 4);
     assert_eq!(
-        fs::read_to_string(mirror.join("docs/crlf.txt.txt")).unwrap(),
+        fs::read_to_string(mirror.join("alpha/docs/crlf.txt.txt")).unwrap(),
         "revised\n"
     );
 }

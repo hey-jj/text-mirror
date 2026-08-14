@@ -160,7 +160,7 @@ pub fn scan(root: &Path, rules: &Rules, options: &WalkOptions) -> Result<ScanRep
     })
 }
 
-fn validate_division(name: &str) -> Result<()> {
+pub(crate) fn validate_division(name: &str) -> Result<()> {
     let usable = !name.is_empty()
         && name
             .chars()
@@ -429,8 +429,9 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
         let started = Instant::now();
         let relative = &entry.path;
         let absolute = options.root.join(relative);
-        let text_absolute = mirror::mirror_path(options.mirror_root, relative);
-        let segments_absolute = segments::segments_path(options.mirror_root, relative);
+        let text_absolute = mirror::mirror_path(options.mirror_root, options.division, relative);
+        let segments_absolute =
+            segments::segments_path(options.mirror_root, options.division, relative);
 
         if entry.kind == EntryKind::Other {
             special_entries += 1;
@@ -537,8 +538,9 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
             if key_matches && has_text {
                 let intact = match (&previous.text_path, &previous.text_hash) {
                     (Some(text_path), Some(text_hash)) => {
-                        let artifact = options.mirror_root.join(text_path);
-                        envelope_intact(&artifact, text_hash, &segments_absolute)
+                        mirror::resolve_recorded_path(options.mirror_root, text_path).is_ok_and(
+                            |artifact| envelope_intact(&artifact, text_hash, &segments_absolute),
+                        )
                     }
                     _ => false,
                 };
@@ -553,7 +555,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
             }
         }
 
-        let text_relative = format!("{source_path}.txt");
+        let text_relative = mirror::recorded_text_path(options.division, &source_path);
 
         // Dedup: identical bytes already converted once, by the same
         // converter that would handle this source.
@@ -564,18 +566,23 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
             })
         {
             let canonical = canonical.clone();
-            let canonical_text = options.mirror_root.join(&canonical.text_path);
-            let canonical_segments =
-                segments::segments_path(options.mirror_root, Path::new(&canonical.source_path));
-            // The canonical pair must still match its record: text
-            // bytes hashing to the recorded hash and a sidecar that
-            // validates against them. A tampered or unreadable
-            // canonical falls through to a real conversion instead of
-            // propagating.
-            if let (Ok(text), Ok(segment_lines)) = (
-                fs::read_to_string(&canonical_text),
-                fs::read_to_string(&canonical_segments),
-            ) && hash::hash_bytes(text.as_bytes()) == canonical.text_hash
+            let canonical_segments = segments::segments_path(
+                options.mirror_root,
+                options.division,
+                Path::new(&canonical.source_path),
+            );
+            // The canonical pair must still match its record: a
+            // resolvable recorded path, text bytes hashing to the
+            // recorded hash, and a sidecar that validates against
+            // them. Anything tampered, malformed, or unreadable falls
+            // through to a real conversion instead of propagating.
+            if let Ok(canonical_text) =
+                mirror::resolve_recorded_path(options.mirror_root, &canonical.text_path)
+                && let (Ok(text), Ok(segment_lines)) = (
+                    fs::read_to_string(&canonical_text),
+                    fs::read_to_string(&canonical_segments),
+                )
+                && hash::hash_bytes(text.as_bytes()) == canonical.text_hash
                 && segments::parse_jsonl(&segment_lines)
                     .is_ok_and(|segs| segments::validate(&segs, &text).is_ok())
             {
@@ -941,7 +948,7 @@ extensions = ["badseg"]
                 .unwrap()
                 .starts_with("converter_panic")
         );
-        assert!(!dir.path().join("mirror/boom.panicfmt.txt").exists());
+        assert!(!dir.path().join("mirror/unit/boom.panicfmt.txt").exists());
     }
 
     #[test]
@@ -975,8 +982,12 @@ extensions = ["badseg"]
                 .unwrap()
                 .starts_with("invalid_segments")
         );
-        assert!(!dir.path().join("mirror/bad.badseg.txt").exists());
-        assert!(!dir.path().join("mirror/bad.badseg.segments.jsonl").exists());
+        assert!(!dir.path().join("mirror/unit/bad.badseg.txt").exists());
+        assert!(
+            !dir.path()
+                .join("mirror/unit/bad.badseg.segments.jsonl")
+                .exists()
+        );
     }
 
     #[test]
@@ -1051,7 +1062,8 @@ extensions = ["badseg"]
         assert_eq!(duplicate.dedup_of.as_deref(), Some("first.txt"));
         assert_eq!(duplicate.text_hash, canonical.text_hash);
 
-        let mirrored = fs::read_to_string(dir.path().join("mirror/sub/second.txt.txt")).unwrap();
+        let mirrored =
+            fs::read_to_string(dir.path().join("mirror/unit/sub/second.txt.txt")).unwrap();
         assert_eq!(mirrored, "same bytes\n");
     }
 }

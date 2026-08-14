@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error as ThisError;
 
+pub mod bundle;
 pub mod convert;
 pub mod detect;
 pub mod hash;
@@ -125,6 +126,17 @@ pub enum Error {
     Layout {
         /// What is wrong with the layout.
         message: String,
+    },
+
+    /// A bundle verb examined its input and refused it, naming every
+    /// offender. Refusal is an outcome, distinct from a verb that
+    /// could not run.
+    #[error("{verb} refused: {}", problems.join("; "))]
+    Refused {
+        /// The verb that refused.
+        verb: &'static str,
+        /// Every offending file, record, or field.
+        problems: Vec<String>,
     },
 }
 

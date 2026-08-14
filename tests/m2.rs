@@ -326,7 +326,7 @@ fn terminal(setup: &Setup, source_path: &str) -> Record {
 }
 
 fn read_segments(setup: &Setup, source_path: &str) -> Vec<Segment> {
-    let path = segments::segments_path(&setup.mirror, Path::new(source_path));
+    let path = segments::segments_path(&setup.mirror, "alpha", Path::new(source_path));
     fs::read_to_string(path)
         .unwrap()
         .lines()
@@ -335,7 +335,7 @@ fn read_segments(setup: &Setup, source_path: &str) -> Vec<Segment> {
 }
 
 fn artifact(setup: &Setup, source_path: &str) -> String {
-    fs::read_to_string(setup.mirror.join(format!("{source_path}.txt"))).unwrap()
+    fs::read_to_string(setup.mirror.join(format!("alpha/{source_path}.txt"))).unwrap()
 }
 
 fn slice<'a>(text: &'a str, segment: &Segment) -> &'a str {
@@ -556,7 +556,7 @@ fn pdf_text_layer_converts_and_scanned_pdf_fails_closed() {
         "error: {:?}",
         scanned.error
     );
-    assert!(!setup.mirror.join("scan.pdf.txt").exists());
+    assert!(!setup.mirror.join("alpha/scan.pdf.txt").exists());
 
     // Failed records re-evaluate every run, so the scanned PDF is
     // retried and converts automatically once OCR lands.
@@ -603,7 +603,7 @@ fn corrupt_worksheet_visibility_fails_instead_of_unmarked_content() {
         error.starts_with("visibility_read_error") || error.starts_with("workbook_parse_error"),
         "error: {error}"
     );
-    assert!(!setup.mirror.join("broken.xlsx.txt").exists());
+    assert!(!setup.mirror.join("alpha/broken.xlsx.txt").exists());
 }
 
 #[test]
@@ -832,7 +832,7 @@ fn corrupted_sidecar_reconverts_at_checkpoint_time() {
     let rules = Rules::builtin().unwrap();
     run(&setup, &rules);
 
-    let sidecar = setup.mirror.join("plain.txt.segments.jsonl");
+    let sidecar = setup.mirror.join("alpha/plain.txt.segments.jsonl");
     fs::write(&sidecar, "not segments at all\n").unwrap();
 
     let report = run(&setup, &rules);
@@ -859,9 +859,9 @@ fn tampered_canonical_falls_through_to_conversion() {
     // The canonical source leaves the tree, its artifact is tampered
     // with, and the duplicate's envelope is removed.
     fs::remove_file(setup.root.join("a.txt")).unwrap();
-    fs::write(setup.mirror.join("a.txt.txt"), "tampered payload\n").unwrap();
-    fs::remove_file(setup.mirror.join("b.txt.txt")).unwrap();
-    fs::remove_file(setup.mirror.join("b.txt.segments.jsonl")).unwrap();
+    fs::write(setup.mirror.join("alpha/a.txt.txt"), "tampered payload\n").unwrap();
+    fs::remove_file(setup.mirror.join("alpha/b.txt.txt")).unwrap();
+    fs::remove_file(setup.mirror.join("alpha/b.txt.segments.jsonl")).unwrap();
 
     let report = run(&setup, &rules);
     assert_eq!(report.counts.converted, 1);
@@ -869,7 +869,7 @@ fn tampered_canonical_falls_through_to_conversion() {
     let record = terminal(&setup, "b.txt");
     assert_eq!(record.status, Status::Converted);
     assert_eq!(
-        fs::read_to_string(setup.mirror.join("b.txt.txt")).unwrap(),
+        fs::read_to_string(setup.mirror.join("alpha/b.txt.txt")).unwrap(),
         "twin payload\n"
     );
 }

@@ -131,7 +131,8 @@ pub struct Record {
     pub format_mismatch: bool,
     /// The recorded outcome.
     pub status: Status,
-    /// Text artifact path relative to the mirror root.
+    /// Text artifact path relative to the mirror root, beginning with
+    /// the record's division segment: `<division>/<source_path>.txt`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub text_path: Option<String>,
     /// Lowercase hex BLAKE3 hash of the text artifact bytes.
@@ -362,6 +363,37 @@ pub fn read_shard(path: &Path) -> Result<Shard> {
     Ok(Shard { records, warnings })
 }
 
+/// Reads a shard with no torn-line tolerance.
+///
+/// The producer's own resume path tolerates one torn final line, the
+/// footprint of a killed run. A bundle must not: a torn tail means an
+/// interrupted run and a possibly incomplete division, so packaging
+/// and receiving both refuse it. Every line must parse as a complete
+/// record and the shard must end with a newline, the clean-write
+/// property bundle@1 declares.
+pub fn read_shard_strict(path: &Path) -> Result<Vec<Record>> {
+    let bytes = fs::read(path).map_err(|e| Error::io("read", path, e))?;
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        return Err(Error::Manifest {
+            path: path.to_path_buf(),
+            line: 0,
+            message: "shard does not end with a newline, resume the run to complete the division"
+                .to_string(),
+        });
+    }
+    let shard = read_shard(path)?;
+    if let Some(warning) = shard.warnings.first() {
+        return Err(Error::Manifest {
+            path: path.to_path_buf(),
+            line: 0,
+            message: format!(
+                "shard has a torn final line ({warning}), resume the run to complete the division"
+            ),
+        });
+    }
+    Ok(shard.records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +516,25 @@ mod tests {
         let shard = read_shard(&path).unwrap();
         assert_eq!(shard.records.len(), 1);
         assert!(shard.warnings.is_empty());
+    }
+
+    #[test]
+    fn read_shard_strict_rejects_an_unterminated_final_record() {
+        // The tolerant reader above accepts this shape for the
+        // producer's resume path. The strict reader enforces the
+        // clean-write property itself, with no caller byte checks.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("division.jsonl");
+        let good = serde_json::to_string(&sample_record()).unwrap();
+        std::fs::write(&path, &good).unwrap();
+        let err = read_shard_strict(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("does not end with a newline"),
+            "{err}"
+        );
+
+        std::fs::write(&path, format!("{good}\n")).unwrap();
+        assert_eq!(read_shard_strict(&path).unwrap().len(), 1);
     }
 
     #[test]

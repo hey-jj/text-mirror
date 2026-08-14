@@ -129,8 +129,12 @@ impl Segment {
 
 /// Maps a source path to its segments file in the mirror, the full
 /// source name plus `.segments.jsonl`.
-pub fn segments_path(mirror_root: &Path, relative_source: &Path) -> std::path::PathBuf {
-    let mut mapped = mirror::mirror_path(mirror_root, relative_source);
+pub fn segments_path(
+    mirror_root: &Path,
+    division: &str,
+    relative_source: &Path,
+) -> std::path::PathBuf {
+    let mut mapped = mirror::mirror_path(mirror_root, division, relative_source);
     let mut name = mapped
         .file_name()
         .map(std::ffi::OsString::from)
@@ -230,10 +234,10 @@ mod tests {
 
     #[test]
     fn segments_path_swaps_the_txt_suffix() {
-        let path = segments_path(Path::new("/m"), Path::new("a/Q3 Budget.xlsx"));
+        let path = segments_path(Path::new("/m"), "emea", Path::new("a/Q3 Budget.xlsx"));
         assert_eq!(
             path,
-            std::path::PathBuf::from("/m/a/Q3 Budget.xlsx.segments.jsonl")
+            std::path::PathBuf::from("/m/emea/a/Q3 Budget.xlsx.segments.jsonl")
         );
     }
 
