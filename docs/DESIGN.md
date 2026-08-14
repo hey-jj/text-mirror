@@ -51,6 +51,7 @@ Security-scan binding: when a scan verdict is recorded for a source, it binds th
 
 Append-only JSONL, sharded per division: `manifest/<division>.jsonl`. One record per source file per outcome. Fields:
 
+- `schema`: the literal string `text-mirror/manifest@1`, the first field of every record
 - source path (relative to the division root), source hash, source size
 - declared and detected format, mismatch flag
 - `status`: `converted`, `failed`, `unsupported`, `skipped_unchanged`, `dedup`
@@ -59,6 +60,8 @@ Append-only JSONL, sharded per division: `manifest/<division>.jsonl`. One record
 - converter id and version, tool version, rules version
 - optional `media` block: duration, language, model id and hash, decode-options hash, speaker count
 - `parent_source`, `dedup_of`, warnings, error, duration
+
+Every record self-describes its schema, so a shard separated from its bundle stays verifiable. A consumer must reject any record whose `schema` value it does not recognize. After manifest@1 freezes, any change to the record field set, including an addition, bumps the version to manifest@2. Strict consumers reject unknown fields, so additive changes are breaking.
 
 Incremental and idempotent: the manifest is the checkpoint. The key is (source_path, source_hash, converter_version, rules_version). A match means `skipped_unchanged` with no work done. Traversal is sorted, so a killed run resumes by re-walking and skipping completed records, with no separate journal to corrupt. Path plus size plus mtime is never sufficient to skip.
 
@@ -81,9 +84,9 @@ On-screen text is deduplicated by screen state before it enters the transcript, 
 
 ## Two-machine bundle handoff
 
-Conversion and consumption can run on different machines. The interface is a self-contained bundle from `text-mirror bundle`: the mirror tree (text only, source binaries never leave the conversion machine), the manifest shards, the `rules/` snapshot that produced them, and a `BUNDLE.json` with run ids, divisions, counts, coverage, and a top-level hash over a per-artifact checksum file.
+Conversion and consumption can run on different machines. The interface is a self-contained bundle from `text-mirror bundle`: the mirror tree (text only, source binaries never leave the conversion machine), the manifest shards, the `rules/` snapshot that produced them, and a `BUNDLE.json` with `schema` (`text-mirror/bundle@1`), `manifest_schema` (`text-mirror/manifest@1`), run ids, divisions, counts, coverage, and a top-level hash over a per-artifact checksum file.
 
-The receiving machine runs `text-mirror verify <bundle>` first. It recomputes every artifact hash, confirms every manifest text path exists and matches, and confirms coverage denominators. Any mismatch refuses the bundle and names the failed records. Bundles are per-division and mergeable, so divisions transfer as they complete. Failed and unsupported records travel in the manifest, so the receiver always knows the true denominator and the enumerated unconverted remainder.
+The receiving machine runs `text-mirror verify <bundle>` first. Verify refuses a bundle whose `schema`, `manifest_schema`, or any record `schema` value it does not recognize. It recomputes every artifact hash, confirms every manifest text path exists and matches, and confirms coverage denominators. Any mismatch refuses the bundle and names the failed records. Bundles are per-division and mergeable, so divisions transfer as they complete. Failed and unsupported records travel in the manifest, so the receiver always knows the true denominator and the enumerated unconverted remainder.
 
 ## CLI
 
@@ -105,4 +108,4 @@ Media conversion dominates wall-clock time, so AV runs as its own pass within a 
 
 ## Relationship to data-classification
 
-The `data-classification` crate consumes the bundle, mirror plus manifest, and never source binaries. Each eval item is a manifest record. The classifier reads the text path for content and carries source hash, detected format, `artifact_kind`, and converter provenance into its evidence, so every finding traces back to the original file by hash. Downstream crates take the manifest serde types from this crate.
+The `data-classification` crate consumes the bundle, mirror plus manifest, and never source binaries. Each eval item is a manifest record. The classifier reads the text path for content and carries source hash, detected format, `artifact_kind`, and converter provenance into its evidence, so every finding traces back to the original file by hash. The manifest schema `text-mirror/manifest@1` is the contract. A consumer may depend on this crate's serde types once published, or conform to the schema independently. Every bundle and every record carries its schema string, so a conforming consumer can fail closed on versions it does not recognize.

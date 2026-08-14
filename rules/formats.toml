@@ -1,0 +1,118 @@
+# Format table for text-mirror.
+#
+# Detection maps magic bytes and file extensions to the format ids
+# below. The version is recorded in every manifest record as
+# rules_version, so a change here is a visible versioned event. It must
+# match the version in converters.toml.
+
+version = "1"
+
+[[formats]]
+id = "text"
+name = "Plain text"
+extensions = ["txt", "text", "log"]
+
+[[formats]]
+id = "markdown"
+name = "Markdown"
+extensions = ["md", "markdown"]
+
+[[formats]]
+id = "html"
+name = "HTML"
+extensions = ["html", "htm", "xhtml"]
+
+[[formats]]
+id = "csv"
+name = "Comma-separated values"
+extensions = ["csv"]
+
+[[formats]]
+id = "docx"
+name = "Office Open XML document"
+extensions = ["docx"]
+
+[[formats]]
+id = "xlsx"
+name = "Office Open XML spreadsheet"
+extensions = ["xlsx"]
+
+[[formats]]
+id = "pptx"
+name = "Office Open XML presentation"
+extensions = ["pptx"]
+
+[[formats]]
+id = "doc"
+name = "Legacy Word document"
+extensions = ["doc"]
+
+[[formats]]
+id = "xls"
+name = "Legacy Excel spreadsheet"
+extensions = ["xls"]
+
+[[formats]]
+id = "ppt"
+name = "Legacy PowerPoint presentation"
+extensions = ["ppt"]
+
+[[formats]]
+id = "pdf"
+name = "Portable Document Format"
+extensions = ["pdf"]
+
+[[formats]]
+id = "png"
+name = "Portable Network Graphics image"
+extensions = ["png"]
+
+[[formats]]
+id = "jpeg"
+name = "JPEG image"
+extensions = ["jpg", "jpeg"]
+
+[[formats]]
+id = "tiff"
+name = "TIFF image"
+extensions = ["tif", "tiff"]
+
+[[formats]]
+id = "mp3"
+name = "MP3 audio"
+extensions = ["mp3"]
+
+[[formats]]
+id = "wav"
+name = "WAV audio"
+extensions = ["wav"]
+
+[[formats]]
+id = "m4a"
+name = "MPEG-4 audio"
+extensions = ["m4a"]
+
+[[formats]]
+id = "mp4"
+name = "MPEG-4 video"
+extensions = ["mp4"]
+
+[[formats]]
+id = "mov"
+name = "QuickTime video"
+extensions = ["mov"]
+
+[[formats]]
+id = "zip"
+name = "ZIP archive"
+extensions = ["zip"]
+
+[[formats]]
+id = "eml"
+name = "Email message"
+extensions = ["eml"]
+
+[[formats]]
+id = "msg"
+name = "Outlook message"
+extensions = ["msg"]

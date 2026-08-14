@@ -1,0 +1,13 @@
+# Converter registry for text-mirror.
+#
+# Each entry pins a converter id, its version, and the format ids it
+# claims. A format no entry claims produces status unsupported. The
+# version must match the version in formats.toml and is recorded in
+# every manifest record as rules_version.
+
+version = "1"
+
+[[converters]]
+id = "text-passthrough"
+version = "1.0.0"
+formats = ["text", "markdown", "csv"]
