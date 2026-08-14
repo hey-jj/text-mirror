@@ -5,7 +5,7 @@
 # version must match the version in formats.toml and is recorded in
 # every manifest record as rules_version.
 
-version = "2"
+version = "3"
 
 [[converters]]
 id = "text-passthrough"
@@ -15,12 +15,21 @@ formats = ["text", "markdown", "csv"]
 [[converters]]
 id = "anydoc-document"
 version = "1.0.0"
-formats = ["docx", "doc", "pptx", "ppt", "rtf", "odt", "odp", "epub", "pdf"]
+formats = ["docx", "doc", "pptx", "ppt", "rtf", "odt", "odp", "epub"]
 
 [[converters]]
 id = "workbook-ir"
 version = "1.0.0"
 formats = ["xls", "xlsx", "xlsm", "ods"]
+
+# Text-layer PDF runs behind the sandbox runner in the worker binary,
+# so hostile PDF bytes crash a jailed child and never the pipeline.
+# The outcome, warnings, and failure reasons match the earlier
+# in-process path, so records differ only in this converter id.
+[[converters]]
+id = "pdf-subprocess"
+version = "1.0.0"
+formats = ["pdf"]
 
 # Spreadsheet formats with no row and column visibility reader yet.
 # They record unsupported with this reason until a reader lands, and
@@ -28,3 +37,12 @@ formats = ["xls", "xlsx", "xlsm", "ods"]
 [[unsupported]]
 reason = "hidden-visibility-unresolved"
 formats = ["xlsb", "xla", "xlam"]
+
+# Media formats route to subprocess adapters whose engines are not
+# pinned yet. Until a rules bump pins an engine version and model
+# hash, each records unsupported with this reason and no artifact.
+# The checkpoint key includes rules_version, so the bump that pins an
+# engine re-runs every such record automatically.
+[[unsupported]]
+reason = "engine-unpinned"
+formats = ["png", "jpeg", "tiff", "mp3", "wav", "m4a", "mp4", "mov"]

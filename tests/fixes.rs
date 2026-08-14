@@ -156,7 +156,7 @@ fn stale_seed_is_ignored_and_dedup_hashes_written_bytes() {
     // The rules bump reconverted the canonical instead of trusting it.
     let canonical = terminal(&setup, "a.txt");
     assert_eq!(canonical.status, Status::Converted);
-    assert_eq!(canonical.rules_version, "2");
+    assert_eq!(canonical.rules_version, "3");
     assert_eq!(
         fs::read_to_string(setup.mirror.join("a.txt.txt")).unwrap(),
         "payload\n"

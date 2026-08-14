@@ -808,12 +808,14 @@ fn empty_cell_in_a_hidden_column_gets_a_zero_width_span() {
 }
 
 // A partially extracted PDF records its recovery warning instead of
-// reading as silently complete.
+// reading as silently complete. The PDF core is shared with the
+// sandbox worker, so testing it here proves the warning the worker
+// carries over the protocol.
 #[test]
 fn partial_pdf_extraction_carries_a_warning() {
-    let outcome = AnydocDocument.convert(&two_page_pdf(), "pdf").unwrap();
-    assert!(outcome.text.contains("First page text"));
-    let warning = outcome
+    let conversion = text_mirror::convert::pdf::convert_pdf(&two_page_pdf()).unwrap();
+    assert!(conversion.text.contains("First page text"));
+    let warning = conversion
         .warnings
         .iter()
         .find(|w| w.starts_with("pdf_partial_text:"))

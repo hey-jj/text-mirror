@@ -48,8 +48,11 @@ use unicode_normalization::UnicodeNormalization;
 use crate::segments::Segment;
 use crate::{Error, Result};
 
+mod anydoc_log;
 mod differential;
 mod document;
+pub mod pdf;
+pub mod subprocess;
 mod visibility;
 mod workbook;
 
@@ -57,6 +60,7 @@ pub use differential::{
     DiffMetrics, DiffVerdict, DifferentialOutcome, compare_texts, normalize_for_diff,
 };
 pub use document::{AnydocDocument, markdown_to_plain};
+pub use subprocess::PdfSubprocess;
 pub use visibility::{IndexRange, SheetVisibility, WorkbookVisibility, read_visibility};
 pub use workbook::WorkbookIr;
 
@@ -249,6 +253,7 @@ impl Registry {
                 PASSTHROUGH_ID => Box::new(PlainTextPassthrough),
                 document::ANYDOC_ID => Box::new(AnydocDocument),
                 workbook::WORKBOOK_ID => Box::new(WorkbookIr),
+                subprocess::PDF_SUBPROCESS_ID => Box::new(PdfSubprocess),
                 other => {
                     return Err(Error::Rules {
                         name: name.to_string(),
@@ -396,11 +401,15 @@ mod tests {
     #[test]
     fn builtin_registry_claims_the_text_family() {
         let registry = Registry::builtin().unwrap();
-        assert_eq!(registry.version(), "2");
+        assert_eq!(registry.version(), "3");
         assert!(registry.converter_for("text").is_some());
         assert!(registry.converter_for("markdown").is_some());
         assert!(registry.converter_for("csv").is_some());
         assert!(registry.converter_for("pdf").is_some());
+        assert_eq!(
+            registry.converter_for("pdf").map(|c| c.id()),
+            Some("pdf-subprocess")
+        );
         assert!(registry.converter_for("docx").is_some());
         assert!(registry.converter_for("xlsx").is_some());
         assert!(registry.converter_for("html").is_none());
@@ -409,6 +418,8 @@ mod tests {
             registry.unsupported_reason("xlsb"),
             Some("hidden-visibility-unresolved")
         );
+        assert_eq!(registry.unsupported_reason("png"), Some("engine-unpinned"));
+        assert_eq!(registry.unsupported_reason("mp4"), Some("engine-unpinned"));
         assert_eq!(registry.unsupported_reason("html"), None);
     }
 

@@ -1,86 +1,33 @@
 //! The document adapter over anydoc.
 //!
 //! One converter covers documents, presentations, rich text, ebooks,
-//! and text-layer PDF. anydoc emits Markdown, and one deterministic
-//! normalizer flattens that Markdown to plain text before the shared
-//! NFC and LF pass. anydoc's stable error class is preserved as the
-//! machine-readable reason of a failed record. A PDF with no
-//! extractable text layer fails with reason `pdf_no_text_layer`, so
-//! it converts automatically once an OCR converter lands.
+//! and OpenDocument files. anydoc emits Markdown, and one
+//! deterministic normalizer flattens that Markdown to plain text
+//! before the shared NFC and LF pass. anydoc's stable error class is
+//! preserved as the machine-readable reason of a failed record.
+//!
+//! Text-layer PDF is no longer an in-process format here. It runs
+//! behind the sandbox runner in the worker binary, because hostile
+//! PDF bytes must crash a jailed child and never the pipeline. See
+//! the sibling `pdf` and `subprocess` modules.
 //!
 //! Legacy `doc` and `ppt` conversions run the differential check
 //! against a second extraction. See the sibling differential module
 //! for the policy.
 //!
 //! anydoc reports recovered and skipped content through the log
-//! facade. A process-wide bridge captures those records per
-//! conversion and promotes them to manifest warnings, so a partially
-//! extracted document never reads as silently complete.
-
-use std::cell::RefCell;
-use std::sync::Once;
+//! facade. The shared bridge in `anydoc_log` captures those records
+//! per conversion and promotes them to manifest warnings, so a
+//! partially extracted document never reads as silently complete.
 
 use crate::segments::Segment;
 
+use super::anydoc_log::capture_anydoc;
 use super::differential::{self, DifferentialOutcome};
 use super::{ConvertError, Converter, Outcome, normalize_text};
 
-thread_local! {
-    static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
-}
-
-struct AnydocLogBridge;
-
-impl log::Log for AnydocLogBridge {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Warn
-    }
-
-    fn log(&self, record: &log::Record) {
-        if record.level() > log::Level::Warn || !record.target().starts_with("anydoc") {
-            return;
-        }
-        CAPTURE.with(|capture| {
-            if let Some(sink) = capture.borrow_mut().as_mut() {
-                sink.push(record.args().to_string());
-            }
-        });
-    }
-
-    fn flush(&self) {}
-}
-
-static BRIDGE: AnydocLogBridge = AnydocLogBridge;
-static INSTALL: Once = Once::new();
-
-fn install_bridge() {
-    INSTALL.call_once(|| {
-        if log::set_logger(&BRIDGE).is_ok() {
-            log::set_max_level(log::LevelFilter::Warn);
-        }
-    });
-}
-
-/// Runs `work` with the capture sink active on this thread and
-/// returns its result beside the captured anydoc messages.
-fn capture_anydoc<T>(work: impl FnOnce() -> T) -> (T, Vec<String>) {
-    install_bridge();
-    CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
-    let result = work();
-    let captured = CAPTURE
-        .with(|capture| capture.borrow_mut().take())
-        .unwrap_or_default();
-    (result, captured)
-}
-
-/// Turns a captured anydoc message into a manifest warning. The
-/// partial-PDF case gets its own stable prefix so downstream tooling
-/// can route those files to OCR.
-fn promote_warning(detected_format: &str, message: &str) -> String {
-    if detected_format == "pdf" && message.contains("pages need OCR") {
-        let head = message.split(" and ").next().unwrap_or(message);
-        return format!("pdf_partial_text: {head}");
-    }
+/// Turns a captured anydoc message into a manifest warning.
+fn promote_warning(message: &str) -> String {
     format!("anydoc_recovery: {message}")
 }
 
@@ -95,7 +42,6 @@ fn anydoc_format(format_id: &str) -> Option<anydoc::Format> {
         "doc" => anydoc::Format::Doc,
         "docx" => anydoc::Format::Docx,
         "odt" => anydoc::Format::Odt,
-        "pdf" => anydoc::Format::Pdf,
         "ppt" => anydoc::Format::Ppt,
         "pptx" => anydoc::Format::Pptx,
         "rtf" => anydoc::Format::Rtf,
@@ -105,11 +51,7 @@ fn anydoc_format(format_id: &str) -> Option<anydoc::Format> {
     })
 }
 
-fn error_code(error: &anydoc::ConvertError, format_id: &str) -> &'static str {
-    if format_id == "pdf" && matches!(error, anydoc::ConvertError::Unsupported(_)) {
-        // anydoc reports a scanned or image-only PDF as unsupported.
-        return "pdf_no_text_layer";
-    }
+fn error_code(error: &anydoc::ConvertError) -> &'static str {
     match error.code() {
         "unsupported" => "unsupported",
         "malformed" => "malformed",
@@ -225,7 +167,7 @@ impl Converter for AnydocDocument {
         };
         let (converted, captured) = capture_anydoc(|| anydoc::to_markdown_bytes(source, format));
         let markdown = converted.map_err(|error| ConvertError {
-            code: error_code(&error, detected_format),
+            code: error_code(&error),
             message: error.to_string(),
         })?;
         let text = normalize_text(&markdown_to_plain(&markdown));
@@ -240,7 +182,7 @@ impl Converter for AnydocDocument {
         }
         let mut warnings: Vec<String> = captured
             .iter()
-            .map(|message| promote_warning(detected_format, message))
+            .map(|message| promote_warning(message))
             .collect();
 
         // Legacy Office formats get a second, independent extraction.
@@ -368,17 +310,12 @@ let x = 1;
     #[test]
     fn the_log_bridge_captures_and_promotes_anydoc_warnings() {
         let ((), captured) = capture_anydoc(|| {
-            log::warn!(target: "anydoc::formats::pdf", "1 of 2 pages need OCR and were not extracted");
             log::warn!(target: "anydoc::formats::pptx", "skipped slide 3: corrupt part");
             log::warn!(target: "unrelated::crate", "never captured");
         });
-        assert_eq!(captured.len(), 2);
+        assert_eq!(captured.len(), 1);
         assert_eq!(
-            promote_warning("pdf", &captured[0]),
-            "pdf_partial_text: 1 of 2 pages need OCR"
-        );
-        assert_eq!(
-            promote_warning("pptx", &captured[1]),
+            promote_warning(&captured[0]),
             "anydoc_recovery: skipped slide 3: corrupt part"
         );
     }

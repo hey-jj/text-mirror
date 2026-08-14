@@ -1,0 +1,548 @@
+//! The sandboxed subprocess runner behind every subprocess adapter.
+//!
+//! The runner enforces the whole sandbox contract from the design
+//! document: a wall-clock timeout, separate stdout and stderr caps
+//! drained concurrently, no network, no inherited environment, and a
+//! temp-dir working jail. Every violation fails closed with a
+//! machine-readable reason and no partial result.
+//!
+//! The spawn is two-stage. The parent builds a `std::process::Command`
+//! through the platform [`jail::JailBackend`] with a cleared
+//! environment, the jail as working directory, piped stdio, and a
+//! fresh process group. The child starts in the worker binary's
+//! single-threaded sandbox helper mode, which applies namespaces,
+//! resource limits, descriptor hygiene, the filesystem jail, and the
+//! syscall filter, then execs the requested adapter mode. No sandbox
+//! work runs in a `pre_exec` closure.
+//!
+//! The wall clock is a parent-owned monotonic deadline. When it fires,
+//! or when either output cap is crossed, the parent kills the whole
+//! process group with SIGKILL. The same group kill also runs after a
+//! normal clean exit, so no descendant outlives the invocation, and
+//! the post-exit drain join is deadline-bounded, so the parent never
+//! blocks on a pipe an escaped descendant holds open. A response
+//! frame is accepted only from a child that wrote exactly one
+//! complete frame, nothing after it, and exited cleanly.
+
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::{Child, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+pub mod helper;
+pub mod jail;
+pub mod protocol;
+pub mod worker;
+
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
+
+use jail::{JailBackend, SpawnSpec};
+use protocol::{FrameRead, Request, RequestSchema, Response};
+
+/// Resource and output limits for one adapter class.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    /// Wall-clock ceiling enforced by the parent.
+    pub wall_timeout: Duration,
+    /// Ceiling on the response frame payload, checked against the
+    /// declared length before allocation.
+    pub max_response_bytes: u32,
+    /// Ceiling on stderr bytes, drained and counted concurrently.
+    pub max_stderr_bytes: u64,
+    /// RLIMIT_AS for the child, in bytes.
+    pub address_space_bytes: u64,
+    /// RLIMIT_CPU for the child, in seconds.
+    pub cpu_seconds: u64,
+    /// RLIMIT_FSIZE for the child, in bytes. Caps regular-file growth
+    /// inside the jail. Stdout is a pipe, so the response cap above
+    /// is enforced by the parent instead.
+    pub file_size_bytes: u64,
+    /// RLIMIT_NPROC for the child. An absolute cap on the process and
+    /// thread count of the mapped real user id, so a compromised
+    /// adapter cannot fork-bomb the host. The default is a modest
+    /// absolute value: the shipped adapter spawns nothing, so on a
+    /// host where the user already runs more tasks than the cap,
+    /// every fork from the adapter fails, which is the intent.
+    pub max_processes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            wall_timeout: Duration::from_secs(120),
+            max_response_bytes: 192 * 1024 * 1024,
+            max_stderr_bytes: 1024 * 1024,
+            address_space_bytes: 4 * 1024 * 1024 * 1024,
+            cpu_seconds: 300,
+            file_size_bytes: 512 * 1024 * 1024,
+            max_processes: 16,
+        }
+    }
+}
+
+/// A runner failure with a machine-readable reason.
+///
+/// The codes are stable: `sandbox_unavailable`, `sandbox_probe_failed`,
+/// `worker_not_found`, `adapter_spawn_error`, `adapter_timeout`,
+/// `adapter_frame_oversized`, `adapter_output_overflow`,
+/// `adapter_protocol_error`, `adapter_drain_timeout`, and
+/// `adapter_crash`.
+#[derive(Debug, Clone)]
+pub struct RunnerError {
+    /// Stable reason code.
+    pub code: &'static str,
+    /// Detail for a human reading the manifest.
+    pub message: String,
+}
+
+impl std::fmt::Display for RunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RunnerError {}
+
+/// File name of the worker binary this crate ships.
+pub const WORKER_BINARY: &str = "text-mirror-worker";
+
+/// Exit code the sandbox helper uses when jail setup fails, so the
+/// parent can tell a refused jail from an adapter crash.
+pub const SANDBOX_SETUP_EXIT: i32 = 71;
+
+/// Locates the worker binary beside the current executable, or one
+/// directory up, which covers an installed layout and a build tree.
+pub fn locate_worker() -> Result<PathBuf, RunnerError> {
+    let missing = |detail: String| RunnerError {
+        code: "worker_not_found",
+        message: detail,
+    };
+    let current = std::env::current_exe()
+        .map_err(|e| missing(format!("cannot resolve the current executable: {e}")))?;
+    let Some(dir) = current.parent() else {
+        return Err(missing(
+            "the current executable has no directory".to_string(),
+        ));
+    };
+    let mut candidates = vec![dir.join(WORKER_BINARY)];
+    if let Some(parent) = dir.parent() {
+        candidates.push(parent.join(WORKER_BINARY));
+    }
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return candidate
+                .canonicalize()
+                .map_err(|e| missing(format!("cannot canonicalize {}: {e}", candidate.display())));
+        }
+    }
+    Err(missing(format!(
+        "no {WORKER_BINARY} beside {}",
+        current.display()
+    )))
+}
+
+/// Runs worker modes under the platform jail.
+pub struct Runner {
+    backend: Box<dyn JailBackend>,
+    worker: PathBuf,
+    limits: Limits,
+}
+
+impl Runner {
+    /// A runner over an explicit backend, worker, and limits.
+    pub fn new(backend: Box<dyn JailBackend>, worker: PathBuf, limits: Limits) -> Runner {
+        Runner {
+            backend,
+            worker,
+            limits,
+        }
+    }
+
+    /// The platform backend, the co-located worker binary, and
+    /// default limits.
+    pub fn with_platform_defaults() -> Result<Runner, RunnerError> {
+        Ok(Runner::new(
+            jail::platform_backend()?,
+            locate_worker()?,
+            Limits::default(),
+        ))
+    }
+
+    /// The backend this runner spawns through.
+    pub fn backend(&self) -> &dyn JailBackend {
+        self.backend.as_ref()
+    }
+
+    /// The limits this runner enforces.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    /// The policy digest that keys this runner's probe cache entry.
+    pub fn policy_digest(&self) -> Result<String, RunnerError> {
+        jail::policy_digest(self.backend.as_ref(), &self.worker)
+    }
+
+    /// Runs one adapter mode inside the jail and returns its response.
+    ///
+    /// `files` are written into a fresh jail directory before the
+    /// spawn, so the child reads inputs by bare name from its working
+    /// directory. The capability probe must have passed for the
+    /// current policy digest, and runs once per process if not.
+    pub fn run(
+        &self,
+        mode: &str,
+        payload: serde_json::Value,
+        files: &[(&str, &[u8])],
+    ) -> Result<Response, RunnerError> {
+        let digest = self.policy_digest()?;
+        jail::ensure_probed(self, &digest)?;
+        self.run_unprobed(mode, payload, files, true)
+    }
+
+    /// Runs one mode without the probe gate. Only the probe itself
+    /// uses this, and only through the jail backend.
+    pub(crate) fn run_unprobed(
+        &self,
+        mode: &str,
+        payload: serde_json::Value,
+        files: &[(&str, &[u8])],
+        seccomp: bool,
+    ) -> Result<Response, RunnerError> {
+        let jail_dir = tempfile::tempdir().map_err(|e| RunnerError {
+            code: "adapter_spawn_error",
+            message: format!("cannot create the jail directory: {e}"),
+        })?;
+        let jail_path = jail_dir.path().canonicalize().map_err(|e| RunnerError {
+            code: "adapter_spawn_error",
+            message: format!("cannot canonicalize the jail directory: {e}"),
+        })?;
+        for (name, bytes) in files {
+            if name.contains('/') || name.contains("..") {
+                return Err(RunnerError {
+                    code: "adapter_spawn_error",
+                    message: format!("input name {name:?} is not a bare file name"),
+                });
+            }
+            std::fs::write(jail_path.join(name), bytes).map_err(|e| RunnerError {
+                code: "adapter_spawn_error",
+                message: format!("cannot stage input {name:?}: {e}"),
+            })?;
+        }
+
+        let spec = SpawnSpec {
+            worker: &self.worker,
+            jail: &jail_path,
+            mode,
+            limits: &self.limits,
+            seccomp,
+        };
+        let mut command = self.backend.command(&spec)?;
+        command
+            .env_clear()
+            .current_dir(&jail_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(|e| RunnerError {
+            code: "adapter_spawn_error",
+            message: format!("cannot spawn the jailed worker: {e}"),
+        })?;
+
+        let request = Request {
+            schema: RequestSchema,
+            adapter: mode.to_string(),
+            payload,
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            // A child that dies before reading breaks the pipe. That
+            // is not a verdict, the exit status below is.
+            let _ = protocol::write_frame(&mut stdin, &request);
+        }
+
+        drive(&mut child, &self.limits)
+    }
+}
+
+/// What the stdout drain thread observed.
+enum StdoutEnd {
+    Frame(Vec<u8>),
+    Empty,
+    Truncated,
+    Oversized { declared: u64 },
+    Trailing,
+    ReadError(String),
+}
+
+/// How long the parent waits for the drains to reach EOF after the
+/// final group kill. A drain still open past this bound means a
+/// descendant escaped the process group and holds a pipe, and the
+/// parent detaches the drain and fails closed instead of hanging.
+const DRAIN_JOIN_BOUND: Duration = Duration::from_secs(2);
+
+/// Drains both pipes concurrently, enforces the deadline and caps,
+/// and interprets the exit.
+///
+/// The group-lifetime contract: no descendant outlives the
+/// invocation. The parent SIGKILLs the whole process group on every
+/// exit path, the normal clean exit included, before it returns. The
+/// parent itself never blocks without a bound: the post-exit drain
+/// join is deadline-bounded, and a drain that does not finish is
+/// detached while the call returns a fail-closed reason.
+fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
+    let kill_now = Arc::new(AtomicBool::new(false));
+
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stdout_kill = kill_now.clone();
+    let max_response = limits.max_response_bytes;
+    let (stdout_done, stdout_result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = stdout;
+        let end = match protocol::read_frame(&mut reader, max_response) {
+            Ok(FrameRead::Complete(payload)) => {
+                // One frame is the whole grammar. Any byte after it is
+                // a protocol violation and kills the child.
+                let mut probe = [0u8; 1];
+                match reader.read(&mut probe) {
+                    Ok(0) => StdoutEnd::Frame(payload),
+                    Ok(_) => StdoutEnd::Trailing,
+                    Err(e) => StdoutEnd::ReadError(e.to_string()),
+                }
+            }
+            Ok(FrameRead::Empty) => StdoutEnd::Empty,
+            Ok(FrameRead::Truncated) => StdoutEnd::Truncated,
+            Ok(FrameRead::Oversized { declared }) => StdoutEnd::Oversized { declared },
+            Err(e) => StdoutEnd::ReadError(e.to_string()),
+        };
+        if matches!(
+            end,
+            StdoutEnd::Oversized { .. } | StdoutEnd::Trailing | StdoutEnd::ReadError(_)
+        ) {
+            stdout_kill.store(true, Ordering::SeqCst);
+        }
+        if matches!(end, StdoutEnd::Oversized { .. } | StdoutEnd::Trailing) {
+            // Keep the pipe drained so the child cannot stall on a
+            // full pipe between the violation and the kill. The bytes
+            // are discarded.
+            let mut sink = [0u8; 8192];
+            while matches!(reader.read(&mut sink), Ok(n) if n > 0) {}
+        }
+        let _ = stdout_done.send(end);
+    });
+
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let stderr_kill = kill_now.clone();
+    let max_stderr = limits.max_stderr_bytes;
+    let (stderr_done, stderr_result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = stderr;
+        let mut kept = Vec::new();
+        let mut total: u64 = 0;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n as u64;
+                    if kept.len() < 4096 {
+                        let take = (4096 - kept.len()).min(n);
+                        kept.extend_from_slice(&chunk[..take]);
+                    }
+                    if total > max_stderr {
+                        stderr_kill.store(true, Ordering::SeqCst);
+                        // Keep draining so the child cannot stall.
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = stderr_done.send((kept, total));
+    });
+
+    let deadline = Instant::now() + limits.wall_timeout;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().ok().flatten() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            kill_group(child);
+            break wait_after_kill(child);
+        }
+        if kill_now.load(Ordering::SeqCst) {
+            kill_group(child);
+            break wait_after_kill(child);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+
+    // The final group kill runs on every exit path, the normal clean
+    // exit included, so a descendant that closed its stdio and
+    // lingered past its leader is still killed. The group id stays
+    // reserved while any member lives, and ESRCH on an empty group is
+    // fine.
+    kill_group(child);
+
+    // Bounded drain join. On Linux the group kill guarantees EOF,
+    // because a descendant cannot leave the group. On macOS a
+    // descendant that changed its session can survive the group kill
+    // holding a pipe, and this bound is what keeps the parent from
+    // hanging on it: the drain is detached and the call fails closed.
+    let join_deadline = Instant::now() + DRAIN_JOIN_BOUND;
+    let stdout_end = stdout_result.recv_timeout(DRAIN_JOIN_BOUND).ok();
+    let stderr_end = stderr_result
+        .recv_timeout(join_deadline.saturating_duration_since(Instant::now()))
+        .ok();
+    let (Some(stdout_end), Some((stderr_kept, stderr_total))) = (stdout_end, stderr_end) else {
+        return Err(RunnerError {
+            code: "adapter_drain_timeout",
+            message: format!(
+                "a pipe stayed open {DRAIN_JOIN_BOUND:?} after the group kill, so a descendant escaped the process group; the drain is detached and all output is discarded"
+            ),
+        });
+    };
+
+    if timed_out {
+        return Err(RunnerError {
+            code: "adapter_timeout",
+            message: format!(
+                "killed the process group after the {:?} wall-clock ceiling, partial output discarded",
+                limits.wall_timeout
+            ),
+        });
+    }
+    if let StdoutEnd::Oversized { declared } = stdout_end {
+        return Err(RunnerError {
+            code: "adapter_frame_oversized",
+            message: format!(
+                "response frame declared {declared} bytes over the {} byte ceiling, refused before allocation",
+                limits.max_response_bytes
+            ),
+        });
+    }
+    if stderr_total > limits.max_stderr_bytes {
+        return Err(RunnerError {
+            code: "adapter_output_overflow",
+            message: format!(
+                "stderr wrote {stderr_total} bytes over the {} byte cap",
+                limits.max_stderr_bytes
+            ),
+        });
+    }
+    if matches!(stdout_end, StdoutEnd::Trailing) {
+        return Err(RunnerError {
+            code: "adapter_output_overflow",
+            message: "bytes after the response frame, one frame is the whole stdout budget"
+                .to_string(),
+        });
+    }
+    if !status.success() {
+        let detail = exit_detail(&status);
+        let stderr_text = String::from_utf8_lossy(&stderr_kept);
+        let stderr_text = stderr_text.trim();
+        #[cfg(unix)]
+        let setup_failed = status.code() == Some(SANDBOX_SETUP_EXIT);
+        #[cfg(not(unix))]
+        let setup_failed = false;
+        if setup_failed {
+            return Err(RunnerError {
+                code: "sandbox_unavailable",
+                message: format!("the sandbox helper refused to engage the jail: {stderr_text}"),
+            });
+        }
+        return Err(RunnerError {
+            code: "adapter_crash",
+            message: if stderr_text.is_empty() {
+                format!("worker {detail}, any response frame is discarded")
+            } else {
+                format!("worker {detail}: {stderr_text}")
+            },
+        });
+    }
+    let payload = match stdout_end {
+        StdoutEnd::Frame(payload) => payload,
+        StdoutEnd::Empty => {
+            return Err(RunnerError {
+                code: "adapter_protocol_error",
+                message: "worker exited without a response frame".to_string(),
+            });
+        }
+        StdoutEnd::Truncated => {
+            return Err(RunnerError {
+                code: "adapter_protocol_error",
+                message: "worker exited with a truncated response frame".to_string(),
+            });
+        }
+        StdoutEnd::ReadError(detail) => {
+            return Err(RunnerError {
+                code: "adapter_protocol_error",
+                message: format!("reading the response failed: {detail}"),
+            });
+        }
+        StdoutEnd::Oversized { .. } | StdoutEnd::Trailing => unreachable!("handled above"),
+    };
+    let response: Response = serde_json::from_slice(&payload).map_err(|e| RunnerError {
+        code: "adapter_protocol_error",
+        message: format!("response frame did not parse: {e}"),
+    })?;
+    response.validate().map_err(|detail| RunnerError {
+        code: "adapter_protocol_error",
+        message: detail,
+    })?;
+    Ok(response)
+}
+
+/// Kills the child's whole process group with SIGKILL.
+fn kill_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // The child is its own group leader via process_group(0),
+            // and ESRCH after the group is gone is fine.
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
+fn wait_after_kill(child: &mut Child) -> std::process::ExitStatus {
+    child.wait().unwrap_or_else(|_| {
+        // The child was already reaped by try_wait.
+        child
+            .try_wait()
+            .ok()
+            .flatten()
+            .expect("killed child has an exit status")
+    })
+}
+
+fn exit_detail(status: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("died on signal {signal}");
+        }
+    }
+    match status.code() {
+        Some(code) => format!("exited with code {code}"),
+        None => "exited without a status".to_string(),
+    }
+}

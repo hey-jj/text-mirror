@@ -5,10 +5,12 @@
 //! interface. The [`manifest`] module holds its serde types. See
 //! `docs/DESIGN.md` for the architecture.
 //!
-//! The current release ships the pure-Rust core. The only converter is
-//! the plain text passthrough. Every other known format is inventoried
-//! by [`detect`] and recorded as `unsupported`, so the manifest always
-//! reports the true denominator.
+//! In-process converters cover text, Office and OpenDocument
+//! documents, and spreadsheets. Text-layer PDF and the media adapters
+//! run behind the sandbox [`runner`] in a jailed worker. A format no
+//! converter claims, or one whose adapter engine is not pinned yet, is
+//! inventoried by [`detect`] and recorded as `unsupported`, so the
+//! manifest always reports the true denominator.
 
 #![forbid(unsafe_code)]
 
@@ -23,8 +25,45 @@ pub mod manifest;
 pub mod mirror;
 pub mod pipeline;
 pub mod report;
+#[cfg(unix)]
+pub mod runner;
 pub mod segments;
 pub mod walk;
+
+/// The typed adapter request and response bodies, re-exported so
+/// transcript rendering and tests reach them on every platform. On a
+/// unix target these are the same types the [`runner`] protocol uses.
+#[cfg(unix)]
+pub use runner::protocol::bodies as runner_bodies;
+
+/// Standalone copies of the transcript-shaped bodies for platforms
+/// without a jail backend, so transcript rendering still type-checks.
+#[cfg(not(unix))]
+pub mod runner_bodies {
+    use serde::{Deserialize, Serialize};
+
+    /// One transcribed speech segment.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AsrSegment {
+        /// Segment start in seconds.
+        pub start_seconds: f64,
+        /// Segment end in seconds.
+        pub end_seconds: f64,
+        /// One-based speaker index.
+        pub speaker: u32,
+        /// The transcribed text.
+        pub text: String,
+    }
+
+    /// One deduplicated on-screen text state.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ScreenState {
+        /// When this state first appeared, in seconds.
+        pub first_seen_seconds: f64,
+        /// The on-screen text.
+        pub text: String,
+    }
+}
 
 /// Errors returned by this library.
 ///

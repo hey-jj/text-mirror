@@ -820,7 +820,7 @@ mod tests {
     #[test]
     fn builtin_rules_agree_on_a_version() {
         let rules = Rules::builtin().unwrap();
-        assert_eq!(rules.version(), "2");
+        assert_eq!(rules.version(), "3");
     }
 
     use crate::convert::{ConvertError, Converter, Outcome, PlainTextPassthrough};
