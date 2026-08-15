@@ -13,7 +13,7 @@ pub struct WalkOptions {
     pub ignore_names: Vec<String>,
 }
 
-/// What kind of directory entry the walk found.
+/// How the walk classified a directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     /// A regular file.

@@ -653,7 +653,7 @@ fn two_page_pdf() -> Vec<u8> {
     pdf.into_bytes()
 }
 
-// Hostile-input and policy regressions, one per reviewed defect.
+// Hostile-input and policy regressions.
 
 use text_mirror::convert::{AnydocDocument, Converter, WorkbookIr};
 

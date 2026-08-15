@@ -1,4 +1,5 @@
-//! Regression tests for reviewed failure scenarios, one per finding.
+//! Regression tests for pipeline edge cases: crash recovery, hostile
+//! layouts, dedup integrity, and per-source fault isolation.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -76,7 +77,7 @@ fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<String>)> {
     out
 }
 
-// B1: identical bytes under a format handled by a different converter
+// Identical bytes under a format handled by a different converter
 // must not borrow the canonical artifact.
 #[test]
 fn dedup_respects_format_ownership() {
@@ -108,7 +109,7 @@ fn dedup_respects_format_ownership() {
     assert!(!setup.mirror.join("alpha/c.xlsb.txt").exists());
 }
 
-// B2 and B4: a seed from another rules version never becomes the
+// A seed from another rules version never becomes the
 // canonical, and a dedup record hashes the bytes it actually wrote.
 #[test]
 fn stale_seed_is_ignored_and_dedup_hashes_written_bytes() {
@@ -174,11 +175,11 @@ fn stale_seed_is_ignored_and_dedup_hashes_written_bytes() {
     );
     assert_eq!(written, b"payload\n");
 
-    // H2: the recorded source hash binds to the bytes that converted.
+    // The recorded source hash binds to the bytes that converted.
     assert_eq!(canonical.source_hash, hash::hash_bytes(b"payload\n"));
 }
 
-// B3: a duplicate whose canonical artifact vanished converts for
+// A duplicate whose canonical artifact vanished converts for
 // itself instead of failing forever.
 #[test]
 fn vanished_canonical_falls_through_to_conversion() {
@@ -206,7 +207,7 @@ fn vanished_canonical_falls_through_to_conversion() {
     );
 }
 
-// B5: a torn tail from a killed run is dropped with a warning, and the
+// A torn tail from a killed run is dropped with a warning, and the
 // affected source is re-recorded by the next run.
 #[test]
 fn torn_manifest_tail_recovers_on_the_next_run() {
@@ -232,7 +233,7 @@ fn torn_manifest_tail_recovers_on_the_next_run() {
     assert_eq!(shard.records.len(), 2);
 }
 
-// B6: a source that turns invalid loses its stale artifact in the same
+// A source that turns invalid loses its stale artifact in the same
 // pass that records the failure.
 #[test]
 fn stale_artifact_is_removed_after_a_failed_outcome() {
@@ -254,7 +255,7 @@ fn stale_artifact_is_removed_after_a_failed_outcome() {
     assert!(!setup.mirror.join("alpha/report.txt.txt").exists());
 }
 
-// B7: a mirror path collision fails one source and the run continues.
+// A mirror path collision fails one source and the run continues.
 #[test]
 fn mirror_collision_fails_one_source_and_continues() {
     let setup = setup();
@@ -280,7 +281,7 @@ fn mirror_collision_fails_one_source_and_continues() {
     assert_eq!(terminal(&setup, "z.txt").status, Status::Converted);
 }
 
-// B8: one unreadable file fails alone and later sources still convert.
+// One unreadable file fails alone and later sources still convert.
 #[cfg(unix)]
 #[test]
 fn unreadable_file_does_not_starve_the_rest_of_the_run() {
@@ -311,7 +312,7 @@ fn unreadable_file_does_not_starve_the_rest_of_the_run() {
     assert_eq!(terminal(&setup, "z.txt").status, Status::Converted);
 }
 
-// B9: a division root that is itself a symlink is refused.
+// A division root that is itself a symlink is refused.
 #[cfg(unix)]
 #[test]
 fn symlinked_root_is_rejected() {
@@ -335,7 +336,7 @@ fn symlinked_root_is_rejected() {
     assert!(err.to_string().contains("symlink"));
 }
 
-// B10: a symlink entry becomes a recorded outcome hashed over its
+// A symlink entry becomes a recorded outcome hashed over its
 // readlink target bytes, and special entries are counted.
 #[cfg(unix)]
 #[test]
@@ -367,7 +368,7 @@ fn symlink_entries_are_recorded_not_skipped() {
     assert!(!setup.mirror.join("alpha/link.txt.txt").exists());
 }
 
-// B11 and F3: output roots inside the division root are refused
+// Output roots inside the division root are refused
 // before any work, and a refusal leaves the division root
 // byte-identical, intermediate directories included.
 #[test]
@@ -424,7 +425,7 @@ fn outputs_inside_the_root_are_refused() {
     assert_eq!(tree_snapshot(&setup.root), before);
 }
 
-// F2: an output root that is an ancestor of the division root is
+// An output root that is an ancestor of the division root is
 // refused, so artifacts can never land inside the source tree when
 // names collide.
 #[test]
@@ -466,7 +467,7 @@ fn root_inside_an_output_root_is_refused() {
     assert_eq!(tree_snapshot(&setup.root), before);
 }
 
-// F1: a torn tail that breaks inside a multibyte UTF-8 character is
+// A torn tail that breaks inside a multibyte UTF-8 character is
 // tolerated like any other torn tail, and the next run recovers.
 #[test]
 fn multibyte_torn_tail_recovers_on_the_next_run() {
@@ -530,7 +531,7 @@ fn non_utf8_symlink_name_records_failed() {
     );
 }
 
-// H1: a corrupted artifact is caught by the skip rehash and
+// A corrupted artifact is caught by the skip rehash and
 // reconverted instead of trusted.
 #[test]
 fn corrupted_artifact_is_reconverted_not_skipped() {
@@ -550,7 +551,7 @@ fn corrupted_artifact_is_reconverted_not_skipped() {
     );
 }
 
-// H5: a non-UTF-8 source name records a failure and never names an
+// A non-UTF-8 source name records a failure and never names an
 // artifact. APFS refuses such names, so the tree setup is guarded.
 #[cfg(unix)]
 #[test]

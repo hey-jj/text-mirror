@@ -8,8 +8,7 @@
 //! machines, and every release decision must rest on the Linux
 //! namespace, Landlock, and seccomp path. The profile still fails
 //! closed: it denies by default, and a missing `sandbox-exec` or a
-//! rejected profile refuses the adapter run rather than running
-//! unjailed.
+//! rejected profile refuses the adapter run outright.
 //!
 //! The profile denies by default and grants only what the process
 //! needs to boot plus the jail, the worker, and the minimal runtime.

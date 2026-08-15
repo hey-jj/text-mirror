@@ -3,9 +3,13 @@ name = "text-mirror"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Converts binary and rich files into text and builds a replica text-mirror tree with a provenance manifest"
+description = "Converts binary and rich files into text and builds a replica text-mirror tree beside a manifest recording the source, hash, and converter behind every artifact"
 keywords = ["conversion", "text-extraction", "corpus", "provenance", "manifest"]
 categories = ["command-line-utilities", "parsing"]
+readme = "README.md"
+repository = "https://github.com/hey-jj/text-mirror"
+rust-version = "1.85"
+exclude = ["AGENTS.md"]
 
 [lib]
 name = "text_mirror"

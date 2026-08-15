@@ -299,7 +299,7 @@ fn verify_refuses_each_failure_class() {
     );
 }
 
-// B2: a forged record binding real artifact bytes to a false source
+// A forged record binding real artifact bytes to a false source
 // identity is refused by the pure-mapping check. This exact forgery
 // passed verify before the fix.
 #[test]
@@ -638,7 +638,7 @@ fn ascii_case_fold_collision_is_refused() {
     );
 }
 
-// B1: descriptor arrays are untrusted. The EMEA and emea pair passed
+// Descriptor arrays are untrusted. The EMEA and emea pair passed
 // verify before the fix and would alias on the receiving fleet.
 #[test]
 fn descriptor_division_and_run_id_arrays_are_validated() {
@@ -700,7 +700,7 @@ fn descriptor_division_and_run_id_arrays_are_validated() {
     );
 }
 
-// B3: the layout holds at every depth. All three shapes passed verify
+// The layout holds at every depth. All three shapes passed verify
 // before the fix.
 #[test]
 fn deep_layout_strays_are_refused() {
@@ -751,7 +751,7 @@ fn deep_layout_strays_are_refused() {
     );
 }
 
-// B4: checksums.b3 framing is enforced like shard framing. Both
+// Checksums.b3 framing is enforced like shard framing. Both
 // shapes passed verify before the fix with the chain rebuilt.
 #[test]
 fn checksums_framing_is_enforced() {
@@ -787,7 +787,7 @@ fn checksums_framing_is_enforced() {
     );
 }
 
-// B5: the rules snapshot binds to the effective records. A record
+// The rules snapshot binds to the effective records. A record
 // claiming another rules generation verified before the fix.
 #[test]
 fn rules_snapshot_binds_to_the_records() {
@@ -849,7 +849,7 @@ fn rules_snapshot_binds_to_the_records() {
     }
 }
 
-// B6 defense in depth: separator bytes that mean something on other
+// Defense in depth: separator bytes that mean something on other
 // hosts are refused in checksum paths outright.
 #[test]
 fn foreign_separator_bytes_in_checksum_paths_are_refused() {
@@ -875,7 +875,7 @@ fn foreign_separator_bytes_in_checksum_paths_are_refused() {
     );
 }
 
-// H1: refusal branches that were correct by inspection but undriven.
+// Refusal branches that were correct by inspection but undriven.
 #[test]
 fn undriven_refusal_branches_are_locked() {
     let setup = setup();

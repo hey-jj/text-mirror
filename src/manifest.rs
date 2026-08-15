@@ -9,8 +9,8 @@
 //! Every record self-describes its schema in its first field, so a
 //! shard separated from its bundle stays verifiable. A consumer must
 //! reject any record whose `schema` value it does not recognize.
-//! [`ManifestSchema`] enforces both rules at the serde layer. Records
-//! also reject unknown fields, so an additive change is a breaking
+//! [`ManifestSchema`] enforces both rules at the serde layer, and
+//! records reject unknown fields, so an additive change is a breaking
 //! change that bumps the schema version.
 
 use std::fs::{self, File, OpenOptions};

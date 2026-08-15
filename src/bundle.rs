@@ -8,8 +8,8 @@
 //! crash recovery for its own resume path, and packaging refuses a
 //! shard with a torn tail instead of repairing it, because a torn
 //! tail means an interrupted run and the remedy is resuming the run.
-//! Every line of every shard in a verified bundle parses as a
-//! complete record.
+//! Once a bundle passes verification, every line of every shard
+//! parses as a complete record.
 //!
 //! Verification refuses the whole bundle on any failure and names
 //! every offender the failing step found. Merging verifies every
@@ -537,7 +537,7 @@ pub fn bundle(options: &BundleOptions) -> Result<BundleReport> {
 /// The `verify` verb output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyReport {
-    /// The verified bundle root.
+    /// The bundle root the checks ran against.
     pub bundle: String,
     /// Divisions the bundle carries.
     pub divisions: Vec<String>,
@@ -1034,7 +1034,7 @@ pub struct MergeReport {
     pub checksums_hash: String,
 }
 
-/// Merges two or more verified bundles into one.
+/// Merges two or more bundles into one, checking each in full first.
 ///
 /// Every input verifies first, divisions must be disjoint
 /// case-insensitively, rules snapshots must be byte-identical, and

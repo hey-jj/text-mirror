@@ -146,11 +146,10 @@ fn engage(_config: &HelperConfig) -> Result<(), String> {
 /// real user id, so a compromised adapter cannot fork-bomb the host.
 /// `RLIMIT_AS` is applied on Linux only. On macOS the dyld shared
 /// cache reserves a large and version-dependent virtual range, so a
-/// hard address-space cap aborts the process on its next allocation
-/// rather than bounding it. The CPU, file-size, process-count, and
+/// hard address-space cap turns the next allocation into an abort. The CPU, file-size, process-count, and
 /// core limits hold on every platform, and the macOS backend is
 /// development containment where the wall-clock and output caps are
-/// the load-bearing bounds.
+/// the bounds that hold.
 fn apply_rlimits(config: &HelperConfig) -> Result<(), String> {
     use rlimit::{Resource, setrlimit};
     let apply = |resource: Resource, name: &str, value: u64| {

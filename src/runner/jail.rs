@@ -10,9 +10,9 @@
 //! Before a backend accepts adapter work, a capability probe must
 //! prove the jail from the inside: an outbound IPv4 connection, an
 //! outbound IPv6 connection, a Unix socket connection to a listener
-//! the parent holds outside the jail, and a UDP send must all fail
-//! immediately. A success or a hang proves nothing and fails the
-//! probe. Only a passed probe is cached, keyed by the policy digest,
+//! the parent holds outside the jail, and a UDP send must each
+//! return an error before the probe deadline. A success or a hang
+//! proves nothing and fails the probe. Only a passed probe is cached, keyed by the policy digest,
 //! and the cache lives in this process, which cannot outlive the
 //! boot, so a cached pass never crosses a boot or a policy change.
 
@@ -135,11 +135,11 @@ pub fn probe_cached(digest: &str) -> bool {
 }
 
 /// Runs the `probe-net` worker mode inside the jail and requires
-/// every egress attempt to fail immediately.
+/// every egress attempt to return an error before the probe deadline.
 ///
 /// The parent holds a live Unix socket listener outside the jail for
-/// the duration, so the Unix attempt would succeed from an unjailed
-/// process and its failure is evidence, not absence.
+/// the duration. The Unix attempt would succeed from an unjailed
+/// process, so when it fails the jail provably blocked it.
 pub(super) fn probe_net(runner: &Runner, seccomp: bool) -> Result<(), RunnerError> {
     let listener = UnixProbeListener::bind()?;
     // Loopback TCP listeners the parent holds for the probe's

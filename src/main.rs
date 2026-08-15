@@ -28,7 +28,7 @@ use text_mirror::walk::WalkOptions;
     name = "text-mirror",
     version,
     about = "Converts files into plain text and builds a replica text-mirror tree \
-             beside a provenance manifest"
+             beside a manifest recording how every file was handled"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -89,7 +89,7 @@ enum Command {
         /// The bundle root to verify
         bundle: PathBuf,
     },
-    /// Combine verified per-division bundles into one
+    /// Check and combine per-division bundles into one
     Merge {
         /// Two or more input bundle roots
         #[arg(required = true, num_args = 2..)]

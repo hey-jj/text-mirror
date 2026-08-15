@@ -38,7 +38,7 @@ pub struct CanonicalArtifact {
     pub converter_id: String,
     /// Version of that converter.
     pub converter_version: String,
-    /// Artifact kind of the canonical artifact.
+    /// The canonical artifact's kind.
     pub artifact_kind: Option<ArtifactKind>,
 }
 

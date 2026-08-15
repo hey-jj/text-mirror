@@ -164,7 +164,8 @@ mod production {
 /// Network egress attempts used by the probe. Every target is one
 /// the parent controls and holds reachable, so each leg discriminates
 /// jailed from unjailed: an unjailed process connects, a jailed one
-/// fails immediately. Only an immediate error scores `denied`. A hang
+/// gets a prompt error. Only an error before the deadline scores
+/// `denied`. A hang
 /// scores `timeout`, which fails the probe, because a hang proves
 /// nothing about the jail.
 mod net {
