@@ -8,7 +8,8 @@ keywords = ["conversion", "text-extraction", "corpus", "provenance", "manifest"]
 categories = ["command-line-utilities", "parsing"]
 readme = "README.md"
 repository = "https://github.com/hey-jj/text-mirror"
-rust-version = "1.85"
+documentation = "https://docs.rs/text-mirror"
+rust-version = "1.88"
 exclude = ["AGENTS.md", "/tests"]
 
 [lib]
@@ -31,11 +32,8 @@ test-adapters = []
 # Compiles the jailed records worker: the parquet, avro, and sqlite
 # readers that run inside the subprocess sandbox. Off by default, so a
 # library build and the main CLI pull none of the heavy native parser
-# trees and stay buildable on the 1.85 toolchain the package declares.
-# Turning it on pulls the pinned reader crates and raises the build's
-# minimum to 1.88, which apache-avro 0.22 requires. The self
-# dev-dependency below turns it on so `cargo test` exercises the
-# readers, exactly as it does the fake engines above.
+# trees. The self dev-dependency below turns it on so `cargo test`
+# exercises the readers, exactly as it does the fake engines above.
 records-worker = ["dep:parquet", "dep:apache-avro", "dep:rusqlite"]
 
 [dependencies]
@@ -73,8 +71,7 @@ pulldown-cmark = { version = "=0.13.4", default-features = false }
 # Records-worker readers. Optional and gated behind the records-worker
 # feature, so a default build pulls none of these native trees. Their
 # CVE history and large transitive surface are the reason the readers
-# run only inside the M3 subprocess jail. apache-avro 0.22 sets the
-# worker's minimum toolchain to 1.88.
+# run only inside the subprocess jail.
 parquet = { version = "=59.2.0", default-features = false, features = ["brotli", "crc", "flate2-rust_backend", "lz4", "snap", "zstd"], optional = true }
 apache-avro = { version = "=0.22.0", default-features = false, features = ["snappy"], optional = true }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "limits"], optional = true }

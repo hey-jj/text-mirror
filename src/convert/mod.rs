@@ -222,7 +222,7 @@ fn decode_utf16_pairs(
     big_endian: bool,
     mark_len: usize,
 ) -> std::result::Result<String, ConvertError> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(ConvertError {
             code: "invalid_utf16",
             message: format!("odd trailing byte at byte {}", mark_len + bytes.len() - 1),

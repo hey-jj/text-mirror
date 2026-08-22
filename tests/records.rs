@@ -1,5 +1,6 @@
 //! End-to-end tests for the jailed records worker: parquet, avro, and
-//! sqlite rendered to inert tab-separated text behind the M3 sandbox.
+//! sqlite rendered to inert tab-separated text behind the subprocess
+//! sandbox.
 //!
 //! Fixtures are built with the pinned reader crates, which the self
 //! dev-dependency turns on with the `records-worker` feature, exactly
