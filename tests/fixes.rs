@@ -157,7 +157,7 @@ fn stale_seed_is_ignored_and_dedup_hashes_written_bytes() {
     // The rules bump reconverted the canonical instead of trusting it.
     let canonical = terminal(&setup, "a.txt");
     assert_eq!(canonical.status, Status::Converted);
-    assert_eq!(canonical.rules_version, "3");
+    assert_eq!(canonical.rules_version, rules.version());
     assert_eq!(
         fs::read_to_string(setup.mirror.join("alpha/a.txt.txt")).unwrap(),
         "payload\n"
@@ -362,6 +362,7 @@ fn symlink_entries_are_recorded_not_skipped() {
     let record = terminal(&setup, "link.txt");
     assert_eq!(record.status, Status::Unsupported);
     assert_eq!(record.detected_format, "symlink");
+    assert_eq!(record.error.as_deref(), Some("no-converter"));
     assert_eq!(record.source_hash, hash::hash_bytes(b"real.txt"));
     assert_eq!(record.source_size, "real.txt".len() as u64);
     assert!(record.text_path.is_none());

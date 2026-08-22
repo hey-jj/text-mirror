@@ -5,7 +5,7 @@
 # rules_version, so a change here is a visible versioned event. It must
 # match the version in converters.toml.
 
-version = "3"
+version = "4"
 
 [[formats]]
 id = "text"
@@ -161,3 +161,295 @@ extensions = ["eml"]
 id = "msg"
 name = "Outlook message"
 extensions = ["msg"]
+
+# Text-native formats. Each routes to the plain text passthrough in
+# converters.toml, which validates UTF-8 and fails closed on anything
+# else, so a binary wearing one of these extensions records failed
+# with invalid_utf8. One id per format so consumers can slice by
+# detected_format.
+
+[[formats]]
+id = "json"
+name = "JSON"
+extensions = ["json"]
+
+[[formats]]
+id = "jsonl"
+name = "JSON Lines"
+extensions = ["jsonl", "ndjson"]
+
+[[formats]]
+id = "yaml"
+name = "YAML"
+extensions = ["yaml", "yml"]
+
+[[formats]]
+id = "xml"
+name = "XML"
+extensions = ["xml"]
+
+[[formats]]
+id = "tsv"
+name = "Tab-separated values"
+extensions = ["tsv"]
+
+[[formats]]
+id = "toml"
+name = "TOML"
+extensions = ["toml"]
+
+[[formats]]
+id = "ini"
+name = "INI configuration"
+extensions = ["ini", "cfg", "conf", "properties"]
+
+[[formats]]
+id = "env"
+name = "Environment file"
+extensions = ["env"]
+
+# refines names the generic parent format whose magic these bytes
+# also satisfy. When magic resolves to the parent and the extension
+# declares the refinement, the declared id wins with no mismatch,
+# because an svg is xml and the observations agree.
+[[formats]]
+id = "svg"
+name = "Scalable Vector Graphics"
+extensions = ["svg"]
+refines = "xml"
+
+[[formats]]
+id = "ipynb"
+name = "Jupyter notebook"
+extensions = ["ipynb"]
+
+[[formats]]
+id = "python"
+name = "Python source"
+extensions = ["py"]
+
+[[formats]]
+id = "shell"
+name = "Shell script"
+extensions = ["sh", "bash", "zsh"]
+
+[[formats]]
+id = "rust"
+name = "Rust source"
+extensions = ["rs"]
+
+[[formats]]
+id = "javascript"
+name = "JavaScript source"
+extensions = ["js", "mjs", "jsx"]
+
+[[formats]]
+id = "typescript"
+name = "TypeScript source"
+extensions = ["ts", "tsx"]
+
+[[formats]]
+id = "sql"
+name = "SQL script"
+extensions = ["sql"]
+
+[[formats]]
+id = "ruby"
+name = "Ruby source"
+extensions = ["rb"]
+
+[[formats]]
+id = "go"
+name = "Go source"
+extensions = ["go"]
+
+[[formats]]
+id = "java"
+name = "Java source"
+extensions = ["java"]
+
+[[formats]]
+id = "c"
+name = "C source"
+extensions = ["c", "h"]
+
+[[formats]]
+id = "cpp"
+name = "C++ source"
+extensions = ["cc", "cpp", "hpp"]
+
+[[formats]]
+id = "csharp"
+name = "C# source"
+extensions = ["cs"]
+
+[[formats]]
+id = "php"
+name = "PHP source"
+extensions = ["php"]
+
+[[formats]]
+id = "perl"
+name = "Perl source"
+extensions = ["pl"]
+
+[[formats]]
+id = "powershell"
+name = "PowerShell script"
+extensions = ["ps1", "psm1"]
+
+[[formats]]
+id = "batch"
+name = "Windows batch script"
+extensions = ["bat", "cmd"]
+
+[[formats]]
+id = "terraform"
+name = "Terraform configuration"
+extensions = ["tf", "tfvars"]
+
+[[formats]]
+id = "hcl"
+name = "HashiCorp configuration language"
+extensions = ["hcl"]
+
+[[formats]]
+id = "lookml"
+name = "LookML model"
+extensions = ["lkml"]
+
+[[formats]]
+id = "tmdl"
+name = "Tabular Model Definition Language"
+extensions = ["tmdl"]
+
+[[formats]]
+id = "pbip"
+name = "Power BI project"
+extensions = ["pbip"]
+
+[[formats]]
+id = "tableau-workbook"
+name = "Tableau workbook"
+extensions = ["twb"]
+refines = "xml"
+
+[[formats]]
+id = "tableau-datasource"
+name = "Tableau data source"
+extensions = ["tds"]
+refines = "xml"
+
+# Recognized formats no converter claims. Each carries a declared
+# unsupported reason in converters.toml, so detection names the
+# format and the record names the reason.
+
+[[formats]]
+id = "pickle"
+name = "Python pickle"
+extensions = ["pkl", "pickle"]
+
+[[formats]]
+id = "webp"
+name = "WebP image"
+extensions = ["webp"]
+
+[[formats]]
+id = "heic"
+name = "HEIC image"
+extensions = ["heic"]
+
+[[formats]]
+id = "parquet"
+name = "Apache Parquet"
+extensions = ["parquet"]
+
+[[formats]]
+id = "avro"
+name = "Apache Avro"
+extensions = ["avro"]
+
+[[formats]]
+id = "sqlite"
+name = "SQLite database"
+extensions = ["sqlite", "sqlite3"]
+
+[[formats]]
+id = "arrow"
+name = "Apache Arrow"
+extensions = ["arrow"]
+
+[[formats]]
+id = "orc"
+name = "Apache ORC"
+extensions = ["orc"]
+
+[[formats]]
+id = "feather"
+name = "Feather columnar"
+extensions = ["feather"]
+
+[[formats]]
+id = "duckdb"
+name = "DuckDB database"
+extensions = ["duckdb"]
+
+[[formats]]
+id = "faiss"
+name = "FAISS index"
+extensions = ["faiss"]
+
+[[formats]]
+id = "msgpack"
+name = "MessagePack data"
+extensions = ["msgpack"]
+
+[[formats]]
+id = "tar"
+name = "Tar archive"
+extensions = ["tar"]
+
+[[formats]]
+id = "gzip"
+name = "Gzip compressed file"
+extensions = ["gz"]
+
+[[formats]]
+id = "bzip2"
+name = "Bzip2 compressed file"
+extensions = ["bz2"]
+
+[[formats]]
+id = "7z"
+name = "7-Zip archive"
+extensions = ["7z"]
+
+[[formats]]
+id = "rar"
+name = "RAR archive"
+extensions = ["rar"]
+
+[[formats]]
+id = "sketch"
+name = "Sketch design"
+extensions = ["sketch"]
+
+[[formats]]
+id = "psd"
+name = "Adobe Photoshop document"
+extensions = ["psd", "psb"]
+
+[[formats]]
+id = "fig"
+name = "Figma design"
+extensions = ["fig"]
+
+[[formats]]
+id = "indd"
+name = "Adobe InDesign document"
+extensions = ["indd"]
+
+[[formats]]
+id = "idml"
+name = "Adobe InDesign markup"
+extensions = ["idml"]

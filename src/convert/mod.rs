@@ -2,7 +2,8 @@
 //!
 //! Every converter returns the same outcome shape. The registry in
 //! `rules/converters.toml` maps format ids to converters. A format no
-//! converter claims is unsupported. A converter error or invalid
+//! converter claims is unsupported, with a declared reason or the
+//! `no-converter` floor. A converter error or invalid
 //! output is a failure with a machine-readable reason and no text
 //! artifact. There is no silent skip and no silently empty file. A
 //! non-empty source that converts to empty text fails with reason
@@ -45,6 +46,7 @@ use std::fmt;
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::detect::RESERVED_FORMAT_IDS;
 use crate::segments::Segment;
 use crate::{Error, Result};
 
@@ -139,15 +141,70 @@ pub fn normalize_text(input: &str) -> String {
 
 /// Passthrough for text-native formats.
 ///
-/// Reads the source as plain text, validates UTF-8, strips a leading
-/// byte order mark, and applies [`normalize_text`]. It parses nothing
-/// and strips no markup.
+/// Reads the source as plain text and applies [`normalize_text`]. It
+/// parses nothing and strips no markup. Input encoding is UTF-8, or
+/// UTF-16 behind a required byte order mark: a leading `FF FE`
+/// decodes as UTF-16LE and `FE FF` as UTF-16BE, the mark is consumed
+/// before decoding, and the outcome carries a transcoding warning. A
+/// UTF-32 mark fails closed with reason `unsupported-encoding`, an
+/// odd trailing byte or unpaired surrogate fails with `invalid_utf16`
+/// naming the byte offset, and a file with no mark must be valid
+/// UTF-8. A leading UTF-8 byte order mark is stripped with a warning.
 pub struct PlainTextPassthrough;
+
+/// The floor reason for an unsupported record whose detected format
+/// has no converter entry and no declared reason, including true
+/// unknowns.
+pub const NO_CONVERTER_REASON: &str = "no-converter";
 
 /// Registry id of the passthrough converter.
 pub const PASSTHROUGH_ID: &str = "text-passthrough";
 /// Version of the passthrough converter.
-pub const PASSTHROUGH_VERSION: &str = "1.0.0";
+pub const PASSTHROUGH_VERSION: &str = "1.1.0";
+
+/// Decodes UTF-16 byte pairs after a consumed byte order mark.
+///
+/// `mark_len` is the consumed mark's length, so failure offsets name
+/// positions in the original source bytes.
+fn decode_utf16_pairs(
+    bytes: &[u8],
+    big_endian: bool,
+    mark_len: usize,
+) -> std::result::Result<String, ConvertError> {
+    if bytes.len() % 2 != 0 {
+        return Err(ConvertError {
+            code: "invalid_utf16",
+            message: format!("odd trailing byte at byte {}", mark_len + bytes.len() - 1),
+        });
+    }
+    let units = bytes.chunks_exact(2).map(|pair| {
+        if big_endian {
+            u16::from_be_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_le_bytes([pair[0], pair[1]])
+        }
+    });
+    let mut decoded = String::with_capacity(bytes.len() / 2);
+    let mut consumed_units = 0usize;
+    for result in char::decode_utf16(units) {
+        match result {
+            Ok(c) => {
+                decoded.push(c);
+                consumed_units += c.len_utf16();
+            }
+            Err(_) => {
+                return Err(ConvertError {
+                    code: "invalid_utf16",
+                    message: format!(
+                        "unpaired surrogate at byte {}",
+                        mark_len + consumed_units * 2
+                    ),
+                });
+            }
+        }
+    }
+    Ok(decoded)
+}
 
 impl Converter for PlainTextPassthrough {
     fn id(&self) -> &'static str {
@@ -164,17 +221,35 @@ impl Converter for PlainTextPassthrough {
         detected_format: &str,
     ) -> std::result::Result<Outcome, ConvertError> {
         let source_len = source.len();
-        let raw = String::from_utf8(source.to_vec()).map_err(|e| ConvertError {
-            code: "invalid_utf8",
-            message: format!("invalid UTF-8 at byte {}", e.utf8_error().valid_up_to()),
-        })?;
         let mut warnings = Vec::new();
-        let raw = match raw.strip_prefix('\u{feff}') {
-            Some(stripped) => {
-                warnings.push("stripped leading byte order mark".to_string());
-                stripped.to_string()
+        // The four-byte UTF-32 marks come first, because the UTF-32LE
+        // mark begins with the UTF-16LE one and would otherwise decode
+        // as UTF-16 with interleaved NULs.
+        let raw = if source.starts_with(&[0xFF, 0xFE, 0x00, 0x00])
+            || source.starts_with(&[0x00, 0x00, 0xFE, 0xFF])
+        {
+            return Err(ConvertError {
+                code: "unsupported-encoding",
+                message: "utf-32 byte order mark".to_string(),
+            });
+        } else if let Some(rest) = source.strip_prefix(&[0xFF, 0xFE][..]) {
+            warnings.push("transcoded from utf-16le".to_string());
+            decode_utf16_pairs(rest, false, 2)?
+        } else if let Some(rest) = source.strip_prefix(&[0xFE, 0xFF][..]) {
+            warnings.push("transcoded from utf-16be".to_string());
+            decode_utf16_pairs(rest, true, 2)?
+        } else {
+            let raw = String::from_utf8(source.to_vec()).map_err(|e| ConvertError {
+                code: "invalid_utf8",
+                message: format!("invalid UTF-8 at byte {}", e.utf8_error().valid_up_to()),
+            })?;
+            match raw.strip_prefix('\u{feff}') {
+                Some(stripped) => {
+                    warnings.push("stripped leading byte order mark".to_string());
+                    stripped.to_string()
+                }
+                None => raw,
             }
-            None => raw,
         };
         let text = normalize_text(&raw);
         if source_len > 0 && text.is_empty() {
@@ -275,6 +350,12 @@ impl Registry {
             let index = converters.len();
             converters.push(converter);
             for format in &entry.formats {
+                if RESERVED_FORMAT_IDS.contains(&format.as_str()) {
+                    return Err(Error::Rules {
+                        name: name.to_string(),
+                        message: format!("format id {format:?} is reserved"),
+                    });
+                }
                 if by_format.insert(format.clone(), index).is_some() {
                     return Err(Error::Rules {
                         name: name.to_string(),
@@ -286,6 +367,12 @@ impl Registry {
         let mut unsupported_reasons = HashMap::new();
         for entry in &raw.unsupported {
             for format in &entry.formats {
+                if RESERVED_FORMAT_IDS.contains(&format.as_str()) {
+                    return Err(Error::Rules {
+                        name: name.to_string(),
+                        message: format!("format id {format:?} is reserved"),
+                    });
+                }
                 if by_format.contains_key(format)
                     || unsupported_reasons
                         .insert(format.clone(), entry.reason.clone())
@@ -318,11 +405,23 @@ impl Registry {
             .map(|index| self.converters[*index].as_ref())
     }
 
-    /// The declared reason a format is unsupported, when the registry
-    /// names one, such as a spreadsheet format with no visibility
-    /// reader yet.
+    /// The reason a format is unsupported.
+    ///
+    /// A declared entry from the registry wins, such as a spreadsheet
+    /// format with no visibility reader yet. Every other format no
+    /// converter claims gets the generic floor
+    /// [`NO_CONVERTER_REASON`], so an unsupported record is never
+    /// reason-less. A format a converter claims returns `None`.
     pub fn unsupported_reason(&self, format_id: &str) -> Option<&str> {
-        self.unsupported_reasons.get(format_id).map(String::as_str)
+        if self.by_format.contains_key(format_id) {
+            return None;
+        }
+        Some(
+            self.unsupported_reasons
+                .get(format_id)
+                .map(String::as_str)
+                .unwrap_or(NO_CONVERTER_REASON),
+        )
     }
 
     /// A registry built directly from converter instances, for tests
@@ -398,10 +497,92 @@ mod tests {
         assert_eq!(outcome.text, "");
     }
 
+    fn utf16_bytes(text: &str, big_endian: bool) -> Vec<u8> {
+        let mut bytes = if big_endian {
+            vec![0xFE, 0xFF]
+        } else {
+            vec![0xFF, 0xFE]
+        };
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            });
+        }
+        bytes
+    }
+
+    #[test]
+    fn passthrough_transcodes_utf16le_behind_a_byte_order_mark() {
+        let source = utf16_bytes("a,b\r\n1,caf\u{e9}\r\n", false);
+        let outcome = PlainTextPassthrough.convert(&source, "csv").unwrap();
+        assert_eq!(outcome.text, "a,b\n1,caf\u{e9}\n");
+        assert_eq!(
+            outcome.warnings,
+            vec!["transcoded from utf-16le".to_string()]
+        );
+    }
+
+    #[test]
+    fn passthrough_transcodes_utf16be_behind_a_byte_order_mark() {
+        let source = utf16_bytes("total \u{5317}\u{4eac}\n", true);
+        let outcome = PlainTextPassthrough.convert(&source, "text").unwrap();
+        assert_eq!(outcome.text, "total \u{5317}\u{4eac}\n");
+        assert_eq!(
+            outcome.warnings,
+            vec!["transcoded from utf-16be".to_string()]
+        );
+    }
+
+    #[test]
+    fn passthrough_refuses_utf32_byte_order_marks() {
+        for source in [
+            b"\xFF\xFE\x00\x00A\x00\x00\x00".as_slice(),
+            b"\x00\x00\xFE\xFF\x00\x00\x00A".as_slice(),
+        ] {
+            let err = PlainTextPassthrough.convert(source, "text").unwrap_err();
+            assert_eq!(err.code, "unsupported-encoding");
+            assert!(err.to_string().starts_with("unsupported-encoding: utf-32"));
+        }
+    }
+
+    #[test]
+    fn passthrough_fails_an_odd_utf16_tail_at_its_offset() {
+        let err = PlainTextPassthrough
+            .convert(b"\xFF\xFEA\x00B", "text")
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_utf16");
+        assert_eq!(err.message, "odd trailing byte at byte 4");
+    }
+
+    #[test]
+    fn passthrough_fails_an_unpaired_surrogate_at_its_offset() {
+        let err = PlainTextPassthrough
+            .convert(b"\xFF\xFEA\x00\x00\xD8", "text")
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_utf16");
+        assert_eq!(err.message, "unpaired surrogate at byte 4");
+    }
+
+    #[test]
+    fn passthrough_still_fails_bomless_utf16_as_invalid_utf8() {
+        let mut source = utf16_bytes("R\u{e9}sum\u{e9}\n", false);
+        source.drain(..2);
+        let err = PlainTextPassthrough.convert(&source, "text").unwrap_err();
+        assert_eq!(err.code, "invalid_utf8");
+    }
+
     #[test]
     fn builtin_registry_claims_the_text_family() {
         let registry = Registry::builtin().unwrap();
-        assert_eq!(registry.version(), "3");
+        assert_eq!(registry.version(), "4");
+        assert!(registry.converter_for("json").is_some());
+        assert!(registry.converter_for("yaml").is_some());
+        assert!(registry.converter_for("svg").is_some());
+        assert!(registry.converter_for("ipynb").is_some());
+        assert!(registry.converter_for("python").is_some());
+        assert!(registry.converter_for("pickle").is_none());
         assert!(registry.converter_for("text").is_some());
         assert!(registry.converter_for("markdown").is_some());
         assert!(registry.converter_for("csv").is_some());
@@ -418,9 +599,66 @@ mod tests {
             registry.unsupported_reason("xlsb"),
             Some("hidden-visibility-unresolved")
         );
+        assert_eq!(
+            registry.unsupported_reason("pickle"),
+            Some("pickle-deserialization-unsafe")
+        );
+        assert_eq!(registry.unsupported_reason("webp"), Some("engine-unpinned"));
+        assert_eq!(
+            registry.unsupported_reason("parquet"),
+            Some("converter-deferred")
+        );
+        assert_eq!(
+            registry.unsupported_reason("tar"),
+            Some("container-deferred")
+        );
+        assert_eq!(
+            registry.unsupported_reason("psd"),
+            Some("proprietary-binary")
+        );
+        // The floor: a format nothing claims and nothing declares.
+        assert_eq!(
+            registry.unsupported_reason("unknown"),
+            Some(NO_CONVERTER_REASON)
+        );
+        // A claimed format has no unsupported reason.
+        assert_eq!(registry.unsupported_reason("text"), None);
         assert_eq!(registry.unsupported_reason("png"), Some("engine-unpinned"));
         assert_eq!(registry.unsupported_reason("mp4"), Some("engine-unpinned"));
-        assert_eq!(registry.unsupported_reason("html"), None);
+        // html is detected but unclaimed until a strip converter
+        // lands, so it sits on the floor, not outside the vocabulary.
+        assert_eq!(
+            registry.unsupported_reason("html"),
+            Some(NO_CONVERTER_REASON)
+        );
+    }
+
+    #[test]
+    fn registry_rejects_reserved_format_ids() {
+        for (section, id) in [
+            ("converters", "symlink"),
+            ("converters", "unknown"),
+            ("unsupported", "symlink"),
+            ("unsupported", "unknown"),
+        ] {
+            let toml = if section == "converters" {
+                format!(
+                    "version = \"1\"\n[[converters]]\nid = \"text-passthrough\"\nversion = \"1.1.0\"\nformats = [\"{id}\"]\n"
+                )
+            } else {
+                format!(
+                    "version = \"1\"\nconverters = []\n[[unsupported]]\nreason = \"r\"\nformats = [\"{id}\"]\n"
+                )
+            };
+            let err = match Registry::parse(&toml, "converters.toml") {
+                Ok(_) => panic!("{section} {id}: reserved id was accepted"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("reserved"),
+                "{section} {id}: {err}"
+            );
+        }
     }
 
     #[test]

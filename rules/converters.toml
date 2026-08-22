@@ -1,16 +1,36 @@
 # Converter registry for text-mirror.
 #
 # Each entry pins a converter id, its version, and the format ids it
-# claims. A format no entry claims produces status unsupported. The
-# version must match the version in formats.toml and is recorded in
-# every manifest record as rules_version.
+# claims. A format no entry claims produces status unsupported with a
+# machine-readable reason: a declared reason from the entries at the
+# bottom of this file, or the generic floor no-converter. The version
+# must match the version in formats.toml and is recorded in every
+# manifest record as rules_version.
 
-version = "3"
+version = "4"
 
+# The passthrough validates UTF-8 and fails closed on anything else,
+# so a binary wearing one of these extensions records failed with
+# invalid_utf8. That floor is what makes a broad list safe.
 [[converters]]
 id = "text-passthrough"
-version = "1.0.0"
-formats = ["text", "markdown", "csv"]
+version = "1.1.0"
+formats = [
+  "text", "markdown", "csv",
+  # Structured text and data interchange.
+  "json", "jsonl", "yaml", "xml", "tsv", "toml", "ini", "env",
+  # Markup whose raw text is the content. svg passes through as raw
+  # markup, and ipynb as the raw notebook json, so every cell source,
+  # output, and metadata string reaches the artifact.
+  "svg", "ipynb",
+  # Source code and scripts.
+  "python", "shell", "rust", "javascript", "typescript", "sql",
+  "ruby", "go", "java", "c", "cpp", "csharp", "php", "perl",
+  "powershell", "batch",
+  # Infrastructure and analytics tool text.
+  "terraform", "hcl", "lookml", "tmdl", "pbip",
+  "tableau-workbook", "tableau-datasource",
+]
 
 [[converters]]
 id = "anydoc-document"
@@ -45,4 +65,37 @@ formats = ["xlsb", "xla", "xlam"]
 # engine re-runs every such record automatically.
 [[unsupported]]
 reason = "engine-unpinned"
-formats = ["png", "jpeg", "tiff", "mp3", "wav", "m4a", "mp4", "mov"]
+formats = [
+  "png", "jpeg", "tiff", "webp", "heic",
+  "mp3", "wav", "m4a", "mp4", "mov",
+]
+
+# Deserializing a pickle stream executes arbitrary code, so no
+# pickle deserializer exists in this tree. Never add one. Bytes that
+# resolve to the pickle format are refused unconverted with this
+# reason. A file wearing a pickle name whose bytes are genuinely
+# another format, a docx-shaped zip named .pkl, routes as that format
+# under magic-first detection with the mismatch flag raised.
+[[unsupported]]
+reason = "pickle-deserialization-unsafe"
+formats = ["pickle"]
+
+# Recognized data formats with feasible extraction that no converter
+# claims yet.
+[[unsupported]]
+reason = "converter-deferred"
+formats = [
+  "parquet", "avro", "sqlite", "arrow", "orc", "feather",
+  "duckdb", "faiss", "msgpack",
+]
+
+# Archive formats awaiting container expansion.
+[[unsupported]]
+reason = "container-deferred"
+formats = ["tar", "gzip", "bzip2", "7z", "rar"]
+
+# Design-tool and app binaries with no public text extraction worth
+# building.
+[[unsupported]]
+reason = "proprietary-binary"
+formats = ["sketch", "psd", "fig", "indd", "idml"]

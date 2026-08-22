@@ -795,25 +795,29 @@ fn rules_snapshot_binds_to_the_records() {
     run_division(&setup, "emea", &[("a.txt", "content\n")]);
 
     // Receiving side: a forged effective record from rules 9.
+    let current = Rules::builtin().unwrap().version().to_string();
     let out = bundle_division(&setup, "emea", "case-rules-version");
     let shard = out.join("manifest/emea.jsonl");
     let line = fs::read_to_string(&shard).unwrap();
-    let forged = line.replace("\"rules_version\":\"3\"", "\"rules_version\":\"9\"");
+    let forged = line.replace(
+        &format!("\"rules_version\":\"{current}\""),
+        "\"rules_version\":\"9\"",
+    );
     assert_ne!(line, forged);
     fs::write(&shard, &forged).unwrap();
     refresh_checksums(&out);
     let problems = refusal_of(bundle::verify(&out));
     assert!(
-        problems
-            .iter()
-            .any(|p| p.contains("does not match the snapshot rules version \"3\"")),
+        problems.iter().any(|p| p.contains(&format!(
+            "does not match the snapshot rules version \"{current}\""
+        ))),
         "{problems:?}"
     );
 
     // Receiving side: the two snapshot files disagree.
     let out = bundle_division(&setup, "emea", "case-rules-disagree");
     let formats = fs::read_to_string(out.join("rules/formats.toml")).unwrap();
-    let bumped = formats.replace("version = \"3\"", "version = \"4\"");
+    let bumped = formats.replace(&format!("version = \"{current}\""), "version = \"9\"");
     assert_ne!(formats, bumped);
     fs::write(out.join("rules/formats.toml"), &bumped).unwrap();
     refresh_checksums(&out);
@@ -829,7 +833,10 @@ fn rules_snapshot_binds_to_the_records() {
     // the operator to re-run.
     let prep_shard = setup.manifest_dir.join("emea.jsonl");
     let line = fs::read_to_string(&prep_shard).unwrap();
-    let forged = line.replace("\"rules_version\":\"3\"", "\"rules_version\":\"9\"");
+    let forged = line.replace(
+        &format!("\"rules_version\":\"{current}\""),
+        "\"rules_version\":\"9\"",
+    );
     fs::write(&prep_shard, &forged).unwrap();
     let result = bundle::bundle(&BundleOptions {
         mirror_root: &setup.mirror,

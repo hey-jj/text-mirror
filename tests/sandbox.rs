@@ -113,13 +113,13 @@ fn pdf_converts_behind_the_runner_and_records_the_subprocess_converter() {
     );
     assert_eq!(record.converter_id.as_deref(), Some("pdf-subprocess"));
     assert_eq!(record.converter_version.as_deref(), Some("1.0.0"));
-    assert_eq!(record.rules_version, "3");
+    assert_eq!(record.rules_version, rules.version());
     let text = fs::read_to_string(setup.mirror.join("alpha/brief.pdf.txt")).unwrap();
     assert!(text.contains("Runner carried text"), "text: {text:?}");
 }
 
 #[test]
-fn a_converted_pdf_reconverts_idempotently_under_rules_three() {
+fn a_converted_pdf_reconverts_idempotently_under_the_pinned_rules() {
     let setup = setup();
     fs::write(
         setup.root.join("brief.pdf"),
@@ -133,13 +133,13 @@ fn a_converted_pdf_reconverts_idempotently_under_rules_three() {
 
     // The checkpoint key includes converter version and rules version.
     // A second pass matches it and skips with no work, and the record
-    // still carries the rules_version 3 provenance.
+    // still carries the run's rules version as provenance.
     let second = run(&setup, &rules);
     assert_eq!(second.counts.converted, 0);
     assert_eq!(second.counts.skipped_unchanged, 1);
     let record = terminal(&setup, "brief.pdf");
     assert_eq!(record.status, Status::SkippedUnchanged);
-    assert_eq!(record.rules_version, "3");
+    assert_eq!(record.rules_version, rules.version());
     assert_eq!(record.converter_id.as_deref(), Some("pdf-subprocess"));
 }
 

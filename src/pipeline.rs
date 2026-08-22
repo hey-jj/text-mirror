@@ -380,14 +380,17 @@ fn envelope_intact(artifact: &Path, text_hash: &str, segments_path: &Path) -> bo
     segments::parse_jsonl(&sidecar).is_ok_and(|segs| segments::validate(&segs, &text).is_ok())
 }
 
-fn source_front(absolute: &Path, table: &FormatTable) -> Result<(String, u64, Detection)> {
+fn source_front(
+    absolute: &Path,
+    table: &FormatTable,
+) -> Result<(String, u64, Detection, Vec<String>)> {
     let source_hash = hash::hash_file(absolute)?;
     let source_size = absolute
         .metadata()
         .map_err(|e| Error::io("stat", absolute, e))?
         .len();
-    let detection = detect::detect_file(absolute, table)?;
-    Ok((source_hash, source_size, detection))
+    let (detection, warnings) = detect::detect_file_with_warnings(absolute, table)?;
+    Ok((source_hash, source_size, detection, warnings))
 }
 
 /// Converts a division root into the mirror tree.
@@ -471,14 +474,19 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
             let mut record = match fs::read_link(&absolute) {
                 Ok(target) => {
                     let target_bytes = target.as_os_str().as_encoded_bytes();
-                    new_record(
+                    let mut record = new_record(
                         &source_path,
                         &hash::hash_bytes(target_bytes),
                         target_bytes.len() as u64,
                         &detection,
                         rules.version(),
                         Status::Unsupported,
-                    )
+                    );
+                    // Symlinks are unsupported by pipeline design,
+                    // whatever the registry claims, so the reason is
+                    // set directly instead of looked up.
+                    record.error = Some(convert::NO_CONVERTER_REASON.to_string());
+                    record
                 }
                 Err(e) => {
                     let mut record = new_record(
@@ -499,7 +507,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
             continue;
         }
 
-        let (source_hash, source_size, detection) = match source_front(&absolute, &rules.table) {
+        let front = match source_front(&absolute, &rules.table) {
             Ok(front) => front,
             Err(e) => {
                 let detection = Detection {
@@ -522,6 +530,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                 continue;
             }
         };
+        let (source_hash, source_size, detection, detect_warnings) = front;
         let converter = rules.registry.converter_for(&detection.detected);
         let current_version = converter.map(|c| c.version());
 
@@ -594,6 +603,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                     rules.version(),
                     Status::Dedup,
                 );
+                record.warnings.clone_from(&detect_warnings);
                 match mirror::write_atomic(&text_absolute, &text)
                     .and_then(|()| mirror::write_atomic(&segments_absolute, &segment_lines))
                 {
@@ -626,6 +636,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                 rules.version(),
                 Status::Unsupported,
             );
+            record.warnings.clone_from(&detect_warnings);
             record.error = rules
                 .registry
                 .unsupported_reason(&detection.detected)
@@ -644,6 +655,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
             rules.version(),
             Status::Converted,
         );
+        record.warnings.clone_from(&detect_warnings);
         // One byte snapshot feeds both the recorded hash and the
         // converter, so the record describes exactly what converted.
         // The size ceiling applies before the read, the converter runs
@@ -700,7 +712,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                     record.artifact_kind = Some(ArtifactKind::Text);
                     record.converter_id = Some(outcome.converter_id.clone());
                     record.converter_version = Some(outcome.converter_version.clone());
-                    record.warnings = outcome.warnings;
+                    record.warnings.extend(outcome.warnings);
                     dedup.replace(
                         &source_hash,
                         CanonicalArtifact {
@@ -827,7 +839,7 @@ mod tests {
     #[test]
     fn builtin_rules_agree_on_a_version() {
         let rules = Rules::builtin().unwrap();
-        assert_eq!(rules.version(), "3");
+        assert_eq!(rules.version(), "4");
     }
 
     use crate::convert::{ConvertError, Converter, Outcome, PlainTextPassthrough};
