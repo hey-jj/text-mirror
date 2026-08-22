@@ -23,6 +23,11 @@ pub const PDF_SUBPROCESS_ID: &str = "pdf-subprocess";
 /// Version of the subprocess PDF adapter.
 pub const PDF_SUBPROCESS_VERSION: &str = "1.0.0";
 
+/// Registry id of the jailed records worker adapter.
+pub const RECORDS_SUBPROCESS_ID: &str = "records-worker";
+/// Version of the jailed records worker adapter.
+pub const RECORDS_SUBPROCESS_VERSION: &str = "1.0.0";
+
 /// Registry id of the OCR adapter.
 pub const OCR_ADAPTER_ID: &str = "ocr-adapter";
 /// Version of the OCR adapter.
@@ -65,8 +70,10 @@ mod imp {
     use std::sync::OnceLock;
 
     use super::*;
+    use crate::convert::RecordsLimits;
     use crate::runner::protocol::bodies::{
-        AsrOk, AsrRequest, OcrInput, OcrOk, OcrRequest, PdfOk, PdfRequest, VideoOk, VideoRequest,
+        AsrOk, AsrRequest, OcrInput, OcrOk, OcrRequest, PdfOk, PdfRequest, RecordsOk,
+        RecordsRequest, VideoOk, VideoRequest,
     };
     use crate::runner::{Runner, RunnerError};
 
@@ -88,6 +95,9 @@ mod imp {
             "converter_panic",
             "unclaimed_format",
             "resource_limit",
+            "record-limit-exceeded",
+            "records_read_error",
+            "not_sqlite",
         ];
         KNOWN
             .iter()
@@ -176,6 +186,71 @@ mod imp {
             Ok(Outcome {
                 converter_id: PDF_SUBPROCESS_ID.to_string(),
                 converter_version: PDF_SUBPROCESS_VERSION.to_string(),
+                detected_format: detected_format.to_string(),
+                text: body.text,
+                warnings: body.warnings,
+                segments: body.segments,
+            })
+        }
+    }
+
+    /// The records worker adapter: parquet, avro, and sqlite behind
+    /// the sandbox runner.
+    ///
+    /// The three readers pull large native parser trees with CVE
+    /// history, so they never run in this process. Each source stages
+    /// into the jail and the reader runs in the worker, where a panic
+    /// on hostile bytes crashes the child and records a failed outcome
+    /// without touching the pipeline. The ceilings come from the rules
+    /// and travel in the request, and a source over any ceiling fails
+    /// closed with reason `record-limit-exceeded`.
+    pub struct RecordsSubprocess {
+        limits: RecordsLimits,
+    }
+
+    impl RecordsSubprocess {
+        /// An adapter over the rules-supplied ceilings.
+        pub fn new(limits: RecordsLimits) -> RecordsSubprocess {
+            RecordsSubprocess { limits }
+        }
+    }
+
+    impl Converter for RecordsSubprocess {
+        fn id(&self) -> &'static str {
+            RECORDS_SUBPROCESS_ID
+        }
+
+        fn version(&self) -> &'static str {
+            RECORDS_SUBPROCESS_VERSION
+        }
+
+        fn convert(
+            &self,
+            source: &[u8],
+            detected_format: &str,
+        ) -> std::result::Result<Outcome, ConvertError> {
+            if !matches!(detected_format, "parquet" | "avro" | "sqlite") {
+                return Err(ConvertError {
+                    code: "unclaimed_format",
+                    message: format!("the records worker does not handle {detected_format}"),
+                });
+            }
+            let input = format!("input.{detected_format}");
+            let body: RecordsOk = call(
+                shared_runner()?,
+                "records",
+                &RecordsRequest {
+                    input: input.clone(),
+                    format: detected_format.to_string(),
+                    max_records: self.limits.max_records,
+                    max_tables: self.limits.max_tables,
+                    max_output_bytes: self.limits.max_output_bytes,
+                },
+                &[(&input, source)],
+            )?;
+            Ok(Outcome {
+                converter_id: RECORDS_SUBPROCESS_ID.to_string(),
+                converter_version: RECORDS_SUBPROCESS_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
                 text: body.text,
                 warnings: body.warnings,
@@ -396,11 +471,20 @@ mod imp {
 }
 
 #[cfg(unix)]
-pub use imp::{AsrAdapter, OcrAdapter, PdfSubprocess, VideoAdapter};
+pub use imp::{AsrAdapter, OcrAdapter, PdfSubprocess, RecordsSubprocess, VideoAdapter};
 
 #[cfg(not(unix))]
 mod imp {
     use super::*;
+    use crate::convert::RecordsLimits;
+
+    fn no_backend() -> ConvertError {
+        ConvertError {
+            code: "sandbox_unavailable",
+            message: "no jail backend exists for this platform, refusing to run adapters"
+                .to_string(),
+        }
+    }
 
     /// The subprocess PDF adapter on a platform without a jail
     /// backend. It refuses every run.
@@ -420,17 +504,42 @@ mod imp {
             _source: &[u8],
             _detected_format: &str,
         ) -> std::result::Result<Outcome, ConvertError> {
-            Err(ConvertError {
-                code: "sandbox_unavailable",
-                message: "no jail backend exists for this platform, refusing to run adapters"
-                    .to_string(),
-            })
+            Err(no_backend())
+        }
+    }
+
+    /// The records worker adapter on a platform without a jail
+    /// backend. It refuses every run.
+    pub struct RecordsSubprocess;
+
+    impl RecordsSubprocess {
+        /// An adapter that refuses every run, ceilings unused.
+        pub fn new(_limits: RecordsLimits) -> RecordsSubprocess {
+            RecordsSubprocess
+        }
+    }
+
+    impl Converter for RecordsSubprocess {
+        fn id(&self) -> &'static str {
+            RECORDS_SUBPROCESS_ID
+        }
+
+        fn version(&self) -> &'static str {
+            RECORDS_SUBPROCESS_VERSION
+        }
+
+        fn convert(
+            &self,
+            _source: &[u8],
+            _detected_format: &str,
+        ) -> std::result::Result<Outcome, ConvertError> {
+            Err(no_backend())
         }
     }
 }
 
 #[cfg(not(unix))]
-pub use imp::PdfSubprocess;
+pub use imp::{PdfSubprocess, RecordsSubprocess};
 
 /// Renders speech segments to the transcript format:
 /// `[HH:MM:SS -> HH:MM:SS] Speaker N: text`, one line per segment,

@@ -12,6 +12,57 @@ license electable to those terms carry the license texts already
 reproduced in LICENSE-MIT and LICENSE-APACHE beside this file, so
 they are not repeated here.
 
+The records-worker feature pulls the parquet, apache-avro, rusqlite,
+and compression crates. Their notices are below. A build without that
+feature links none of them.
+
+## Apache-2.0 NOTICE files
+
+Two Apache-2.0 dependencies ship a NOTICE file, reproduced here under
+Apache-2.0 section 4(d). Both are consumed unmodified.
+
+parquet 59.2.0 (Apache Arrow):
+
+```text
+Apache Arrow
+Copyright 2016-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
+
+This product includes software from the chronoutil crate (MIT)
+ * Copyright (c) 2020-2022 Oliver Margetts
+ * https://github.com/olliemath/chronoutil
+
+This product includes software from the compact-thrift project (Apache 2.0)
+ * Copyright Jörn Horstmann
+ * https://github.com/jhorstmann/compact-thrift
+```
+
+apache-avro 0.22.0 (Apache Avro):
+
+```text
+Apache Avro
+Copyright 2010-2025 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (https://www.apache.org/).
+
+The initial implementation of the Apache Avro Rust SDK has been
+developed by Flavien Raynaud (https://github.com/flavray/avro-rs)
+and donated to the Apache Avro project in 2020.
+```
+
+## Bundled native libraries
+
+`libsqlite3-sys` 0.38.2 bundles the SQLite amalgamation, which its
+authors have dedicated to the public domain. No license notice is
+required, and this note records its origin.
+
+`zstd-sys` 2.0.16 bundles the Zstandard C library, which upstream
+dual-licenses BSD-3-Clause or GPL-2.0. This project takes it under
+BSD-3-Clause, whose terms match the section below.
+
 ## MPL-2.0
 
 Covered crates, all consumed unmodified: cssparser 0.36.0,
@@ -398,8 +449,15 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 
 ## BSD-3-Clause
 
-Covered crates: lol_html 3.0.1 (Copyright Cloudflare, Inc.), and the
-WHATWG portions of encoding_rs 0.8.35.
+Covered crates: lol_html 3.0.1 (Copyright Cloudflare, Inc.), the WHATWG
+portions of encoding_rs 0.8.35, snap 1.1.2 (Copyright 2011, The
+Snappy-Rust Authors), the brotli family, brotli 8.0.4,
+brotli-decompressor, alloc-no-stdlib, and alloc-stdlib (Copyright the
+Brotli Authors and Copyright 2016 Dropbox, Inc.), and the bundled
+Zstandard C library in zstd-sys 2.0.16, taken under its BSD-3-Clause
+election. Every one is consumed unmodified. The three-clause terms are
+identical across them, reproduced once below, and each crate's own
+copyright line is named above.
 
 ```text
 Copyright (C) 2019, Cloudflare, Inc.

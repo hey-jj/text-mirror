@@ -323,6 +323,42 @@ pub mod bodies {
         pub segments: Vec<Segment>,
     }
 
+    /// Request body for the `records` adapter, which reads parquet,
+    /// avro, and sqlite behind the jail.
+    ///
+    /// The ceilings travel in the request because the worker, not the
+    /// parent, enforces them, and they are rules data the parent reads
+    /// from the registry. A source over any ceiling fails closed with
+    /// reason `record-limit-exceeded`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RecordsRequest {
+        /// Input file name inside the jail.
+        pub input: String,
+        /// The detected format: `parquet`, `avro`, or `sqlite`.
+        pub format: String,
+        /// Ceiling on records per parquet or avro file, or per sqlite
+        /// table.
+        pub max_records: u64,
+        /// Ceiling on tables per sqlite database.
+        pub max_tables: u64,
+        /// Ceiling on rendered output bytes.
+        pub max_output_bytes: u64,
+    }
+
+    /// Success body for the `records` adapter.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RecordsOk {
+        /// The rendered text, UTF-8, NFC, LF line endings.
+        pub text: String,
+        /// Non-fatal notes about the conversion.
+        pub warnings: Vec<String>,
+        /// Structure spans over the text. Sqlite carries a sheet
+        /// boundary per table.
+        pub segments: Vec<Segment>,
+    }
+
     /// What an OCR request asks the engine to read.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case", deny_unknown_fields)]

@@ -16,6 +16,18 @@ The mirror feeds downstream text tooling that cannot read binary formats. The co
 
 Early development. The manifest schema `text-mirror/manifest@1` and the architecture are documented in `docs/DESIGN.md`.
 
+## The records-worker feature
+
+Parquet, avro, and sqlite conversion is an opt-in feature, `records-worker`, off by default. These parsers pull large native trees with CVE history, so they run only inside the subprocess jail, and the default build links none of them and stays buildable on the crate's declared 1.85 toolchain.
+
+Build with the feature to convert these formats:
+
+```
+cargo build --release --features records-worker
+```
+
+The feature requires a 1.88 or newer toolchain, which `apache-avro` needs. A default build records a parquet, avro, or sqlite source as `unsupported` with reason `records-worker-not-built` and handles every other format exactly as a featured build does.
+
 ## License
 
 MIT OR Apache-2.0

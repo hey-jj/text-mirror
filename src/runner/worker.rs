@@ -76,6 +76,10 @@ fn run_mode(mode: &str) -> Result<Response, HardExit> {
         "pdf" => production::pdf(read_request()?),
         "probe-net" => production::probe_net(read_request()?),
         "probe-seccomp" => production::probe_seccomp(read_request()?),
+        // The records reader trees are heavy and native, so they
+        // compile only under the feature and run only in the jail.
+        #[cfg(all(unix, feature = "records-worker"))]
+        "records" => records::records(read_request()?),
         // Held descendants get no stdin, so this mode never reads a
         // request frame.
         #[cfg(feature = "test-adapters")]
@@ -158,6 +162,40 @@ mod production {
             eprintln!("worker_bad_payload: {e}");
             HardExit(2)
         })
+    }
+}
+
+/// The jailed records mode: parquet, avro, and sqlite to text.
+#[cfg(all(unix, feature = "records-worker"))]
+mod records {
+    use std::path::Path;
+
+    use super::*;
+    use crate::convert::records::{Ceilings, convert_records};
+    use crate::runner::protocol::bodies::{RecordsOk, RecordsRequest};
+
+    pub(super) fn records(request: Request) -> Result<Response, HardExit> {
+        let body: RecordsRequest =
+            serde_json::from_value(request.payload.clone()).map_err(|e| {
+                eprintln!("worker_bad_payload: {e}");
+                HardExit(2)
+            })?;
+        let ceilings = Ceilings {
+            max_records: body.max_records,
+            max_tables: body.max_tables,
+            max_output_bytes: body.max_output_bytes,
+        };
+        match convert_records(Path::new(&body.input), &body.format, &ceilings) {
+            Ok(conversion) => Ok(Response::ok(
+                serde_json::to_value(RecordsOk {
+                    text: conversion.text,
+                    warnings: conversion.warnings,
+                    segments: conversion.segments,
+                })
+                .expect("RecordsOk serializes"),
+            )),
+            Err(error) => Ok(Response::err(error.code, error.message)),
+        }
     }
 }
 

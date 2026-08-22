@@ -84,7 +84,7 @@ fn text_native_formats_convert_through_the_passthrough() {
         assert_eq!(record.status, Status::Converted, "{path}");
         assert_eq!(record.detected_format, format, "{path}");
         assert_eq!(record.converter_id.as_deref(), Some("text-passthrough"));
-        assert_eq!(record.rules_version, "6");
+        assert_eq!(record.rules_version, "7");
     }
 
     // svg passes through as raw markup and ipynb as the raw notebook
@@ -126,9 +126,11 @@ fn unsupported_reasons_name_every_deliberate_exclusion() {
         b"\x80\x04\x95\x1a\x00\x00\x00\x00\x00\x00\x00hostile pickle stream",
     )
     .unwrap();
+    // arrow stays converter-deferred; parquet, avro, and sqlite are
+    // claimed by the records worker and exercised in its own suite.
     fs::write(
-        setup.root.join("table.parquet"),
-        b"PAR1\x15\x04junk\x00PAR1",
+        setup.root.join("table.arrow"),
+        b"ARROW1\x00\x00not a real arrow file",
     )
     .unwrap();
     fs::write(
@@ -150,7 +152,7 @@ fn unsupported_reasons_name_every_deliberate_exclusion() {
 
     for (path, format, reason) in [
         ("model.pkl", "pickle", "pickle-deserialization-unsafe"),
-        ("table.parquet", "parquet", "converter-deferred"),
+        ("table.arrow", "arrow", "converter-deferred"),
         ("backup.tar", "tar", "container-deferred"),
         ("mock.psd", "psd", "proprietary-binary"),
         ("photo.webp", "webp", "engine-unpinned"),
@@ -250,7 +252,7 @@ fn a_prior_unsupported_record_reconverts_under_the_new_rules() {
     let record = terminal(&setup, "data.json");
     assert_eq!(record.status, Status::Converted);
     assert_eq!(record.detected_format, "json");
-    assert_eq!(record.rules_version, "6");
+    assert_eq!(record.rules_version, "7");
     assert_eq!(
         fs::read_to_string(setup.mirror.join("alpha/data.json.txt")).unwrap(),
         String::from_utf8_lossy(bytes)
@@ -370,7 +372,7 @@ fn a_prior_invalid_utf8_failure_reconverts_under_the_new_rules() {
 
     let record = terminal(&setup, "legacy.csv");
     assert_eq!(record.status, Status::Converted);
-    assert_eq!(record.rules_version, "6");
+    assert_eq!(record.rules_version, "7");
     assert_eq!(record.converter_version.as_deref(), Some("1.2.0"));
     assert!(record.error.is_none());
     assert_eq!(

@@ -40,10 +40,36 @@ pub const MAX_SHEET_COLUMNS: u32 = 16_384;
 /// source's own references before the workbook parser allocates.
 pub const MAX_SHEET_CELLS: u64 = 10_000_000;
 
+/// Ceilings for the records worker, held as rules data beside the
+/// container limits so a deployment raises them in a visible versioned
+/// bump. The parent reads them from the registry and passes them into
+/// the jailed worker, which enforces them and fails a source over any
+/// ceiling with reason `record-limit-exceeded`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordsLimits {
+    /// Records per parquet or avro file, and per sqlite table.
+    pub max_records: u64,
+    /// Tables per sqlite database.
+    pub max_tables: u64,
+    /// Rendered output bytes. Under the runner's response cap.
+    pub max_output_bytes: u64,
+}
+
+impl Default for RecordsLimits {
+    fn default() -> RecordsLimits {
+        RecordsLimits {
+            max_records: 100_000,
+            max_tables: 256,
+            max_output_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 use std::collections::HashMap;
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::detect::RESERVED_FORMAT_IDS;
@@ -57,6 +83,13 @@ mod document;
 pub mod eml;
 pub mod html;
 pub mod pdf;
+// The parquet, avro, and sqlite readers. Compiled only for the records
+// worker, so a default build pulls none of the heavy parser trees.
+// Crate-private, so a library consumer cannot run the native parsers in
+// process and bypass the jail. The worker dispatch reaches it through a
+// crate path.
+#[cfg(all(unix, feature = "records-worker"))]
+pub(crate) mod records;
 pub mod subprocess;
 mod visibility;
 mod workbook;
@@ -71,7 +104,7 @@ pub use differential::{
 pub use document::{AnydocDocument, markdown_to_plain};
 pub use eml::{EmlExpansion, EmlMime, expand_eml};
 pub use html::HtmlStrip;
-pub use subprocess::PdfSubprocess;
+pub use subprocess::{PdfSubprocess, RecordsSubprocess};
 pub use visibility::{IndexRange, SheetVisibility, WorkbookVisibility, read_visibility};
 pub use workbook::WorkbookIr;
 
@@ -168,6 +201,12 @@ pub struct PlainTextPassthrough;
 /// has no converter entry and no declared reason, including true
 /// unknowns.
 pub const NO_CONVERTER_REASON: &str = "no-converter";
+
+/// The reason a records format records on a build without the
+/// `records-worker` feature. The converter exists and the rules route
+/// to it, but this binary's worker has no records mode, so the format
+/// is a deliberate capability gap rather than a converter error.
+pub const RECORDS_NOT_BUILT_REASON: &str = "records-worker-not-built";
 
 /// Registry id of the passthrough converter.
 pub const PASSTHROUGH_ID: &str = "text-passthrough";
@@ -304,6 +343,8 @@ struct RawRegistry {
     unsupported: Vec<RawUnsupported>,
     #[serde(default)]
     containers: Option<ContainerLimits>,
+    #[serde(default)]
+    records: Option<RecordsLimits>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,6 +373,7 @@ pub struct Registry {
     by_format: HashMap<String, usize>,
     unsupported_reasons: HashMap<String, String>,
     container_limits: ContainerLimits,
+    records_limits: RecordsLimits,
 }
 
 impl Registry {
@@ -349,9 +391,39 @@ impl Registry {
             name: name.to_string(),
             message: e.to_string(),
         })?;
+        let records_limits = raw.records.clone().unwrap_or_default();
         let mut converters: Vec<Box<dyn Converter>> = Vec::new();
         let mut by_format = HashMap::new();
+        let mut unsupported_reasons = HashMap::new();
         for entry in &raw.converters {
+            // A build without the records-worker feature has no records
+            // mode in its worker, so route the records formats to a
+            // deliberate unsupported reason instead of a converter that
+            // would spawn a worker unable to serve them. The rules stay
+            // one shared file: the routing decision is made here at
+            // construction, not by forking the rules.
+            #[cfg(not(feature = "records-worker"))]
+            if entry.id == subprocess::RECORDS_SUBPROCESS_ID {
+                for format in &entry.formats {
+                    if RESERVED_FORMAT_IDS.contains(&format.as_str()) {
+                        return Err(Error::Rules {
+                            name: name.to_string(),
+                            message: format!("format id {format:?} is reserved"),
+                        });
+                    }
+                    if by_format.contains_key(format)
+                        || unsupported_reasons
+                            .insert(format.clone(), RECORDS_NOT_BUILT_REASON.to_string())
+                            .is_some()
+                    {
+                        return Err(Error::Rules {
+                            name: name.to_string(),
+                            message: format!("format {format:?} claimed twice"),
+                        });
+                    }
+                }
+                continue;
+            }
             let converter: Box<dyn Converter> = match entry.id.as_str() {
                 PASSTHROUGH_ID => Box::new(PlainTextPassthrough),
                 html::HTML_STRIP_ID => Box::new(HtmlStrip),
@@ -359,6 +431,9 @@ impl Registry {
                 document::ANYDOC_ID => Box::new(AnydocDocument),
                 workbook::WORKBOOK_ID => Box::new(WorkbookIr),
                 subprocess::PDF_SUBPROCESS_ID => Box::new(PdfSubprocess),
+                subprocess::RECORDS_SUBPROCESS_ID => {
+                    Box::new(RecordsSubprocess::new(records_limits.clone()))
+                }
                 other => {
                     return Err(Error::Rules {
                         name: name.to_string(),
@@ -394,7 +469,6 @@ impl Registry {
                 }
             }
         }
-        let mut unsupported_reasons = HashMap::new();
         for entry in &raw.unsupported {
             for format in &entry.formats {
                 if RESERVED_FORMAT_IDS.contains(&format.as_str()) {
@@ -421,6 +495,7 @@ impl Registry {
             by_format,
             unsupported_reasons,
             container_limits: raw.containers.unwrap_or_default(),
+            records_limits,
         })
     }
 
@@ -439,6 +514,11 @@ impl Registry {
     /// The container expansion limits from the rules.
     pub fn container_limits(&self) -> &ContainerLimits {
         &self.container_limits
+    }
+
+    /// The records worker ceilings from the rules.
+    pub fn records_limits(&self) -> &RecordsLimits {
+        &self.records_limits
     }
 
     /// The reason a format is unsupported.
@@ -483,6 +563,7 @@ impl Registry {
             by_format,
             unsupported_reasons: HashMap::new(),
             container_limits: ContainerLimits::default(),
+            records_limits: RecordsLimits::default(),
         }
     }
 }
@@ -630,7 +711,7 @@ mod tests {
     #[test]
     fn builtin_registry_claims_the_text_family() {
         let registry = Registry::builtin().unwrap();
-        assert_eq!(registry.version(), "6");
+        assert_eq!(registry.version(), "7");
         assert!(registry.converter_for("json").is_some());
         assert!(registry.converter_for("yaml").is_some());
         assert!(registry.converter_for("svg").is_some());
@@ -666,8 +747,19 @@ mod tests {
             Some("pickle-deserialization-unsafe")
         );
         assert_eq!(registry.unsupported_reason("webp"), Some("engine-unpinned"));
+        // Parquet, avro, and sqlite are claimed by the records worker
+        // now, so they carry no unsupported reason. arrow and the rest
+        // stay deferred.
+        for format in ["parquet", "avro", "sqlite"] {
+            assert_eq!(
+                registry.converter_for(format).map(|c| c.id()),
+                Some("records-worker"),
+                "{format}"
+            );
+            assert_eq!(registry.unsupported_reason(format), None, "{format}");
+        }
         assert_eq!(
-            registry.unsupported_reason("parquet"),
+            registry.unsupported_reason("arrow"),
             Some("converter-deferred")
         );
         assert_eq!(

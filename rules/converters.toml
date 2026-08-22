@@ -7,7 +7,7 @@
 # must match the version in formats.toml and is recorded in every
 # manifest record as rules_version.
 
-version = "6"
+version = "7"
 
 # The passthrough validates UTF-8 and fails closed on anything else,
 # so a binary wearing one of these extensions records failed with
@@ -69,6 +69,17 @@ id = "pdf-subprocess"
 version = "1.0.0"
 formats = ["pdf"]
 
+# Parquet, avro, and sqlite run behind the same subprocess jail as the
+# PDF path. These parsers pull large native trees with CVE history, so
+# hostile bytes crash a jailed child and never the pipeline. Each
+# renders to inert tab-separated text with a header line, and sqlite
+# dumps one table per sheet boundary. The ceilings live in the
+# [records] section below.
+[[converters]]
+id = "records-worker"
+version = "1.0.0"
+formats = ["parquet", "avro", "sqlite"]
+
 # Spreadsheet formats with no row and column visibility reader yet.
 # They record unsupported with this reason until a reader lands, and
 # the rules bump that lands one re-runs every such record.
@@ -99,11 +110,12 @@ reason = "pickle-deserialization-unsafe"
 formats = ["pickle"]
 
 # Recognized data formats with feasible extraction that no converter
-# claims yet.
+# claims yet. Parquet, avro, and sqlite moved to the records worker
+# above.
 [[unsupported]]
 reason = "converter-deferred"
 formats = [
-  "parquet", "avro", "sqlite", "arrow", "orc", "feather",
+  "arrow", "orc", "feather",
   "duckdb", "faiss", "msgpack",
 ]
 
@@ -136,3 +148,16 @@ max_children = 1000
 max_expanded_bytes = 1073741824
 # One member, uncompressed. 256 MiB.
 max_member_size = 268435456
+
+# Records worker ceilings, versioned with the rest of the rules. The
+# parent reads them and passes them into the jailed worker, which
+# enforces them and fails a source over any ceiling with reason
+# record-limit-exceeded and no artifact. A deployment that needs a
+# larger file raises them in a visible versioned bump.
+[records]
+# Records per parquet or avro file, and per sqlite table.
+max_records = 100000
+# Tables per sqlite database.
+max_tables = 256
+# Rendered output bytes, under the runner's response cap. 64 MiB.
+max_output_bytes = 67108864
