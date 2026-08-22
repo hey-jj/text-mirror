@@ -7,7 +7,7 @@
 # must match the version in formats.toml and is recorded in every
 # manifest record as rules_version.
 
-version = "5"
+version = "6"
 
 # The passthrough validates UTF-8 and fails closed on anything else,
 # so a binary wearing one of these extensions records failed with
@@ -117,3 +117,22 @@ formats = ["tar", "gzip", "bzip2", "7z", "rar"]
 [[unsupported]]
 reason = "proprietary-binary"
 formats = ["sketch", "psd", "fig", "indd", "idml"]
+
+# Zip container expansion limits, versioned with the rest of the
+# rules. A source detected as a plain zip expands into a sibling
+# .d/ directory, its members route back through the same dispatch,
+# and these ceilings bound the zip-bomb surface. Enforcement is two
+# stage: the central directory is read first and the child count and
+# declared sizes are checked before any inflation, then actual
+# inflated bytes are charged during extraction and never trust a
+# declared size as the allocation budget.
+[containers]
+# The outer file is depth 0. Covers eml holding zip holding docx.
+max_depth = 4
+# Members per container.
+max_children = 1000
+# Cumulative inflated bytes across one top-level container's whole
+# tree, dedup copies included. 1 GiB.
+max_expanded_bytes = 1073741824
+# One member, uncompressed. 256 MiB.
+max_member_size = 268435456

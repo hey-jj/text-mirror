@@ -8,19 +8,20 @@
 //! part exists, and a mixed group concatenates its text parts in MIME
 //! order separated by one blank line.
 //!
-//! Attachments are enumerated and never decoded. Each one appends a
-//! warning naming the filename and declared type, so the record
-//! states what the artifact omits until container expansion lands. A
-//! nested message counts as an attachment. Hard ceilings on header
-//! bytes, header count, part count, nesting depth, and per-part
-//! decoded bytes fail closed before the parser or a decoder can be
-//! driven past them.
+//! Attachments become container members. Each one is decoded and
+//! lifted out with a name built from its 1-based index and sanitized
+//! filename, and the pipeline routes it back through dispatch under
+//! the message's `.d/` directory. A nested message counts as an
+//! attachment. Hard ceilings on header bytes, header count, part
+//! count, nesting depth, per-part decoded bytes, and the running
+//! total of decoded attachment bytes fail closed before the parser or
+//! a decoder can be driven past them.
 
 use mailparse::body::Body;
 use mailparse::{DispositionType, MailHeaderMap, ParsedMail};
 
 use super::html::strip_html;
-use super::{ConvertError, Converter, MAX_PART_BYTES, Outcome, normalize_text};
+use super::{ConvertError, Converter, MAX_PART_BYTES, MAX_SOURCE_BYTES, Outcome, normalize_text};
 use crate::segments::Segment;
 
 /// Registry id of the eml converter.
@@ -58,10 +59,30 @@ pub const MAX_EML_BOUNDARY_LINES: usize = 10_000;
 /// MIME message converter for eml.
 pub struct EmlMime;
 
+/// One attachment lifted out as a container member.
+pub struct EmlMember {
+    /// Member name, the 1-based attachment index, a hyphen, and the
+    /// sanitized filename, so names never collide or go missing.
+    pub name: String,
+    /// Decoded attachment bytes, routed back through dispatch.
+    pub bytes: Vec<u8>,
+}
+
+/// An eml conversion plus the attachment members it expands into.
+pub struct EmlExpansion {
+    /// The parent artifact: rendered headers and text bodies.
+    pub outcome: Outcome,
+    /// Attachment members, in walk order.
+    pub members: Vec<EmlMember>,
+}
+
 #[derive(Default)]
 struct MessageState {
     bodies: Vec<String>,
     warnings: Vec<String>,
+    members: Vec<EmlMember>,
+    attachments: usize,
+    decoded_bytes: usize,
     parts: usize,
     headers: usize,
     header_bytes: usize,
@@ -100,6 +121,23 @@ fn part_filename(part: &ParsedMail) -> String {
         .or_else(|| part.ctype.params.get("name"))
         .cloned()
         .unwrap_or_else(|| "unnamed".to_string())
+}
+
+/// Reduces a declared filename to one safe path segment: the final
+/// component, control and separator characters dropped. An empty
+/// result becomes `unnamed`, so a member name never goes missing.
+fn sanitize_filename(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = last
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "unnamed".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn is_attachment(part: &ParsedMail) -> bool {
@@ -150,11 +188,28 @@ fn walk(part: &ParsedMail, depth: usize, state: &mut MessageState) -> Result<(),
     }
     account_part(part, state)?;
     if is_attachment(part) {
-        state.warnings.push(format!(
-            "attachment-not-expanded: {} ({})",
-            part_filename(part),
-            part.ctype.mimetype
-        ));
+        let raw_len = raw_body_len(part);
+        if raw_len > MAX_PART_BYTES as usize {
+            return Err(cap_error("attachment body bytes", MAX_PART_BYTES as usize));
+        }
+        let bytes = part.get_body_raw().map_err(decode_error)?;
+        // Charge the running total of decoded attachment bytes as
+        // each one lands, so a message cannot accumulate more decoded
+        // attachment content than one source before the cap fires.
+        state.decoded_bytes = state.decoded_bytes.saturating_add(bytes.len());
+        if state.decoded_bytes > MAX_SOURCE_BYTES as usize {
+            return Err(cap_error(
+                "decoded attachment bytes",
+                MAX_SOURCE_BYTES as usize,
+            ));
+        }
+        state.attachments += 1;
+        let name = format!(
+            "{}-{}",
+            state.attachments,
+            sanitize_filename(&part_filename(part))
+        );
+        state.members.push(EmlMember { name, bytes });
         return Ok(());
     }
     let mimetype = part.ctype.mimetype.as_str();
@@ -219,70 +274,79 @@ impl Converter for EmlMime {
         source: &[u8],
         detected_format: &str,
     ) -> std::result::Result<Outcome, ConvertError> {
-        let content_type_keys = source
-            .windows(b"content-type".len())
-            .filter(|window| window.eq_ignore_ascii_case(b"content-type"))
-            .count();
-        if content_type_keys > MAX_EML_CONTENT_TYPE_HEADERS {
-            return Err(cap_error(
-                "content-type headers",
-                MAX_EML_CONTENT_TYPE_HEADERS,
-            ));
-        }
-        let boundary_lines = source.windows(3).filter(|window| window == b"\n--").count();
-        if boundary_lines > MAX_EML_BOUNDARY_LINES {
-            return Err(cap_error(
-                "boundary delimiter lines",
-                MAX_EML_BOUNDARY_LINES,
-            ));
-        }
-        let message = mailparse::parse_mail(source).map_err(|e| ConvertError {
-            code: "mime_parse_error",
-            message: e.to_string(),
-        })?;
-        let mut state = MessageState::default();
-        walk(&message, 0, &mut state)?;
+        Ok(expand_eml(source, detected_format)?.outcome)
+    }
+}
 
-        let mut rendered = String::new();
-        for name in RENDERED_HEADERS {
-            if let Some(value) = message.headers.get_first_value(name) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    rendered.push_str(name);
-                    rendered.push_str(": ");
-                    rendered.push_str(value);
-                    rendered.push('\n');
-                }
-            }
-        }
-        if !state.bodies.is_empty() {
-            if !rendered.is_empty() {
+/// Renders an eml message to its parent artifact and lifts its
+/// attachments into container members.
+pub fn expand_eml(source: &[u8], detected_format: &str) -> Result<EmlExpansion, ConvertError> {
+    let content_type_keys = source
+        .windows(b"content-type".len())
+        .filter(|window| window.eq_ignore_ascii_case(b"content-type"))
+        .count();
+    if content_type_keys > MAX_EML_CONTENT_TYPE_HEADERS {
+        return Err(cap_error(
+            "content-type headers",
+            MAX_EML_CONTENT_TYPE_HEADERS,
+        ));
+    }
+    let boundary_lines = source.windows(3).filter(|window| window == b"\n--").count();
+    if boundary_lines > MAX_EML_BOUNDARY_LINES {
+        return Err(cap_error(
+            "boundary delimiter lines",
+            MAX_EML_BOUNDARY_LINES,
+        ));
+    }
+    let message = mailparse::parse_mail(source).map_err(|e| ConvertError {
+        code: "mime_parse_error",
+        message: e.to_string(),
+    })?;
+    let mut state = MessageState::default();
+    walk(&message, 0, &mut state)?;
+
+    let mut rendered = String::new();
+    for name in RENDERED_HEADERS {
+        if let Some(value) = message.headers.get_first_value(name) {
+            let value = value.trim();
+            if !value.is_empty() {
+                rendered.push_str(name);
+                rendered.push_str(": ");
+                rendered.push_str(value);
                 rendered.push('\n');
             }
-            rendered.push_str(&state.bodies.join("\n\n"));
+        }
+    }
+    if !state.bodies.is_empty() {
+        if !rendered.is_empty() {
             rendered.push('\n');
         }
+        rendered.push_str(&state.bodies.join("\n\n"));
+        rendered.push('\n');
+    }
 
-        let text = normalize_text(&rendered);
-        if !source.is_empty() && text.is_empty() {
-            return Err(ConvertError {
-                code: "empty_output",
-                message: format!(
-                    "source is {} bytes but renders no headers and no text body",
-                    source.len()
-                ),
-            });
-        }
-        let segments = vec![Segment::span(0, text.len(), "document")];
-        Ok(Outcome {
+    let text = normalize_text(&rendered);
+    if !source.is_empty() && text.is_empty() {
+        return Err(ConvertError {
+            code: "empty_output",
+            message: format!(
+                "source is {} bytes but renders no headers and no text body",
+                source.len()
+            ),
+        });
+    }
+    let segments = vec![Segment::span(0, text.len(), "document")];
+    Ok(EmlExpansion {
+        outcome: Outcome {
             converter_id: EML_ID.to_string(),
             converter_version: EML_VERSION.to_string(),
             detected_format: detected_format.to_string(),
             text,
             warnings: state.warnings,
             segments,
-        })
-    }
+        },
+        members: state.members,
+    })
 }
 
 #[cfg(test)]
@@ -330,10 +394,12 @@ JVBERi0xLjQK\r\n\
         );
         assert!(text.contains("\n\nThe plain rendition.\n"), "{text:?}");
         assert!(!text.contains("html rendition"));
-        assert_eq!(
-            outcome.warnings,
-            vec!["attachment-not-expanded: budget.pdf (application/pdf)".to_string()]
-        );
+        // The attachment is lifted as a member, not a warning.
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let expansion = expand_eml(MULTIPART.as_bytes(), "eml").unwrap();
+        assert_eq!(expansion.members.len(), 1);
+        assert_eq!(expansion.members[0].name, "1-budget.pdf");
+        assert_eq!(expansion.members[0].bytes, b"%PDF-1.4\n");
     }
 
     #[test]
@@ -368,12 +434,19 @@ From: c@example.com\r\n\
 \r\n\
 inner body\r\n\
 --b--\r\n";
-        let outcome = EmlMime.convert(source.as_bytes(), "eml").unwrap();
-        assert!(outcome.text.contains("covering note"));
-        assert!(!outcome.text.contains("inner body"));
-        assert_eq!(
-            outcome.warnings,
-            vec!["attachment-not-expanded: unnamed (message/rfc822)".to_string()]
+        let expansion = expand_eml(source.as_bytes(), "eml").unwrap();
+        assert!(expansion.outcome.text.contains("covering note"));
+        assert!(!expansion.outcome.text.contains("inner body"));
+        // The nested message is a member, and its bytes are the raw
+        // rfc822 message so dispatch re-detects it as eml.
+        assert_eq!(expansion.members.len(), 1);
+        assert_eq!(expansion.members[0].name, "1-unnamed");
+        assert!(
+            expansion.members[0]
+                .bytes
+                .starts_with(b"From: c@example.com"),
+            "{:?}",
+            String::from_utf8_lossy(&expansion.members[0].bytes)
         );
     }
 

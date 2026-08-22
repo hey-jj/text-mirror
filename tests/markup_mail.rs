@@ -78,7 +78,7 @@ fn an_html_page_converts_to_clean_text() {
     assert_eq!(record.status, Status::Converted);
     assert_eq!(record.detected_format, "html");
     assert_eq!(record.converter_id.as_deref(), Some("html-strip"));
-    assert_eq!(record.rules_version, "5");
+    assert_eq!(record.rules_version, "6");
 
     let text = fs::read_to_string(setup.mirror.join("alpha/page.html.txt")).unwrap();
     assert_eq!(
@@ -113,11 +113,11 @@ Content-Type: text/html; charset=utf-8\r\n\
 <p>See the <b>attached</b> budget.</p>\r\n\
 --inner--\r\n\
 --outer\r\n\
-Content-Type: application/pdf\r\n\
-Content-Disposition: attachment; filename=\"budget.pdf\"\r\n\
+Content-Type: text/plain\r\n\
+Content-Disposition: attachment; filename=\"notes.txt\"\r\n\
 Content-Transfer-Encoding: base64\r\n\
 \r\n\
-JVBERi0xLjQK\r\n\
+QXR0YWNoZWQgbm90ZSBib2R5Lgo=\r\n\
 --outer--\r\n";
 
 #[test]
@@ -126,17 +126,16 @@ fn an_eml_message_converts_and_enumerates_its_attachment() {
     fs::write(setup.root.join("update.eml"), MESSAGE).unwrap();
 
     let report = run(&setup);
-    assert_eq!(report.counts.converted, 1);
+    // The message parent plus its one attachment member.
+    assert_eq!(report.counts.converted, 2);
 
     let record = terminal(&setup, "update.eml");
     assert_eq!(record.status, Status::Converted);
     assert_eq!(record.detected_format, "eml");
     assert_eq!(record.converter_id.as_deref(), Some("eml-mime"));
+    // The attachment is a member now, not a warning.
     assert!(
-        record
-            .warnings
-            .iter()
-            .any(|w| w == "attachment-not-expanded: budget.pdf (application/pdf)"),
+        record.warnings.is_empty(),
         "warnings: {:?}",
         record.warnings
     );
@@ -149,6 +148,17 @@ fn an_eml_message_converts_and_enumerates_its_attachment() {
          Date: Fri, 21 Aug 2026 09:00:00 +0000\n\
          Subject: Offsite plan\n\n\
          See the attached budget.\n"
+    );
+
+    // The attachment expanded to a child under the eml's .d/ dir,
+    // named by its 1-based index and sanitized filename, linked back
+    // to the parent.
+    let child = terminal(&setup, "update.eml.d/1-notes.txt");
+    assert_eq!(child.status, Status::Converted);
+    assert_eq!(child.parent_source.as_deref(), Some("update.eml"));
+    assert_eq!(
+        fs::read_to_string(setup.mirror.join("alpha/update.eml.d/1-notes.txt.txt")).unwrap(),
+        "Attached note body.\n"
     );
 }
 
@@ -332,7 +342,7 @@ fn a_v4_era_unsupported_html_record_reconverts_under_v5() {
     let record = terminal(&setup, "report.html");
     assert_eq!(record.status, Status::Converted);
     assert_eq!(record.converter_id.as_deref(), Some("html-strip"));
-    assert_eq!(record.rules_version, "5");
+    assert_eq!(record.rules_version, "6");
     assert_eq!(
         fs::read_to_string(setup.mirror.join("alpha/report.html.txt")).unwrap(),
         "quarterly numbers\n"

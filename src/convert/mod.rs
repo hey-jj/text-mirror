@@ -51,6 +51,7 @@ use crate::segments::Segment;
 use crate::{Error, Result};
 
 mod anydoc_log;
+pub mod container;
 mod differential;
 mod document;
 pub mod eml;
@@ -60,11 +61,15 @@ pub mod subprocess;
 mod visibility;
 mod workbook;
 
+pub use container::{
+    CONTAINER_ZIP_ID, CONTAINER_ZIP_VERSION, ContainerLimits, Inflated, ZipContainer,
+    preflight_entry_count,
+};
 pub use differential::{
     DiffMetrics, DiffVerdict, DifferentialOutcome, compare_texts, normalize_for_diff,
 };
 pub use document::{AnydocDocument, markdown_to_plain};
-pub use eml::EmlMime;
+pub use eml::{EmlExpansion, EmlMime, expand_eml};
 pub use html::HtmlStrip;
 pub use subprocess::PdfSubprocess;
 pub use visibility::{IndexRange, SheetVisibility, WorkbookVisibility, read_visibility};
@@ -297,6 +302,8 @@ struct RawRegistry {
     converters: Vec<RawEntry>,
     #[serde(default)]
     unsupported: Vec<RawUnsupported>,
+    #[serde(default)]
+    containers: Option<ContainerLimits>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +331,7 @@ pub struct Registry {
     converters: Vec<Box<dyn Converter>>,
     by_format: HashMap<String, usize>,
     unsupported_reasons: HashMap<String, String>,
+    container_limits: ContainerLimits,
 }
 
 impl Registry {
@@ -412,6 +420,7 @@ impl Registry {
             converters,
             by_format,
             unsupported_reasons,
+            container_limits: raw.containers.unwrap_or_default(),
         })
     }
 
@@ -425,6 +434,11 @@ impl Registry {
         self.by_format
             .get(format_id)
             .map(|index| self.converters[*index].as_ref())
+    }
+
+    /// The container expansion limits from the rules.
+    pub fn container_limits(&self) -> &ContainerLimits {
+        &self.container_limits
     }
 
     /// The reason a format is unsupported.
@@ -468,6 +482,7 @@ impl Registry {
             converters,
             by_format,
             unsupported_reasons: HashMap::new(),
+            container_limits: ContainerLimits::default(),
         }
     }
 }
@@ -615,7 +630,7 @@ mod tests {
     #[test]
     fn builtin_registry_claims_the_text_family() {
         let registry = Registry::builtin().unwrap();
-        assert_eq!(registry.version(), "5");
+        assert_eq!(registry.version(), "6");
         assert!(registry.converter_for("json").is_some());
         assert!(registry.converter_for("yaml").is_some());
         assert!(registry.converter_for("svg").is_some());

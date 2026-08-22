@@ -84,7 +84,7 @@ fn text_native_formats_convert_through_the_passthrough() {
         assert_eq!(record.status, Status::Converted, "{path}");
         assert_eq!(record.detected_format, format, "{path}");
         assert_eq!(record.converter_id.as_deref(), Some("text-passthrough"));
-        assert_eq!(record.rules_version, "5");
+        assert_eq!(record.rules_version, "6");
     }
 
     // svg passes through as raw markup and ipynb as the raw notebook
@@ -250,7 +250,7 @@ fn a_prior_unsupported_record_reconverts_under_the_new_rules() {
     let record = terminal(&setup, "data.json");
     assert_eq!(record.status, Status::Converted);
     assert_eq!(record.detected_format, "json");
-    assert_eq!(record.rules_version, "5");
+    assert_eq!(record.rules_version, "6");
     assert_eq!(
         fs::read_to_string(setup.mirror.join("alpha/data.json.txt")).unwrap(),
         String::from_utf8_lossy(bytes)
@@ -370,7 +370,7 @@ fn a_prior_invalid_utf8_failure_reconverts_under_the_new_rules() {
 
     let record = terminal(&setup, "legacy.csv");
     assert_eq!(record.status, Status::Converted);
-    assert_eq!(record.rules_version, "5");
+    assert_eq!(record.rules_version, "6");
     assert_eq!(record.converter_version.as_deref(), Some("1.2.0"));
     assert!(record.error.is_none());
     assert_eq!(
@@ -432,8 +432,7 @@ fn the_pickle_exclusion_holds_at_its_exact_boundary() {
     fs::write(setup.root.join("poly.pkl"), docx_bytes()).unwrap();
 
     let report = run(&setup);
-    assert_eq!(report.counts.unsupported, 3);
-    assert_eq!(report.counts.converted, 1);
+    assert_eq!(report.counts.unsupported, 2);
 
     // Pickle opcode bytes and unplaceable bytes under the pickle
     // name both record the exclusion with no converter run.
@@ -449,14 +448,18 @@ fn the_pickle_exclusion_holds_at_its_exact_boundary() {
         assert!(record.converter_id.is_none(), "{path}");
     }
 
-    // A plain zip under the pickle name is detected as the zip it is
-    // and lands on the floor, with the disagreement flagged.
+    // A plain zip under the pickle name is the container it is: it
+    // expands to a member listing, with the extension disagreement
+    // flagged. The pickle name never made it a pickle.
     let archive = terminal(&setup, "archive.pkl");
-    assert_eq!(archive.status, Status::Unsupported);
+    assert_eq!(archive.status, Status::Converted);
     assert_eq!(archive.declared_format.as_deref(), Some("pickle"));
     assert_eq!(archive.detected_format, "zip");
     assert!(archive.format_mismatch);
-    assert_eq!(archive.error.as_deref(), Some("no-converter"));
+    assert_eq!(archive.converter_id.as_deref(), Some("container-zip"));
+    let member = terminal(&setup, "archive.pkl.d/payload.txt");
+    assert_eq!(member.status, Status::Converted);
+    assert_eq!(member.parent_source.as_deref(), Some("archive.pkl"));
 
     // A docx-shaped zip under the pickle name converts as the docx
     // it is, with the disagreement flagged. No pickle byte was ever

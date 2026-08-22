@@ -233,8 +233,32 @@ pub fn detect_file_with_warnings(
     path: &Path,
     table: &FormatTable,
 ) -> Result<(Detection, Vec<String>)> {
-    let declared = declared_format(path, table);
     let magic = FileFormat::from_file(path).map_err(|e| Error::io("detect", path, e))?;
+    Ok(resolve_detection(path, magic, table))
+}
+
+/// Detects the format of in-memory bytes against the table, using a
+/// path hint only for the declared extension or basename.
+///
+/// A container member has no file on disk, so magic runs over the
+/// extracted bytes and the member's own path names the declared
+/// format. The mismatch and warning semantics match
+/// [`detect_file_with_warnings`].
+pub fn detect_bytes_with_warnings(
+    path_hint: &Path,
+    bytes: &[u8],
+    table: &FormatTable,
+) -> (Detection, Vec<String>) {
+    let magic = FileFormat::from_bytes(bytes);
+    resolve_detection(path_hint, magic, table)
+}
+
+fn resolve_detection(
+    path: &Path,
+    magic: FileFormat,
+    table: &FormatTable,
+) -> (Detection, Vec<String>) {
+    let declared = declared_format(path, table);
     let magic_known = magic != FileFormat::default() && magic != FileFormat::Empty;
     let magic_id = if magic_known {
         table.id_for_extension(magic.extension()).map(String::from)
@@ -259,14 +283,14 @@ pub fn detect_file_with_warnings(
         }
         (None, None) => (UNKNOWN_FORMAT.to_string(), false),
     };
-    Ok((
+    (
         Detection {
             declared,
             detected,
             mismatch,
         },
         warnings,
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -279,7 +303,7 @@ mod tests {
     #[test]
     fn builtin_table_parses() {
         let table = FormatTable::builtin().unwrap();
-        assert_eq!(table.version(), "5");
+        assert_eq!(table.version(), "6");
         assert_eq!(table.id_for_extension("txt"), Some("text"));
         assert_eq!(table.id_for_extension("docx"), Some("docx"));
         assert_eq!(table.id_for_extension("json"), Some("json"));
