@@ -84,7 +84,7 @@ fn text_native_formats_convert_through_the_passthrough() {
         assert_eq!(record.status, Status::Converted, "{path}");
         assert_eq!(record.detected_format, format, "{path}");
         assert_eq!(record.converter_id.as_deref(), Some("text-passthrough"));
-        assert_eq!(record.rules_version, "4");
+        assert_eq!(record.rules_version, "5");
     }
 
     // svg passes through as raw markup and ipynb as the raw notebook
@@ -250,7 +250,7 @@ fn a_prior_unsupported_record_reconverts_under_the_new_rules() {
     let record = terminal(&setup, "data.json");
     assert_eq!(record.status, Status::Converted);
     assert_eq!(record.detected_format, "json");
-    assert_eq!(record.rules_version, "4");
+    assert_eq!(record.rules_version, "5");
     assert_eq!(
         fs::read_to_string(setup.mirror.join("alpha/data.json.txt")).unwrap(),
         String::from_utf8_lossy(bytes)
@@ -293,7 +293,7 @@ fn utf16_sources_transcode_and_utf32_fails_closed() {
 
     let csv = terminal(&setup, "report.csv");
     assert_eq!(csv.status, Status::Converted);
-    assert_eq!(csv.converter_version.as_deref(), Some("1.1.0"));
+    assert_eq!(csv.converter_version.as_deref(), Some("1.2.0"));
     assert!(
         csv.warnings.iter().any(|w| w == "transcoded from utf-16le"),
         "warnings: {:?}",
@@ -370,8 +370,8 @@ fn a_prior_invalid_utf8_failure_reconverts_under_the_new_rules() {
 
     let record = terminal(&setup, "legacy.csv");
     assert_eq!(record.status, Status::Converted);
-    assert_eq!(record.rules_version, "4");
-    assert_eq!(record.converter_version.as_deref(), Some("1.1.0"));
+    assert_eq!(record.rules_version, "5");
+    assert_eq!(record.converter_version.as_deref(), Some("1.2.0"));
     assert!(record.error.is_none());
     assert_eq!(
         fs::read_to_string(setup.mirror.join("alpha/legacy.csv.txt")).unwrap(),

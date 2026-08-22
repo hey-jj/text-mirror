@@ -40,6 +40,9 @@ pub struct CanonicalArtifact {
     pub converter_version: String,
     /// The canonical artifact's kind.
     pub artifact_kind: Option<ArtifactKind>,
+    /// Warnings from the canonical conversion. They describe the
+    /// bytes, so a duplicate of the same bytes inherits them.
+    pub warnings: Vec<String>,
 }
 
 /// Maps a source hash to the canonical artifact that converted it.
@@ -104,6 +107,7 @@ mod tests {
             converter_id: "text-passthrough".to_string(),
             converter_version: "1.0.0".to_string(),
             artifact_kind: Some(ArtifactKind::Text),
+            warnings: Vec::new(),
         };
         let mut second = first.clone();
         second.source_path = "b.txt".to_string();

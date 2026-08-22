@@ -324,6 +324,7 @@ fn seed_dedup(terminal: &HashMap<String, Record>, rules: &Rules, dedup: &mut Ded
                 converter_id: converter_id.clone(),
                 converter_version: converter_version.clone(),
                 artifact_kind: record.artifact_kind,
+                warnings: record.warnings.clone(),
             },
         );
     }
@@ -604,6 +605,14 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                     Status::Dedup,
                 );
                 record.warnings.clone_from(&detect_warnings);
+                // The canonical's conversion warnings describe these
+                // exact bytes, so the duplicate inherits any it does
+                // not already carry.
+                for warning in &canonical.warnings {
+                    if !record.warnings.contains(warning) {
+                        record.warnings.push(warning.clone());
+                    }
+                }
                 match mirror::write_atomic(&text_absolute, &text)
                     .and_then(|()| mirror::write_atomic(&segments_absolute, &segment_lines))
                 {
@@ -692,6 +701,14 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                             convert::MAX_OUTPUT_BYTES
                         ));
                     }
+                    // No converter output legitimately carries a NUL,
+                    // so the refusal lives here where every converter,
+                    // present and future, inherits it.
+                    if let Some(offset) = outcome.text.find('\0') {
+                        return Err(format!(
+                            "nul_bytes: NUL at byte {offset} of the converted text"
+                        ));
+                    }
                     segments::validate(&outcome.segments, &outcome.text)
                         .map_err(|detail| format!("invalid_segments: {detail}"))?;
                     Ok(outcome)
@@ -712,7 +729,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                     record.artifact_kind = Some(ArtifactKind::Text);
                     record.converter_id = Some(outcome.converter_id.clone());
                     record.converter_version = Some(outcome.converter_version.clone());
-                    record.warnings.extend(outcome.warnings);
+                    record.warnings.extend(outcome.warnings.iter().cloned());
                     dedup.replace(
                         &source_hash,
                         CanonicalArtifact {
@@ -722,6 +739,7 @@ pub fn run(rules: &Rules, options: &RunOptions) -> Result<RunReport> {
                             converter_id: outcome.converter_id,
                             converter_version: outcome.converter_version,
                             artifact_kind: record.artifact_kind,
+                            warnings: outcome.warnings,
                         },
                     );
                 }
@@ -839,7 +857,7 @@ mod tests {
     #[test]
     fn builtin_rules_agree_on_a_version() {
         let rules = Rules::builtin().unwrap();
-        assert_eq!(rules.version(), "4");
+        assert_eq!(rules.version(), "5");
     }
 
     use crate::convert::{ConvertError, Converter, Outcome, PlainTextPassthrough};

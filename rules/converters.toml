@@ -7,14 +7,14 @@
 # must match the version in formats.toml and is recorded in every
 # manifest record as rules_version.
 
-version = "4"
+version = "5"
 
 # The passthrough validates UTF-8 and fails closed on anything else,
 # so a binary wearing one of these extensions records failed with
 # invalid_utf8. That floor is what makes a broad list safe.
 [[converters]]
 id = "text-passthrough"
-version = "1.1.0"
+version = "1.2.0"
 formats = [
   "text", "markdown", "csv",
   # Structured text and data interchange.
@@ -31,6 +31,24 @@ formats = [
   "terraform", "hcl", "lookml", "tmdl", "pbip",
   "tableau-workbook", "tableau-datasource",
 ]
+
+# Streaming strip to visible text: script, style, template, noscript,
+# and non-title head content are dropped, block boundaries become line
+# breaks, entities decode, whitespace collapses.
+[[converters]]
+id = "html-strip"
+version = "1.0.0"
+formats = ["html"]
+
+# MIME message to text: a fixed header subset, then the text body
+# parts. An html-only body runs through the html strip path.
+# Attachments are enumerated as warnings and never decoded until
+# container expansion lands. msg stays unrouted, it is a compound
+# file, so it sits on the no-converter floor.
+[[converters]]
+id = "eml-mime"
+version = "1.0.0"
+formats = ["eml"]
 
 [[converters]]
 id = "anydoc-document"

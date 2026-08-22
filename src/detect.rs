@@ -40,6 +40,11 @@ struct RawFormatDef {
     /// of, such as svg refining xml. Carried privately by the table.
     #[serde(default)]
     refines: Option<String>,
+    /// Exact file names that declare this format for paths with no
+    /// extension, such as a file named exactly `.env`. Carried
+    /// privately by the table.
+    #[serde(default)]
+    basenames: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +66,7 @@ pub struct FormatTable {
     version: String,
     formats: Vec<FormatDef>,
     by_extension: HashMap<String, String>,
+    by_basename: HashMap<String, String>,
     refines_by_id: HashMap<String, String>,
 }
 
@@ -81,6 +87,7 @@ impl FormatTable {
             message,
         };
         let mut by_extension = HashMap::new();
+        let mut by_basename = HashMap::new();
         let mut ids = HashMap::new();
         let mut refines_by_id = HashMap::new();
         for format in &raw.formats {
@@ -101,6 +108,15 @@ impl FormatTable {
                     return Err(rules_error(format!(
                         "extension {extension:?} claimed twice"
                     )));
+                }
+            }
+            for basename in &format.basenames {
+                if basename.is_empty()
+                    || by_basename
+                        .insert(basename.clone(), format.id.clone())
+                        .is_some()
+                {
+                    return Err(rules_error(format!("basename {basename:?} claimed twice")));
                 }
             }
             if let Some(target) = &format.refines {
@@ -138,6 +154,7 @@ impl FormatTable {
             version: raw.version,
             formats,
             by_extension,
+            by_basename,
             refines_by_id,
         })
     }
@@ -177,12 +194,19 @@ pub struct Detection {
 
 /// The format id a file's extension declares, when the table knows it.
 ///
+/// A path with no extension falls back to the table's exact basename
+/// entries, so a file named exactly `.env` still declares its format.
 /// Needs no file access, so it works for a file the run cannot read.
 pub fn declared_format(path: &Path, table: &FormatTable) -> Option<String> {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .and_then(|e| table.id_for_extension(&e.to_ascii_lowercase()))
-        .map(String::from)
+    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
+        return table
+            .id_for_extension(&extension.to_ascii_lowercase())
+            .map(String::from);
+    }
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| table.by_basename.get(n))
+        .cloned()
 }
 
 /// Detects the format of one file against the table.
@@ -255,7 +279,7 @@ mod tests {
     #[test]
     fn builtin_table_parses() {
         let table = FormatTable::builtin().unwrap();
-        assert_eq!(table.version(), "4");
+        assert_eq!(table.version(), "5");
         assert_eq!(table.id_for_extension("txt"), Some("text"));
         assert_eq!(table.id_for_extension("docx"), Some("docx"));
         assert_eq!(table.id_for_extension("json"), Some("json"));
@@ -402,6 +426,28 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("refines another format"), "{err}");
+    }
+
+    #[test]
+    fn a_bare_dotfile_declares_its_format_by_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        fs::write(&path, b"API_URL=http://localhost\n").unwrap();
+        let table = FormatTable::builtin().unwrap();
+        let detection = detect_file(&path, &table).unwrap();
+        assert_eq!(detection.declared.as_deref(), Some("env"));
+        assert_eq!(detection.detected, "env");
+        assert!(!detection.mismatch);
+    }
+
+    #[test]
+    fn parse_refuses_a_basename_claimed_twice() {
+        let err = table_with(concat!(
+            "[[formats]]\nid = \"a\"\nname = \"A\"\nextensions = [\"a\"]\nbasenames = [\".rc\"]\n",
+            "[[formats]]\nid = \"b\"\nname = \"B\"\nextensions = [\"b\"]\nbasenames = [\".rc\"]\n",
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("basename"), "{err}");
     }
 
     #[test]

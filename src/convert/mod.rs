@@ -53,6 +53,8 @@ use crate::{Error, Result};
 mod anydoc_log;
 mod differential;
 mod document;
+pub mod eml;
+pub mod html;
 pub mod pdf;
 pub mod subprocess;
 mod visibility;
@@ -62,6 +64,8 @@ pub use differential::{
     DiffMetrics, DiffVerdict, DifferentialOutcome, compare_texts, normalize_for_diff,
 };
 pub use document::{AnydocDocument, markdown_to_plain};
+pub use eml::EmlMime;
+pub use html::HtmlStrip;
 pub use subprocess::PdfSubprocess;
 pub use visibility::{IndexRange, SheetVisibility, WorkbookVisibility, read_visibility};
 pub use workbook::WorkbookIr;
@@ -150,6 +154,9 @@ pub fn normalize_text(input: &str) -> String {
 /// odd trailing byte or unpaired surrogate fails with `invalid_utf16`
 /// naming the byte offset, and a file with no mark must be valid
 /// UTF-8. A leading UTF-8 byte order mark is stripped with a warning.
+/// A NUL scalar anywhere in the decoded text fails closed with reason
+/// `nul_bytes`, because text-native content never holds one and the
+/// usual culprit is a BOM-less UTF-16 export.
 pub struct PlainTextPassthrough;
 
 /// The floor reason for an unsupported record whose detected format
@@ -160,7 +167,7 @@ pub const NO_CONVERTER_REASON: &str = "no-converter";
 /// Registry id of the passthrough converter.
 pub const PASSTHROUGH_ID: &str = "text-passthrough";
 /// Version of the passthrough converter.
-pub const PASSTHROUGH_VERSION: &str = "1.1.0";
+pub const PASSTHROUGH_VERSION: &str = "1.2.0";
 
 /// Decodes UTF-16 byte pairs after a consumed byte order mark.
 ///
@@ -251,6 +258,19 @@ impl Converter for PlainTextPassthrough {
                 None => raw,
             }
         };
+        // Legitimate text-native content carries no NUL, and the
+        // common way one appears is a BOM-less UTF-16 export whose
+        // ASCII half happens to be valid UTF-8. Refuse instead of
+        // emitting NUL-split tokens.
+        if let Some(offset) = raw.find('\0') {
+            return Err(ConvertError {
+                code: "nul_bytes",
+                message: format!(
+                    "NUL at byte {offset} of the decoded text, the bytes may be \
+                     BOM-less UTF-16, re-export as UTF-8"
+                ),
+            });
+        }
         let text = normalize_text(&raw);
         if source_len > 0 && text.is_empty() {
             return Err(ConvertError {
@@ -326,6 +346,8 @@ impl Registry {
         for entry in &raw.converters {
             let converter: Box<dyn Converter> = match entry.id.as_str() {
                 PASSTHROUGH_ID => Box::new(PlainTextPassthrough),
+                html::HTML_STRIP_ID => Box::new(HtmlStrip),
+                eml::EML_ID => Box::new(EmlMime),
                 document::ANYDOC_ID => Box::new(AnydocDocument),
                 workbook::WORKBOOK_ID => Box::new(WorkbookIr),
                 subprocess::PDF_SUBPROCESS_ID => Box::new(PdfSubprocess),
@@ -566,6 +588,23 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_refuses_nul_bytes_with_the_first_offset() {
+        let err = PlainTextPassthrough
+            .convert(b"ab\0cd\0", "text")
+            .unwrap_err();
+        assert_eq!(err.code, "nul_bytes");
+        assert!(err.message.contains("byte 2"), "{}", err.message);
+        assert!(err.message.contains("BOM-less UTF-16"), "{}", err.message);
+        // The decoded path gets the same check: a UTF-16 file whose
+        // decoded text holds a NUL fails too.
+        let err = PlainTextPassthrough
+            .convert(b"\xFF\xFEA\x00\x00\x00B\x00", "text")
+            .unwrap_err();
+        assert_eq!(err.code, "nul_bytes");
+        assert!(err.message.contains("byte 1"), "{}", err.message);
+    }
+
+    #[test]
     fn passthrough_still_fails_bomless_utf16_as_invalid_utf8() {
         let mut source = utf16_bytes("R\u{e9}sum\u{e9}\n", false);
         source.drain(..2);
@@ -576,7 +615,7 @@ mod tests {
     #[test]
     fn builtin_registry_claims_the_text_family() {
         let registry = Registry::builtin().unwrap();
-        assert_eq!(registry.version(), "4");
+        assert_eq!(registry.version(), "5");
         assert!(registry.converter_for("json").is_some());
         assert!(registry.converter_for("yaml").is_some());
         assert!(registry.converter_for("svg").is_some());
@@ -593,7 +632,15 @@ mod tests {
         );
         assert!(registry.converter_for("docx").is_some());
         assert!(registry.converter_for("xlsx").is_some());
-        assert!(registry.converter_for("html").is_none());
+        assert_eq!(
+            registry.converter_for("html").map(|c| c.id()),
+            Some("html-strip")
+        );
+        assert_eq!(
+            registry.converter_for("eml").map(|c| c.id()),
+            Some("eml-mime")
+        );
+        assert!(registry.converter_for("msg").is_none());
         assert!(registry.converter_for("xlsb").is_none());
         assert_eq!(
             registry.unsupported_reason("xlsb"),
@@ -625,10 +672,11 @@ mod tests {
         assert_eq!(registry.unsupported_reason("text"), None);
         assert_eq!(registry.unsupported_reason("png"), Some("engine-unpinned"));
         assert_eq!(registry.unsupported_reason("mp4"), Some("engine-unpinned"));
-        // html is detected but unclaimed until a strip converter
-        // lands, so it sits on the floor, not outside the vocabulary.
+        // html is claimed now, and msg stays on the floor: it is a
+        // compound file, not an RFC 822 message.
+        assert_eq!(registry.unsupported_reason("html"), None);
         assert_eq!(
-            registry.unsupported_reason("html"),
+            registry.unsupported_reason("msg"),
             Some(NO_CONVERTER_REASON)
         );
     }
@@ -643,7 +691,7 @@ mod tests {
         ] {
             let toml = if section == "converters" {
                 format!(
-                    "version = \"1\"\n[[converters]]\nid = \"text-passthrough\"\nversion = \"1.1.0\"\nformats = [\"{id}\"]\n"
+                    "version = \"1\"\n[[converters]]\nid = \"text-passthrough\"\nversion = \"1.2.0\"\nformats = [\"{id}\"]\n"
                 )
             } else {
                 format!(
