@@ -23,6 +23,36 @@ pub const PDF_SUBPROCESS_ID: &str = "pdf-subprocess";
 /// Version of the subprocess PDF adapter.
 pub const PDF_SUBPROCESS_VERSION: &str = "1.0.0";
 
+/// Manifest converter id for the direct-extraction recovery path: a
+/// PDF whose text was recovered after the markdown path declined the
+/// page as image-based. It names the actual extraction path so a
+/// recovered document is never recorded under the markdown path's id.
+pub const PDF_RECOVERED_ID: &str = "pdf-text-recovered";
+/// Version of the PDF recovery path. It shares the adapter version
+/// deliberately: both paths ship in the same adapter, and the checkpoint
+/// key compares converter version, so an unchanged recovered PDF skips
+/// on a later run only because this equals the adapter version.
+///
+/// INVARIANT: any future change to the recovery path's behavior MUST
+/// bump the shared adapter version [`PDF_SUBPROCESS_VERSION`]. Because
+/// this equals that version, a bump moves both paths together and
+/// reconverts prior artifacts of both. The equality is asserted in the
+/// tests below so a silent divergence cannot compile past review.
+pub const PDF_RECOVERED_VERSION: &str = PDF_SUBPROCESS_VERSION;
+
+/// The manifest converter id and version for a PDF outcome, chosen by
+/// whether the text came from the direct recovery extractor. The
+/// registered converter keeps its single id and version; only the
+/// per-outcome manifest record names the recovery path.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn pdf_converter_identity(recovered: bool) -> (&'static str, &'static str) {
+    if recovered {
+        (PDF_RECOVERED_ID, PDF_RECOVERED_VERSION)
+    } else {
+        (PDF_SUBPROCESS_ID, PDF_SUBPROCESS_VERSION)
+    }
+}
+
 /// Registry id of the jailed records worker adapter.
 pub const RECORDS_SUBPROCESS_ID: &str = "records-worker";
 /// Version of the jailed records worker adapter.
@@ -183,9 +213,10 @@ mod imp {
                 },
                 &[("input.pdf", source)],
             )?;
+            let (converter_id, converter_version) = pdf_converter_identity(body.recovered);
             Ok(Outcome {
-                converter_id: PDF_SUBPROCESS_ID.to_string(),
-                converter_version: PDF_SUBPROCESS_VERSION.to_string(),
+                converter_id: converter_id.to_string(),
+                converter_version: converter_version.to_string(),
                 detected_format: detected_format.to_string(),
                 text: body.text,
                 warnings: body.warnings,
@@ -614,6 +645,23 @@ fn finish_lines(lines: Vec<String>) -> String {
 mod tests {
     use super::*;
     use crate::runner_bodies::{AsrSegment, ScreenState};
+
+    #[test]
+    fn recovered_pdf_text_is_recorded_under_the_recovery_id() {
+        // The markdown path keeps the adapter id; a recovered document
+        // names the recovery path, and both share the adapter version
+        // so the checkpoint key still skips an unchanged recovered PDF.
+        assert_eq!(
+            pdf_converter_identity(false),
+            (PDF_SUBPROCESS_ID, PDF_SUBPROCESS_VERSION)
+        );
+        assert_eq!(
+            pdf_converter_identity(true),
+            (PDF_RECOVERED_ID, PDF_RECOVERED_VERSION)
+        );
+        assert_ne!(PDF_RECOVERED_ID, PDF_SUBPROCESS_ID);
+        assert_eq!(PDF_RECOVERED_VERSION, PDF_SUBPROCESS_VERSION);
+    }
 
     #[test]
     fn timecodes_render_as_hours_minutes_seconds() {

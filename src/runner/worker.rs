@@ -128,6 +128,7 @@ mod production {
                     text: conversion.text,
                     warnings: conversion.warnings,
                     segments: conversion.segments,
+                    recovered: conversion.recovered,
                 })
                 .expect("PdfOk serializes"),
             )),

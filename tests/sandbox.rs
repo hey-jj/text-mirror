@@ -61,6 +61,50 @@ fn terminal(setup: &Setup, source_path: &str) -> Record {
         .unwrap()
 }
 
+/// A one-page PDF the classifier reports as image-based (heavy vector
+/// paths beside a small text layer), yet whose real text layer the
+/// direct extractor recovers. This drives the recovery path end to end
+/// through the worker, so the record carries the `pdf-text-recovered`
+/// converter id.
+fn image_based_pdf_with_recoverable_text() -> Vec<u8> {
+    let mut stream = String::new();
+    for step in 0..600 {
+        let n = (step % 500) + 50;
+        stream.push_str(&format!("{n} {n} m {n} {n} l S\n"));
+    }
+    stream.push_str("BT /F1 12 Tf 72 700 Td (Small text layer only) Tj ET\n");
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{stream}\nendstream",
+            stream.len()
+        ),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+    ];
+    let mut pdf = String::from("%PDF-1.6\n");
+    let mut offsets = Vec::new();
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", index + 1));
+    }
+    let xref_at = pdf.len();
+    pdf.push_str(&format!("xref\n0 {}\n", objects.len() + 1));
+    pdf.push_str("0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+        objects.len() + 1
+    ));
+    pdf.into_bytes()
+}
+
 /// A minimal one-page PDF with a text layer.
 fn pdf_with_text(text: &str) -> Vec<u8> {
     let stream = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
@@ -141,6 +185,57 @@ fn a_converted_pdf_reconverts_idempotently_under_the_pinned_rules() {
     assert_eq!(record.status, Status::SkippedUnchanged);
     assert_eq!(record.rules_version, rules.version());
     assert_eq!(record.converter_id.as_deref(), Some("pdf-subprocess"));
+}
+
+#[test]
+fn a_recovered_pdf_checkpoint_skips_on_the_second_pass() {
+    // Guards the shared-version coupling: the recovery path is recorded
+    // under `pdf-text-recovered` yet keeps the adapter's converter
+    // version, and the checkpoint key compares converter version. If the
+    // recovery path ever carried a different version, an unchanged
+    // recovered PDF would reconvert every pass instead of skipping. This
+    // test fails the moment that coupling breaks.
+    let setup = setup();
+    fs::write(
+        setup.root.join("art.pdf"),
+        image_based_pdf_with_recoverable_text(),
+    )
+    .unwrap();
+
+    let rules = Rules::builtin().unwrap();
+    let first = run(&setup, &rules);
+    assert_eq!(first.counts.converted, 1, "records: {first:?}");
+    let record = terminal(&setup, "art.pdf");
+    assert_eq!(
+        record.status,
+        Status::Converted,
+        "error: {:?}",
+        record.error
+    );
+    assert_eq!(
+        record.converter_id.as_deref(),
+        Some("pdf-text-recovered"),
+        "the recovery path names itself in the manifest"
+    );
+    assert_eq!(record.converter_version.as_deref(), Some("1.0.0"));
+    assert!(
+        record
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("pdf_partial_text:")),
+        "a recovered page is routed to OCR: {:?}",
+        record.warnings
+    );
+
+    // Second pass over the unchanged source: the checkpoint key matches
+    // on the shared converter version and the document skips with no
+    // work, keeping its recovery id.
+    let second = run(&setup, &rules);
+    assert_eq!(second.counts.converted, 0);
+    assert_eq!(second.counts.skipped_unchanged, 1);
+    let record = terminal(&setup, "art.pdf");
+    assert_eq!(record.status, Status::SkippedUnchanged);
+    assert_eq!(record.converter_id.as_deref(), Some("pdf-text-recovered"));
 }
 
 /// A one-page PDF with an empty content stream, the no-text-layer

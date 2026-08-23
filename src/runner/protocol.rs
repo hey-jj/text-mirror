@@ -218,6 +218,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_non_recovered_pdf_response_omits_the_recovered_field() {
+        use bodies::PdfOk;
+        // A non-recovered outcome serializes byte-identical to the
+        // pre-recovery wire: the `recovered` field is skipped entirely,
+        // so a mixed-version worker pairing can only trip on an
+        // actually-recovered document.
+        let plain = PdfOk {
+            text: "hi".to_string(),
+            warnings: Vec::new(),
+            segments: Vec::new(),
+            recovered: false,
+        };
+        let encoded = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !encoded.contains("recovered"),
+            "false recovered is off the wire: {encoded}"
+        );
+        // The default fills it back in when the field is absent.
+        let back: PdfOk = serde_json::from_str(&encoded).unwrap();
+        assert!(!back.recovered);
+
+        let recovered = PdfOk {
+            recovered: true,
+            ..plain
+        };
+        let encoded = serde_json::to_string(&recovered).unwrap();
+        assert!(
+            encoded.contains("\"recovered\":true"),
+            "a recovered outcome carries the field: {encoded}"
+        );
+    }
+
+    #[test]
     fn frames_roundtrip() {
         let mut buffer = Vec::new();
         let request = Request {
@@ -321,6 +354,23 @@ pub mod bodies {
         pub warnings: Vec<String>,
         /// Structure spans over the text.
         pub segments: Vec<Segment>,
+        /// Whether the text came from the direct recovery extractor
+        /// rather than the markdown path. The parent adapter maps this
+        /// to the manifest converter id, so a recovered document is
+        /// never recorded under the markdown path's id.
+        ///
+        /// Skipped from the wire when false, so every non-recovered
+        /// outcome serializes byte-identical to the pre-recovery wire
+        /// and a mixed-version worker pairing can only ever trip on an
+        /// actually-recovered document. `deny_unknown_fields` above then
+        /// fails such a pairing loudly rather than dropping the field.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub recovered: bool,
+    }
+
+    /// Whether a boolean is false, for `skip_serializing_if`.
+    fn is_false(value: &bool) -> bool {
+        !*value
     }
 
     /// Request body for the `records` adapter, which reads parquet,
