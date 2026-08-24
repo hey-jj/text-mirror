@@ -85,6 +85,21 @@ id = "image-pixel-ocr"
 version = "1.0.0"
 formats = ["png", "jpeg", "webp"]
 
+# Image-metadata is an auxiliary converter: one image source yields the
+# pixel-OCR text as its primary artifact and the textual metadata as a
+# hidden derived child at <source>.d/#image-metadata. It claims no
+# formats, so it never enters the format routing table and never competes
+# for a claim; the pipeline runs it as a derived-child leg for the image
+# carriers. The exif, png text-chunk, xmp, iptc, and iso base media file
+# format parsers all run behind the same subprocess jail as the records
+# worker. Gated behind the image-metadata feature; without it, and with
+# no formats to route, the entry is skipped at registry construction. The
+# ceilings live in the [image_metadata] section below.
+[[converters]]
+id = "image-metadata"
+version = "1.0.0"
+formats = []
+
 # Parquet, avro, and sqlite run behind the same subprocess jail as the
 # PDF path. These parsers pull large native trees with CVE history, so
 # hostile bytes crash a jailed child and never the pipeline. Each
@@ -220,3 +235,28 @@ file_size_bytes = 67108864
 # The GPU driver spins its own threads; 64 gives headroom over the
 # default 16. A per-uid ceiling, not a per-invocation one.
 max_processes = 64
+
+# Image-metadata parser ceilings, versioned with the rest of the rules.
+# The metadata worker runs behind the shared platform-default jail, so
+# these are the parser-surface ceilings only, not the wall-clock and
+# address-space envelope the runner already imposes. The parent reads
+# them and passes them into the jailed worker, which enforces them and
+# fails a source over any ceiling with a stable image-metadata reason and
+# no artifact. A deployment that needs more raises them in a visible
+# versioned bump.
+[image_metadata]
+# Inflated-size ceiling for one compressed text block, the png zTXt and
+# compressed iTXt streams above all. Checked incrementally during
+# inflation so a decompression bomb is stopped before it lands. 16 MiB.
+max_decompressed_bytes = 16777216
+# Nesting-depth ceiling for an xmp or svg parse.
+max_xml_depth = 100
+# Event-count ceiling for an xmp or svg parse.
+max_xml_events = 1000000
+# Box-count ceiling for an iso base media file format carrier.
+max_boxes = 10000
+# Ceiling on emitted metadata rows across all surfaces.
+max_rows = 4096
+# Ceiling on the rendered value bytes, under the runner response cap.
+# 16 MiB.
+max_output_bytes = 16777216

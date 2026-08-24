@@ -106,6 +106,48 @@ impl Default for ImageOcrLimits {
     }
 }
 
+/// The image-metadata parser ceilings, held as rules data beside the
+/// records ceilings so a deployment raises them in a visible versioned
+/// bump. The parent reads them from the registry and passes them into
+/// the jailed worker, which enforces them and fails a source over any
+/// ceiling with a stable `image-metadata-*` reason. The metadata worker
+/// runs behind the shared platform-default jail, so these are the
+/// parser-surface ceilings only, not the wall-clock and address-space
+/// envelope the runner already imposes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageMetadataLimits {
+    /// Inflated-size ceiling for any single compressed text block, the
+    /// png `zTXt` and compressed `iTXt` streams above all. Checked
+    /// incrementally during inflation so a decompression bomb is stopped
+    /// before it lands.
+    pub max_decompressed_bytes: u64,
+    /// Nesting-depth ceiling for an xmp or svg parse.
+    pub max_xml_depth: u32,
+    /// Event-count ceiling for an xmp or svg parse.
+    pub max_xml_events: u64,
+    /// Box-count ceiling for an iso base media file format carrier.
+    pub max_boxes: u64,
+    /// Ceiling on emitted metadata rows across all surfaces.
+    pub max_rows: u64,
+    /// Ceiling on the rendered value bytes, under the runner response
+    /// cap.
+    pub max_output_bytes: u64,
+}
+
+impl Default for ImageMetadataLimits {
+    fn default() -> ImageMetadataLimits {
+        ImageMetadataLimits {
+            max_decompressed_bytes: 16 * 1024 * 1024,
+            max_xml_depth: 100,
+            max_xml_events: 1_000_000,
+            max_boxes: 10_000,
+            max_rows: 4096,
+            max_output_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
 use std::collections::HashMap;
 use std::fmt;
 
@@ -136,6 +178,12 @@ pub(crate) mod records;
 // reaches it through a crate path.
 #[cfg(all(unix, feature = "image-ocr"))]
 pub(crate) mod image_ocr;
+// The image-metadata derived-child leg. The id, version, and the
+// applies predicate are always compiled so the registry and pipeline can
+// name the leg; the parsers and the parent rendering compile only under
+// the feature, crate-private for the same reason records is: a library
+// consumer must not run the parsers in process and bypass the jail.
+pub mod image_metadata;
 pub mod subprocess;
 mod visibility;
 mod workbook;
@@ -435,6 +483,8 @@ struct RawRegistry {
     records: Option<RecordsLimits>,
     #[serde(default)]
     image_ocr: Option<ImageOcrLimits>,
+    #[serde(default)]
+    image_metadata: Option<ImageMetadataLimits>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -465,6 +515,12 @@ pub struct Registry {
     container_limits: ContainerLimits,
     records_limits: RecordsLimits,
     image_ocr_limits: ImageOcrLimits,
+    image_metadata_limits: ImageMetadataLimits,
+    /// Index into `converters` of the auxiliary image-metadata converter,
+    /// which never enters `by_format`. The pipeline reaches it by this
+    /// index to run the derived-child leg. `None` when the feature is
+    /// absent, so the leg simply does not run.
+    image_metadata_index: Option<usize>,
 }
 
 impl Registry {
@@ -484,9 +540,14 @@ impl Registry {
         })?;
         let records_limits = raw.records.clone().unwrap_or_default();
         let image_ocr_limits = raw.image_ocr.clone().unwrap_or_default();
+        let image_metadata_limits = raw.image_metadata.clone().unwrap_or_default();
         let mut converters: Vec<Box<dyn Converter>> = Vec::new();
         let mut by_format = HashMap::new();
         let mut unsupported_reasons = HashMap::new();
+        // Reassigned only under the feature; without it the auxiliary
+        // converter is never constructed and the index stays absent.
+        #[allow(unused_mut)]
+        let mut image_metadata_index: Option<usize> = None;
         for entry in &raw.converters {
             // A build without the records-worker feature has no records
             // mode in its worker, so route the records formats to a
@@ -544,6 +605,17 @@ impl Registry {
                 }
                 continue;
             }
+            // The image-metadata converter is auxiliary and claims no
+            // formats. Without the in-jail metadata reader, or on a
+            // platform with no jail backend, the derived-child leg cannot
+            // run; there are no formats to route to a not-built reason, so
+            // the entry is simply skipped. The pipeline reads
+            // `image_metadata_converter()` as absent and never runs the
+            // leg.
+            #[cfg(not(all(unix, feature = "image-metadata")))]
+            if entry.id == image_metadata::IMAGE_METADATA_ID {
+                continue;
+            }
             let converter: Box<dyn Converter> = match entry.id.as_str() {
                 PASSTHROUGH_ID => Box::new(PlainTextPassthrough),
                 html::HTML_STRIP_ID => Box::new(HtmlStrip),
@@ -558,6 +630,10 @@ impl Registry {
                 subprocess::IMAGE_PIXEL_OCR_ID => {
                     Box::new(subprocess::ImagePixelOcr::new(image_ocr_limits.clone()))
                 }
+                #[cfg(all(unix, feature = "image-metadata"))]
+                image_metadata::IMAGE_METADATA_ID => Box::new(subprocess::ImageMetadata::new(
+                    image_metadata_limits.clone(),
+                )),
                 other => {
                     return Err(Error::Rules {
                         name: name.to_string(),
@@ -577,6 +653,10 @@ impl Registry {
                 });
             }
             let index = converters.len();
+            #[cfg(all(unix, feature = "image-metadata"))]
+            if entry.id == image_metadata::IMAGE_METADATA_ID {
+                image_metadata_index = Some(index);
+            }
             converters.push(converter);
             for format in &entry.formats {
                 if RESERVED_FORMAT_IDS.contains(&format.as_str()) {
@@ -621,6 +701,8 @@ impl Registry {
             container_limits: raw.containers.unwrap_or_default(),
             records_limits,
             image_ocr_limits,
+            image_metadata_limits,
+            image_metadata_index,
         })
     }
 
@@ -649,6 +731,19 @@ impl Registry {
     /// The image-OCR jail limit profile from the rules.
     pub fn image_ocr_limits(&self) -> &ImageOcrLimits {
         &self.image_ocr_limits
+    }
+
+    /// The image-metadata parser ceilings from the rules.
+    pub fn image_metadata_limits(&self) -> &ImageMetadataLimits {
+        &self.image_metadata_limits
+    }
+
+    /// The auxiliary image-metadata converter, if the feature built one.
+    /// It never enters `by_format`, so the pipeline reaches it here to
+    /// run the derived-child leg. `None` means the leg does not run.
+    pub fn image_metadata_converter(&self) -> Option<&dyn Converter> {
+        self.image_metadata_index
+            .map(|index| self.converters[index].as_ref())
     }
 
     /// The reason a format is unsupported.
@@ -695,6 +790,8 @@ impl Registry {
             container_limits: ContainerLimits::default(),
             records_limits: RecordsLimits::default(),
             image_ocr_limits: ImageOcrLimits::default(),
+            image_metadata_limits: ImageMetadataLimits::default(),
+            image_metadata_index: None,
         }
     }
 }

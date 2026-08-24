@@ -16,6 +16,12 @@ The records-worker feature pulls the parquet, apache-avro, rusqlite,
 and compression crates. Their notices are below. A build without that
 feature links none of them.
 
+The image-metadata feature pulls the kamadak-exif, png, and img-parts
+crates, and img-parts pulls mutate_once. png and img-parts are MIT or
+Apache-2.0 and carry no separate notice; kamadak-exif and mutate_once
+are BSD-2-Clause and appear in the section below. A build without that
+feature links none of them.
+
 ## Apache-2.0 NOTICE files
 
 Two Apache-2.0 dependencies ship a NOTICE file, reproduced here under
@@ -522,10 +528,16 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## BSD-2-Clause
 
-Covered crate: arrayref 0.3.9.
+Covered crates: arrayref 0.3.9, and, under the image-metadata feature,
+kamadak-exif 0.6.1 (Copyright (c) 2016-2023 KAMADA Ken'ichi) and
+mutate_once 0.1.2 (Copyright (c) 2019 KAMADA Ken'ichi). Each is consumed
+unmodified. The three copyright notices are reproduced above the shared
+BSD-2-Clause terms below.
 
 ```text
 Copyright (c) 2015 David Roundy <roundyd@physics.oregonstate.edu>
+Copyright (c) 2016-2023 KAMADA Ken'ichi (kamadak-exif)
+Copyright (c) 2019 KAMADA Ken'ichi (mutate_once)
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without

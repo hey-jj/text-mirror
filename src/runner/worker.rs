@@ -85,6 +85,13 @@ fn run_mode(mode: &str) -> Result<Response, HardExit> {
         // decode and the engine child both stay behind the sandbox.
         #[cfg(all(unix, feature = "image-ocr"))]
         "image-ocr" => image_ocr::image_ocr(read_request()?),
+        // The in-jail image-metadata reader. Compiles only under the
+        // feature and runs only in the jail: the exif, png text-chunk,
+        // xmp, iptc, and iso base media file format parsers all stay
+        // behind the sandbox, where a bomb or a flood crashes or times
+        // out the child.
+        #[cfg(all(unix, feature = "image-metadata"))]
+        "image-metadata" => image_metadata::image_metadata(read_request()?),
         // The fake stage-3 recognition, a separate mode the test harness
         // selects. It runs the real decode and area guards and only the
         // stage-3 recognition is fake, so it never stands in for the
@@ -246,6 +253,39 @@ mod image_ocr {
         match recognize_fake(&body) {
             Ok(ok) => Ok(Response::ok(
                 serde_json::to_value(ok).expect("OcrOk serializes"),
+            )),
+            Err(error) => Ok(Response::err(error.code, error.message)),
+        }
+    }
+}
+
+/// The jailed image-metadata mode: lift textual metadata out of a
+/// raster and return structured rows, all inside the sandbox.
+#[cfg(all(unix, feature = "image-metadata"))]
+mod image_metadata {
+    use std::path::Path;
+
+    use super::*;
+    use crate::convert::image_metadata::extract::{Ceilings, extract};
+    use crate::runner::protocol::bodies::{ImageMetadataOk, ImageMetadataRequest};
+
+    pub(super) fn image_metadata(request: Request) -> Result<Response, HardExit> {
+        let body: ImageMetadataRequest =
+            serde_json::from_value(request.payload.clone()).map_err(|e| {
+                eprintln!("worker_bad_payload: {e}");
+                HardExit(2)
+            })?;
+        let ceilings = Ceilings {
+            max_decompressed_bytes: body.max_decompressed_bytes,
+            max_xml_depth: body.max_xml_depth,
+            max_xml_events: body.max_xml_events,
+            max_boxes: body.max_boxes,
+            max_rows: body.max_rows,
+            max_output_bytes: body.max_output_bytes,
+        };
+        match extract(Path::new(&body.input), &body.format, &ceilings) {
+            Ok(rows) => Ok(Response::ok(
+                serde_json::to_value(ImageMetadataOk { rows }).expect("ImageMetadataOk serializes"),
             )),
             Err(error) => Ok(Response::err(error.code, error.message)),
         }

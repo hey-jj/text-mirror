@@ -693,7 +693,7 @@ impl Expander<'_> {
         }
 
         let Some(kind) = kind else {
-            return self.convert_leaf(meta, bytes, started);
+            return self.convert_leaf_with_metadata(meta, bytes, started);
         };
         // A top-level container owns the claim state for its whole
         // subtree. Nested containers share the owner's state.
@@ -868,6 +868,207 @@ impl Expander<'_> {
         }
         record.duration_ms = Some(elapsed_ms(started));
         self.emit(record)
+    }
+
+    /// The leaf path plus, for an image carrier, the auxiliary
+    /// metadata derived-child leg.
+    ///
+    /// The primary conversion is the unchanged leaf path. When the format
+    /// is an image carrier and the metadata converter is built, one
+    /// image source additionally yields a hidden metadata child at
+    /// `<source>.d/#image-metadata`, structurally parallel to a container
+    /// member. The two legs share nothing: a failure of the metadata
+    /// child never touches the primary image record.
+    fn convert_leaf_with_metadata(
+        &mut self,
+        meta: Meta,
+        bytes: UnitBytes,
+        started: Instant,
+    ) -> Result<()> {
+        #[cfg(all(unix, feature = "image-metadata"))]
+        if convert::image_metadata::image_metadata_applies(&meta.detection.detected)
+            && self.rules.registry.image_metadata_converter().is_some()
+        {
+            return self.convert_image_with_metadata(meta, bytes, started);
+        }
+        self.convert_leaf(meta, bytes, started)
+    }
+
+    /// Runs the primary OCR leg and then the metadata derived-child leg
+    /// for one image source, loading the bytes once for both.
+    #[cfg(all(unix, feature = "image-metadata"))]
+    fn convert_image_with_metadata(
+        &mut self,
+        mut meta: Meta,
+        bytes: UnitBytes,
+        started: Instant,
+    ) -> Result<()> {
+        // Load once. A load error means the primary leg records it and no
+        // metadata child is attempted, so route it through the leaf path.
+        let raw = match bytes.load(&meta.source_hash) {
+            Ok(raw) => raw,
+            Err(reason) => return self.fail(&meta, reason, started),
+        };
+        // Collision guard on the image `.d/` namespace, before the primary
+        // leg records, so the warning rides the parent image record. A
+        // real walked source in the namespace means the metadata leg is
+        // skipped rather than overwriting that source's artifact.
+        let collides = self.expansion_collides(&meta.source_path);
+        if collides {
+            meta.detect_warnings
+                .push(convert::image_metadata::IMAGE_METADATA_NAMESPACE_OCCUPIED.to_string());
+        }
+        let source_path = meta.source_path.clone();
+        let format = meta.detection.detected.clone();
+        let declared = meta.detection.declared.clone();
+        let source_hash = meta.source_hash.clone();
+        let source_size = meta.source_size;
+        // The primary OCR leg is the unchanged leaf path. It emits the
+        // parent image record, carrying the collision warning when set.
+        self.convert_leaf(meta, UnitBytes::Mem(raw.clone()), started)?;
+        if collides {
+            return Ok(());
+        }
+        self.run_metadata_leg(
+            &source_path,
+            &format,
+            declared,
+            &source_hash,
+            source_size,
+            &raw,
+            started,
+        )
+    }
+
+    /// Runs the metadata child under the claim-and-reconcile machinery,
+    /// so a re-run that finds no metadata retires a prior metadata child.
+    ///
+    /// A top-level image owns a claim over its own `.d/` namespace; an
+    /// image that is itself a container member shares the owning
+    /// container's claim, which already covers the child path.
+    #[cfg(all(unix, feature = "image-metadata"))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_metadata_leg(
+        &mut self,
+        source_path: &str,
+        format: &str,
+        declared: Option<String>,
+        source_hash: &str,
+        source_size: u64,
+        raw: &[u8],
+        started: Instant,
+    ) -> Result<()> {
+        let owns_claim = self.claim.is_none();
+        if owns_claim {
+            self.claim = Some(ClaimState {
+                prefix: format!("{source_path}.d/"),
+                claimed: std::collections::HashSet::new(),
+                emitted: std::collections::HashSet::new(),
+                collisions: 0,
+            });
+        }
+        let result = self.emit_metadata_child(
+            source_path,
+            format,
+            declared,
+            source_hash,
+            source_size,
+            raw,
+            started,
+        );
+        if owns_claim && let Some(claim) = self.claim.take() {
+            self.reconcile(source_path, &claim, started)?;
+        }
+        result
+    }
+
+    /// Converts the metadata child and emits its record. Zero rows is the
+    /// not-applicable outcome: nothing is written and reconciliation
+    /// retires any prior child. A malformation records one failed child
+    /// with a machine-readable reason and no artifact.
+    #[cfg(all(unix, feature = "image-metadata"))]
+    #[allow(clippy::too_many_arguments)]
+    fn emit_metadata_child(
+        &mut self,
+        source_path: &str,
+        format: &str,
+        declared: Option<String>,
+        source_hash: &str,
+        source_size: u64,
+        raw: &[u8],
+        started: Instant,
+    ) -> Result<()> {
+        let child_path = format!("{source_path}.d/#image-metadata");
+        let (text_absolute, segments_absolute, text_relative) = self.artifact_paths(&child_path);
+        let converter = self
+            .rules
+            .registry
+            .image_metadata_converter()
+            .expect("the metadata leg runs only when the converter is present");
+        let detection = Detection {
+            declared,
+            detected: format.to_string(),
+            mismatch: false,
+        };
+        let child_meta = Meta {
+            source_path: child_path.clone(),
+            parent_source: Some(source_path.to_string()),
+            source_hash: source_hash.to_string(),
+            source_size,
+            detection,
+            detect_warnings: Vec::new(),
+        };
+        match run_converter(converter, raw, format) {
+            Ok(outcome) => {
+                match segments::to_jsonl(&outcome.segments)
+                    .map_err(|e| e.to_string())
+                    .and_then(|lines| {
+                        mirror::write_atomic(&text_absolute, &outcome.text)
+                            .and_then(|()| mirror::write_atomic(&segments_absolute, &lines))
+                            .map_err(|e| e.to_string())
+                    }) {
+                    Ok(()) => {
+                        let mut record = self.base_record(&child_meta, Status::Converted);
+                        record.text_path = Some(text_relative);
+                        record.text_hash = Some(hash::hash_bytes(outcome.text.as_bytes()));
+                        record.artifact_kind = Some(outcome.artifact_kind);
+                        record.converter_id = Some(outcome.converter_id.clone());
+                        record.converter_version = Some(outcome.converter_version.clone());
+                        record.warnings.extend(outcome.warnings.iter().cloned());
+                        record.duration_ms = Some(elapsed_ms(started));
+                        self.emit(record)
+                    }
+                    Err(detail) => {
+                        let mut record = self.base_record(&child_meta, Status::Failed);
+                        record.converter_id =
+                            Some(convert::image_metadata::IMAGE_METADATA_ID.to_string());
+                        record.converter_version =
+                            Some(convert::image_metadata::IMAGE_METADATA_VERSION.to_string());
+                        record.error = Some(format!("mirror_write_error: {detail}"));
+                        record.duration_ms = Some(elapsed_ms(started));
+                        remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
+                        self.emit(record)
+                    }
+                }
+            }
+            Err(reason)
+                if reason.starts_with(convert::image_metadata::IMAGE_METADATA_NOT_APPLICABLE) =>
+            {
+                // No textual metadata: write nothing. A prior child, if
+                // any, is retired by the owning reconciliation.
+                Ok(())
+            }
+            Err(reason) => {
+                let mut record = self.base_record(&child_meta, Status::Failed);
+                record.converter_id = Some(convert::image_metadata::IMAGE_METADATA_ID.to_string());
+                record.converter_version =
+                    Some(convert::image_metadata::IMAGE_METADATA_VERSION.to_string());
+                record.error = Some(reason);
+                record.duration_ms = Some(elapsed_ms(started));
+                remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
+                self.emit(record)
+            }
+        }
     }
 
     /// Writes a parent container artifact and records the parent as

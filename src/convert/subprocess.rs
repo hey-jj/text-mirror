@@ -143,6 +143,14 @@ mod imp {
             "image-ocr-runtime-mismatch",
             "image-ocr-no-accelerator",
             "ocr-protocol-error",
+            // Image-metadata worker reasons. Each must survive the wire-
+            // to-static mapping so the manifest keeps the specific reason
+            // rather than collapsing it to adapter_error.
+            "image-metadata-malformed",
+            "image-metadata-decompress-exceeded",
+            "image-metadata-xml-exceeded",
+            "image-metadata-limit-exceeded",
+            "image-metadata-unsupported",
         ];
         KNOWN
             .iter()
@@ -308,6 +316,99 @@ mod imp {
                 text: body.text,
                 warnings: body.warnings,
                 segments: body.segments,
+            })
+        }
+    }
+
+    /// The in-jail image-metadata converter: the derived-child leg that
+    /// lifts textual metadata out of a raster behind the same jail as the
+    /// records worker.
+    ///
+    /// The carrier and surface parsers pull decompression and expansion
+    /// surfaces a hostile image can flood, so they never run in this
+    /// process. Each source stages into the jail and the parsers run in
+    /// the worker, where a bomb or a flood times out or crashes the child
+    /// and records a failed child without touching the pipeline. The
+    /// ceilings come from the rules and travel in the request. The parent
+    /// holds no parser code: it renders the returned rows to the tabular
+    /// artifact and builds one hidden segment per row, so the output
+    /// contract and the hidden marking stay in the crate. Zero rows is
+    /// the not-applicable outcome, mapped to a distinct reason the
+    /// pipeline reads as write-nothing rather than a failure.
+    #[cfg(feature = "image-metadata")]
+    pub struct ImageMetadata {
+        limits: crate::convert::ImageMetadataLimits,
+    }
+
+    #[cfg(feature = "image-metadata")]
+    impl ImageMetadata {
+        /// An adapter over the rules-supplied metadata ceilings.
+        pub fn new(limits: crate::convert::ImageMetadataLimits) -> ImageMetadata {
+            ImageMetadata { limits }
+        }
+    }
+
+    #[cfg(feature = "image-metadata")]
+    impl Converter for ImageMetadata {
+        fn id(&self) -> &'static str {
+            crate::convert::image_metadata::IMAGE_METADATA_ID
+        }
+
+        fn version(&self) -> &'static str {
+            crate::convert::image_metadata::IMAGE_METADATA_VERSION
+        }
+
+        fn convert(
+            &self,
+            source: &[u8],
+            detected_format: &str,
+        ) -> std::result::Result<Outcome, ConvertError> {
+            use crate::runner::protocol::bodies::{ImageMetadataOk, ImageMetadataRequest};
+            if !crate::convert::image_metadata::image_metadata_applies(detected_format) {
+                return Err(ConvertError {
+                    code: "unclaimed_format",
+                    message: format!("the image-metadata worker does not read {detected_format}"),
+                });
+            }
+            let input = format!("input.{detected_format}");
+            let body: ImageMetadataOk = call(
+                shared_runner()?,
+                "image-metadata",
+                &ImageMetadataRequest {
+                    input: input.clone(),
+                    format: detected_format.to_string(),
+                    max_decompressed_bytes: self.limits.max_decompressed_bytes,
+                    max_xml_depth: self.limits.max_xml_depth,
+                    max_xml_events: self.limits.max_xml_events,
+                    max_boxes: self.limits.max_boxes,
+                    max_rows: self.limits.max_rows,
+                    max_output_bytes: self.limits.max_output_bytes,
+                },
+                &[(&input, source)],
+            )?;
+            // Zero rows is not-applicable: the image carries no textual
+            // metadata, so the parent writes nothing for this leg.
+            if body.rows.is_empty() {
+                return Err(ConvertError {
+                    code: crate::convert::image_metadata::IMAGE_METADATA_NOT_APPLICABLE,
+                    message: "the image carries no textual metadata".to_string(),
+                });
+            }
+            let (text, segments) = crate::convert::image_metadata::render_rows(&body.rows);
+            // A positive row count that renders to nothing is a fault, not
+            // a blank success, matching the other adapters' floor.
+            if text.is_empty() {
+                return Err(empty_output(source.len()));
+            }
+            Ok(Outcome {
+                artifact_kind: ArtifactKind::Text,
+                converter_id: crate::convert::image_metadata::IMAGE_METADATA_ID.to_string(),
+                converter_version: crate::convert::image_metadata::IMAGE_METADATA_VERSION
+                    .to_string(),
+                detected_format: detected_format.to_string(),
+                text,
+                warnings: Vec::new(),
+                segments,
             })
         }
     }
@@ -664,6 +765,8 @@ mod imp {
     }
 }
 
+#[cfg(all(unix, feature = "image-metadata"))]
+pub use imp::ImageMetadata;
 #[cfg(all(unix, feature = "image-ocr"))]
 pub use imp::ImagePixelOcr;
 #[cfg(unix)]

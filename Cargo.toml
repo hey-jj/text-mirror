@@ -42,6 +42,14 @@ records-worker = ["dep:parquet", "dep:apache-avro", "dep:rusqlite"]
 # image-ocr-not-built capability gap. The self dev-dependency below
 # turns it on so `cargo test` exercises the decode path.
 image-ocr = ["dep:image"]
+# Compiles the in-jail image-metadata reader: the exif, png text-chunk,
+# container packet, xmp, iptc, and iso base media file format parsers
+# that lift textual metadata out of a raster and render it as a hidden
+# derived child. Off by default, so a library build and the main CLI
+# pull none of these parser trees. The self dev-dependency below turns
+# it on so `cargo test` exercises the readers, exactly as it does the
+# records readers and the image decode path above.
+image-metadata = ["dep:kamadak-exif", "dep:png", "dep:img-parts"]
 
 [dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -92,6 +100,20 @@ rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled
 # Gated behind the image-ocr feature, so a default build pulls none of it.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"], optional = true }
 
+# In-jail image-metadata readers. Optional and gated behind the
+# image-metadata feature, so a default build pulls none of them. All
+# three are pure Rust and add no native build dependency: kamadak-exif
+# (imports as `exif`, BSD-2-Clause) reads exif; png with
+# default-features = false reads the tEXt, zTXt, and iTXt text chunks,
+# its unconditional inflate backend reaching the compressed-chunk path;
+# and img-parts frames the jpeg segment list and the webp riff chunks
+# so each embedded metadata packet reaches its surface parser. The xmp,
+# svg, iptc, and iso base media file format parsing reuse the pinned
+# quick-xml and first-party bounded code, so they add no dependency.
+kamadak-exif = { version = "=0.6.1", optional = true }
+png = { version = "=0.18.1", default-features = false, optional = true }
+img-parts = { version = "=0.4.0", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 rlimit = "=0.11.0"
 nix = { version = "=0.31.3", default-features = false, features = ["process", "sched", "signal"] }
@@ -101,4 +123,4 @@ landlock = "=0.4.7"
 seccompiler = "=0.5.0"
 
 [dev-dependencies]
-text-mirror = { path = ".", features = ["test-adapters", "records-worker", "image-ocr"] }
+text-mirror = { path = ".", features = ["test-adapters", "records-worker", "image-ocr", "image-metadata"] }

@@ -333,7 +333,10 @@ fn a_raster_image_now_routes_to_the_image_pixel_ocr_converter() {
     let rules = Rules::builtin().unwrap();
     let report = run(&setup, &rules);
     assert_eq!(report.counts.unsupported, 0, "records: {report:?}");
-    assert_eq!(report.counts.failed, 1, "records: {report:?}");
+    // The primary decode fails closed, and the auxiliary metadata leg
+    // fails closed too on the same malformed carrier, so the one png
+    // touches two failed records.
+    assert_eq!(report.counts.failed, 2, "records: {report:?}");
 
     let record = terminal(&setup, "scan.png");
     assert_eq!(record.status, Status::Failed);

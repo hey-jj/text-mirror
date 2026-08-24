@@ -8,6 +8,21 @@ Versioning.
 
 ### Added
 
+- An in-jail image-metadata converter that lifts the textual metadata a
+  raster or vector image carries and records it as a hidden derived
+  child. One image source yields two independent artifacts: the pixel
+  text from the image-OCR converter as the primary artifact, and the
+  metadata as a child at `<source>.d/#image-metadata`, every row marked
+  hidden, reusing the same derived-child record shape a container member
+  already uses. The exif, png text-chunk, container-packet, xmp, iptc,
+  and iso base media file format parsers all run behind the same
+  subprocess jail as the records worker, and a decompression bomb, an
+  xml event flood, or a box-count flood fails the child closed without
+  touching the pipeline or the primary leg. The converter is gated
+  behind a new `image-metadata` feature; a build without it does not run
+  the leg. `manifest@1` is unchanged. This adds the public
+  `ImageMetadataLimits` rules struct and the `ImageMetadata` converter,
+  both additive.
 - An in-jail image-OCR converter for png, jpeg, and webp. The raster is
   decoded by the pure-Rust `image` crate inside the subprocess sandbox,
   the encoder-input area cap is asserted before the full decode, and the
