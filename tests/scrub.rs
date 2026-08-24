@@ -15,16 +15,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The tokens that must never appear in the crate, matched
-/// case-insensitively. Each is built from concatenated fragments so the
-/// full token never occurs as a literal in this file. The set is: the
-/// internal engine codename in every form (including any role label built
-/// from it); and the two pieces of process and review vocabulary that must
-/// not ship.
-fn forbidden() -> [&'static str; 3] {
+/// case-insensitively. Each spelling is stored reversed and rebuilt at run
+/// time, so the forbidden byte sequence appears nowhere as a literal —
+/// neither in this source nor in the compiled test binary's read-only data
+/// (a forward-fragment concat would leave the short fragments in rodata for
+/// the linker to pack back into the token). The set is: the internal engine
+/// codename in every form (including any role label built from it); and the
+/// two pieces of process and review vocabulary that must not ship.
+fn forbidden() -> [String; 3] {
     [
-        concat!("m", "3", "e"),
-        concat!("resi", "dual"),
-        concat!("amend", "ment"),
+        "e3m".chars().rev().collect(),
+        "laudiser".chars().rev().collect(),
+        "tnemdnema".chars().rev().collect(),
     ]
 }
 
@@ -68,7 +70,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 fn scan_text(label: &str, text: &str, violations: &mut Vec<String>) {
     let lowered = text.to_ascii_lowercase();
     for token in forbidden() {
-        if lowered.contains(token) {
+        if lowered.contains(token.as_str()) {
             violations.push(format!("{label} contains {token:?}"));
         }
     }
