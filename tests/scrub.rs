@@ -4,27 +4,36 @@
 //!
 //! The gate walks the packaged crate surface (the source, the tests, the
 //! rules, the manifest, and the changelog) and asserts that no forbidden
-//! token appears anywhere in it. The forbidden set is fixed here, not
-//! sourced from any design note: it fails closed on the internal engine
-//! codename and on the review vocabulary that must never ship. When a
-//! forbidden token would collide with legitimate English in a comment,
-//! the remedy is to reword the comment, never to weaken this battery.
+//! token appears anywhere in it. This battery scans every in-scope file,
+//! itself included: the tokens it forbids are assembled at run time from
+//! separate fragments, so this file names none of them as a literal and
+//! is clean under its own scan. When a forbidden token would collide with
+//! legitimate English in a comment, the remedy is to reword the comment,
+//! never to weaken this battery.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The tokens that must never appear in the crate, matched
-/// case-insensitively. `m3e` is the internal engine codename in every
-/// form (including any role label built from it); `residual` and
-/// `amendment` are the process and review vocabulary that must not ship.
-const FORBIDDEN: &[&str] = &["m3e", "residual", "amendment"];
+/// case-insensitively. Each is built from concatenated fragments so the
+/// full token never occurs as a literal in this file. The set is: the
+/// internal engine codename in every form (including any role label built
+/// from it); and the two pieces of process and review vocabulary that must
+/// not ship.
+fn forbidden() -> [&'static str; 3] {
+    [
+        concat!("m", "3", "e"),
+        concat!("resi", "dual"),
+        concat!("amend", "ment"),
+    ]
+}
 
-/// Directory and file names skipped: build output, VCS metadata, and
-/// this battery itself, which necessarily names the forbidden tokens.
+/// Directory names skipped: build output and VCS metadata. Every other
+/// file is in scope, including this battery itself.
 fn is_skipped(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|n| n.to_str()),
-        Some("target") | Some(".git") | Some("scrub.rs")
+        Some("target") | Some(".git")
     )
 }
 
@@ -54,6 +63,17 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Scan one body of text, appending a violation line for each forbidden
+/// token it contains. Shared by the crate sweep and the negative control.
+fn scan_text(label: &str, text: &str, violations: &mut Vec<String>) {
+    let lowered = text.to_ascii_lowercase();
+    for token in forbidden() {
+        if lowered.contains(token) {
+            violations.push(format!("{label} contains {token:?}"));
+        }
+    }
+}
+
 #[test]
 fn no_forbidden_token_appears_in_the_crate() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -74,13 +94,32 @@ fn no_forbidden_token_appears_in_the_crate() {
         let Ok(text) = fs::read_to_string(file) else {
             continue;
         };
-        let lowered = text.to_ascii_lowercase();
-        for token in FORBIDDEN {
-            if lowered.contains(token) {
-                violations.push(format!("{} contains {:?}", file.display(), token));
-            }
-        }
+        scan_text(&file.display().to_string(), &text, &mut violations);
     }
+    assert!(
+        violations.is_empty(),
+        "forbidden tokens found:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Negative control: a body that names all three forbidden tokens must
+/// trip the gate. The probe is assembled from the same run-time fragments,
+/// so this file still holds no literal token. The inner assertion is the
+/// exact one the crate sweep uses, so a body carrying the tokens makes it
+/// fire (panic / exit 101) — proving the gate catches every token rather
+/// than silently passing.
+#[test]
+#[should_panic(expected = "forbidden tokens found")]
+fn negative_control_gate_fires_on_all_forbidden_tokens() {
+    let probe = forbidden().join(" and ");
+    let mut violations = Vec::new();
+    scan_text("planted-probe", &probe, &mut violations);
+    assert_eq!(
+        violations.len(),
+        forbidden().len(),
+        "the gate must catch every planted token, found: {violations:?}"
+    );
     assert!(
         violations.is_empty(),
         "forbidden tokens found:\n{}",
