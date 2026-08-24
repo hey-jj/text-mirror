@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format
 follows Keep a Changelog, and the project adheres to Semantic
 Versioning.
 
+## [0.6.0] - 2026-08-24
+
+### Added
+
+- An in-jail image-OCR converter for png, jpeg, and webp. The raster is
+  decoded by the pure-Rust `image` crate inside the subprocess sandbox,
+  the encoder-input area cap is asserted before the full decode, and the
+  canonical pixels are handed to the pinned vision engine inside the
+  jail. The converter is gated behind a new `image-ocr` feature. A build
+  without it routes those formats to the `image-ocr-not-built` capability
+  gap. This release wires no engine, so a build with the feature decodes
+  the raster and then fails closed with `image-ocr-runtime-missing` until
+  a deployment supplies the pinned runtime.
+
+### Changed
+
+- The public `Outcome` struct gained an `artifact_kind` field and the
+  `OcrOk` struct gained a `warnings` field. Both structs are exhaustive,
+  so external code that constructs them or destructures them by listing
+  every field must account for the new fields. This is a breaking change
+  for those callers, which is why this release moves to 0.6.0. The
+  on-disk `manifest@1` and `adapter-response@1` serialization stays the
+  same: `artifact_kind` is an existing optional manifest field, and
+  `OcrOk.warnings` is omitted from the wire when empty, so a
+  warning-free success is byte-identical to the previous reader and only
+  an actual warning trips a mixed-version pairing.
+
 ## [0.5.0] - 2026-08-22
 
 ### Changed

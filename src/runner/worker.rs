@@ -85,6 +85,12 @@ fn run_mode(mode: &str) -> Result<Response, HardExit> {
         // decode and the engine child both stay behind the sandbox.
         #[cfg(all(unix, feature = "image-ocr"))]
         "image-ocr" => image_ocr::image_ocr(read_request()?),
+        // The fake stage-3 recognition, a separate mode the test harness
+        // selects. It runs the real decode and area guards and only the
+        // stage-3 recognition is fake, so it never stands in for the
+        // production `image-ocr` mode above.
+        #[cfg(all(unix, feature = "image-ocr", feature = "test-adapters"))]
+        "image-ocr-fake" => image_ocr::image_ocr_fake(read_request()?),
         // Held descendants get no stdin, so this mode never reads a
         // request frame.
         #[cfg(feature = "test-adapters")]
@@ -220,6 +226,24 @@ mod image_ocr {
             HardExit(2)
         })?;
         match recognize(&body) {
+            Ok(ok) => Ok(Response::ok(
+                serde_json::to_value(ok).expect("OcrOk serializes"),
+            )),
+            Err(error) => Ok(Response::err(error.code, error.message)),
+        }
+    }
+
+    /// The fake-engine recognition mode: the real decode and area guards
+    /// with a deterministic fake stage 3. Selected only by the test
+    /// harness, never by the production `image-ocr` mode.
+    #[cfg(feature = "test-adapters")]
+    pub(super) fn image_ocr_fake(request: Request) -> Result<Response, HardExit> {
+        use crate::convert::image_ocr::recognize_fake;
+        let body: OcrRequest = serde_json::from_value(request.payload.clone()).map_err(|e| {
+            eprintln!("worker_bad_payload: {e}");
+            HardExit(2)
+        })?;
+        match recognize_fake(&body) {
             Ok(ok) => Ok(Response::ok(
                 serde_json::to_value(ok).expect("OcrOk serializes"),
             )),

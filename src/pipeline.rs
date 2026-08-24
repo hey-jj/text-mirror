@@ -894,6 +894,11 @@ impl Expander<'_> {
                 let mut record = self.base_record(meta, Status::Converted);
                 record.text_path = Some(text_relative);
                 record.text_hash = Some(hash::hash_bytes(outcome.text.as_bytes()));
+                // By design a container parent is a text manifest of its
+                // members, not a recognized or transcribed artifact, so
+                // it is always `Text` regardless of any member's kind. A
+                // leaf converter's own kind flows through the single
+                // source branch above instead.
                 record.artifact_kind = Some(ArtifactKind::Text);
                 record.converter_id = Some(outcome.converter_id.clone());
                 record.converter_version = Some(outcome.converter_version.clone());
@@ -1664,6 +1669,37 @@ mod tests {
         }
     }
 
+    /// A converter that returns a valid outcome stamped
+    /// [`manifest::ArtifactKind::Ocr`], so the pipeline's kind
+    /// propagation through the single-source, dedup, and checkpoint paths
+    /// can be exercised without a jailed engine.
+    struct OcrKindConverter;
+
+    impl Converter for OcrKindConverter {
+        fn id(&self) -> &'static str {
+            "ocr-kind-test"
+        }
+        fn version(&self) -> &'static str {
+            "1.0.0"
+        }
+        fn convert(
+            &self,
+            _source: &[u8],
+            detected_format: &str,
+        ) -> std::result::Result<Outcome, ConvertError> {
+            let text = "recognized text\n".to_string();
+            Ok(Outcome {
+                converter_id: self.id().to_string(),
+                converter_version: self.version().to_string(),
+                detected_format: detected_format.to_string(),
+                segments: vec![Segment::span(0, text.len(), "document")],
+                text,
+                warnings: Vec::new(),
+                artifact_kind: manifest::ArtifactKind::Ocr,
+            })
+        }
+    }
+
     fn injected_rules() -> Rules {
         let table = FormatTable::parse(
             r#"
@@ -1683,6 +1719,11 @@ extensions = ["panicfmt"]
 id = "badseg"
 name = "Bad segments trigger"
 extensions = ["badseg"]
+
+[[formats]]
+id = "ocrfmt"
+name = "OCR kind trigger"
+extensions = ["ocrfmt"]
 "#,
             "formats.toml",
         )
@@ -1693,6 +1734,7 @@ extensions = ["badseg"]
                 (Box::new(PlainTextPassthrough), vec!["text"]),
                 (Box::new(PanicConverter), vec!["panicfmt"]),
                 (Box::new(BadSegmentsConverter), vec!["badseg"]),
+                (Box::new(OcrKindConverter), vec!["ocrfmt"]),
             ],
         );
         Rules { table, registry }
@@ -1773,6 +1815,70 @@ extensions = ["badseg"]
                 .join("mirror/unit/bad.badseg.segments.jsonl")
                 .exists()
         );
+    }
+
+    #[test]
+    fn the_ocr_artifact_kind_propagates_through_dedup_and_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        let mirror = dir.path().join("mirror");
+        let manifest_dir = dir.path().join("manifest");
+        fs::create_dir_all(&root).unwrap();
+        // Two identical-content OCR sources: the first converts, the
+        // second dedups off it within the same run.
+        fs::write(root.join("a.ocrfmt"), "same pixels\n").unwrap();
+        fs::write(root.join("b.ocrfmt"), "same pixels\n").unwrap();
+
+        let rules = injected_rules();
+        let options = RunOptions {
+            root: &root,
+            mirror_root: &mirror,
+            manifest_dir: &manifest_dir,
+            division: "unit",
+            walk: WalkOptions::default(),
+        };
+        run(&rules, &options).unwrap();
+
+        let shard = manifest_dir.join("unit.jsonl");
+        let latest = |path: &str| {
+            manifest::read_shard(&shard)
+                .unwrap()
+                .records
+                .into_iter()
+                .rev()
+                .find(|r| r.source_path == path)
+                .unwrap()
+        };
+
+        // Same-run: one Converted, one Dedup, both carry the OCR kind.
+        let a = latest("a.ocrfmt");
+        let b = latest("b.ocrfmt");
+        let (converted, deduped) = if a.status == Status::Converted {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        assert_eq!(converted.status, Status::Converted);
+        assert_eq!(deduped.status, Status::Dedup);
+        assert_eq!(converted.artifact_kind, Some(ArtifactKind::Ocr));
+        assert_eq!(deduped.artifact_kind, Some(ArtifactKind::Ocr));
+
+        // Second run with the prior manifest present. The unchanged
+        // sources skip and keep their OCR kind (checkpoint-skip clones
+        // the prior record); a new identical source dedups off the
+        // seeded prior canonical and is also OCR (seeded dedup).
+        fs::write(root.join("c.ocrfmt"), "same pixels\n").unwrap();
+        run(&rules, &options).unwrap();
+
+        let a2 = latest("a.ocrfmt");
+        let b2 = latest("b.ocrfmt");
+        let c = latest("c.ocrfmt");
+        assert_eq!(a2.status, Status::SkippedUnchanged);
+        assert_eq!(b2.status, Status::SkippedUnchanged);
+        assert_eq!(a2.artifact_kind, Some(ArtifactKind::Ocr));
+        assert_eq!(b2.artifact_kind, Some(ArtifactKind::Ocr));
+        assert_eq!(c.status, Status::Dedup);
+        assert_eq!(c.artifact_kind, Some(ArtifactKind::Ocr));
     }
 
     #[test]

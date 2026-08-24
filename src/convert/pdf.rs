@@ -22,7 +22,7 @@
 use crate::segments::Segment;
 
 use super::anydoc_log::capture_anydoc;
-use super::{ConvertError, markdown_to_plain, normalize_text};
+use super::{ConvertError, is_meaningful, markdown_to_plain, normalize_text};
 
 /// A successful PDF conversion: text, warnings, and structure spans.
 #[derive(Debug)]
@@ -74,30 +74,6 @@ fn promote_warning(message: &str) -> String {
         return format!("pdf_partial_text: {head}");
     }
     format!("anydoc_recovery: {message}")
-}
-
-/// Invisible format characters: code points that render nothing yet are
-/// neither whitespace nor control characters, so a bare emptiness check
-/// would let them through. The set is the soft hyphen, the zero-width
-/// and bidi marks (`U+200B`–`U+200F`), the bidi overrides and embeddings
-/// (`U+202A`–`U+202E`), the word joiner and invisible-operator block
-/// (`U+2060`–`U+2064`), and the byte-order mark (`U+FEFF`). A page whose
-/// only recovered code points are these carries no readable text. The
-/// set is a documented minimum and is not narrowed; whitespace and
-/// control characters are handled separately by the meaningful-text
-/// check, so the two together cover the empty-render cases.
-fn is_invisible_format(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x00AD | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0xFEFF
-    )
-}
-
-/// Whether a character is meaningful recovered content: something a
-/// reader would see on the page. Whitespace, control characters, and
-/// invisible format characters are not.
-fn is_meaningful(c: char) -> bool {
-    !c.is_whitespace() && !c.is_control() && !is_invisible_format(c)
 }
 
 /// Attempts a direct text extraction from the pinned PDF parser,

@@ -1,16 +1,20 @@
 //! End-to-end tests for the in-jail pixel-OCR converter: png, jpeg, and
 //! webp decoded behind the subprocess sandbox, the area cap and
-//! long-edge guards, the gated fail-closed formats, and the two ruled
-//! routing amendments.
+//! long-edge guards, the gated fail-closed formats, and the .ai and svg
+//! routing behavior.
 //!
-//! Under the `test-adapters` feature the worker's stage-3 recognition
-//! is a deterministic fake derived from the canonical pixels, so the
-//! decode, the area preflight, and the outcome mapping are exercised
-//! through the real jail without a pinned engine. Raster fixtures are
-//! built in-test with the same crate the worker decodes with, so no
-//! committed binary fixture is needed. The strict stdout-envelope
-//! grammar, the runtime inventory, and the accelerator check are unit
-//! tested beside their implementation.
+//! Through the builtin registry the production `image-ocr` worker mode
+//! runs, and it fails closed with `image-ocr-runtime-missing` because
+//! this core wires no engine: a valid raster's decode and area guards
+//! pass and stage 3 refuses. The fake stage-3 recognition is a separate
+//! `image-ocr-fake` worker mode the test harness selects through
+//! `ImagePixelOcr::new_fake`; it exercises the outcome mapping (spans to
+//! text, the OCR artifact kind, the low-confidence and long-edge
+//! warnings) against the real jail without a pinned engine. Raster
+//! fixtures are built in-test with the same crate the worker decodes
+//! with, so no committed binary fixture is needed. The strict
+//! stdout-envelope grammar, the runtime inventory, and the accelerator
+//! check are unit tested beside their implementation.
 
 #![cfg(all(unix, feature = "image-ocr"))]
 
@@ -140,15 +144,19 @@ fn pdf_with_text(text: &str) -> Vec<u8> {
 // --- tests ----------------------------------------------------------
 
 #[test]
-fn png_jpeg_and_webp_convert_through_the_image_pixel_ocr_path() {
+fn png_jpeg_and_webp_fail_closed_without_a_wired_runtime() {
+    // The builtin registry drives the production image-ocr worker mode.
+    // A valid raster's decode and area guards pass, and stage 3 refuses
+    // because this core wires no engine, so each records a failed
+    // conversion with the runtime-missing reason, no artifact.
     let setup = setup();
     fs::write(setup.root.join("shot.png"), png_bytes(64, 48)).unwrap();
     fs::write(setup.root.join("photo.jpeg"), jpeg_bytes(64, 48)).unwrap();
     fs::write(setup.root.join("sticker.webp"), webp_bytes(64, 48)).unwrap();
 
     let report = run(&setup);
-    assert_eq!(report.counts.converted, 3, "records: {report:?}");
-    assert_eq!(report.counts.failed, 0, "records: {report:?}");
+    assert_eq!(report.counts.converted, 0, "records: {report:?}");
+    assert_eq!(report.counts.failed, 3, "records: {report:?}");
 
     for (source, format) in [
         ("shot.png", "png"),
@@ -156,35 +164,76 @@ fn png_jpeg_and_webp_convert_through_the_image_pixel_ocr_path() {
         ("sticker.webp", "webp"),
     ] {
         let record = terminal(&setup, source);
-        assert_eq!(record.status, Status::Converted, "{source}");
+        assert_eq!(record.status, Status::Failed, "{source}");
         assert_eq!(record.detected_format, format, "{source}");
-        assert_eq!(record.converter_id.as_deref(), Some("image-pixel-ocr"), "{source}");
-        assert_eq!(record.converter_version.as_deref(), Some("1.0.0"), "{source}");
-        // The manifest records recognized text as OCR, not extraction.
-        assert_eq!(record.artifact_kind, Some(ArtifactKind::Ocr), "{source}");
-        let text = artifact(&setup, source);
-        assert!(text.contains("recognized from"), "{source}: {text}");
-        // The fake engine returns one span under the confidence floor,
-        // so the low-confidence warning path fires.
+        assert_eq!(
+            record.converter_id.as_deref(),
+            Some("image-pixel-ocr"),
+            "{source}"
+        );
         assert!(
-            record.warnings.iter().any(|w| w.starts_with("ocr_low_confidence:")),
+            record
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("image-ocr-runtime-missing")),
             "{source}: {:?}",
-            record.warnings
+            record.error
+        );
+        assert!(record.text_path.is_none(), "{source}");
+        assert!(record.artifact_kind.is_none(), "{source}");
+    }
+}
+
+#[test]
+fn the_fake_engine_path_maps_spans_to_an_ocr_outcome() {
+    // The fake stage-3 mode is selected explicitly through new_fake,
+    // never through the registry. It exercises the decode, the outcome
+    // mapping, the OCR artifact kind, and the low-confidence warning
+    // against the real jail without a pinned engine.
+    use text_mirror::convert::Converter;
+    use text_mirror::convert::subprocess::ImagePixelOcr;
+
+    for (bytes, format) in [
+        (png_bytes(64, 48), "png"),
+        (jpeg_bytes(64, 48), "jpeg"),
+        (webp_bytes(64, 48), "webp"),
+    ] {
+        let converter = ImagePixelOcr::new_fake(Default::default());
+        let outcome = converter
+            .convert(&bytes, format)
+            .unwrap_or_else(|e| panic!("{format}: {e}"));
+        assert_eq!(outcome.converter_id, "image-pixel-ocr", "{format}");
+        assert_eq!(outcome.artifact_kind, ArtifactKind::Ocr, "{format}");
+        assert!(
+            outcome.text.contains("recognized from"),
+            "{format}: {}",
+            outcome.text
+        );
+        // The fake returns one span under the confidence floor.
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("ocr_low_confidence:")),
+            "{format}: {:?}",
+            outcome.warnings
         );
     }
 }
 
 #[test]
 fn the_area_cap_fails_closed_with_no_silent_resize() {
+    // 2048x2048 = 4.19 MP is over the 2.36 MP encoder-input area cap and
+    // fails at the area layer; a 1536x1536 in-scope raster clears the
+    // area layer and then fails closed at stage 3 for want of a runtime.
+    // No raster is silently downscaled to fit.
     let setup = setup();
-    // 2048x2048 = 4.19 MP, over the 2.36 MP encoder-input area cap.
     fs::write(setup.root.join("huge.png"), png_bytes(2048, 2048)).unwrap();
-    // 1536x1536 = 2.36 MP is exactly the ceiling and passes.
     fs::write(setup.root.join("ceiling.png"), png_bytes(1536, 1536)).unwrap();
 
     let report = run(&setup);
-    assert_eq!(report.counts.converted, 1, "records: {report:?}");
-    assert_eq!(report.counts.failed, 1, "records: {report:?}");
+    assert_eq!(report.counts.converted, 0, "records: {report:?}");
+    assert_eq!(report.counts.failed, 2, "records: {report:?}");
 
     let huge = terminal(&setup, "huge.png");
     assert_eq!(huge.status, Status::Failed);
@@ -199,25 +248,34 @@ fn the_area_cap_fails_closed_with_no_silent_resize() {
     assert!(!setup.mirror.join("alpha/huge.png.txt").exists());
 
     let ceiling = terminal(&setup, "ceiling.png");
-    assert_eq!(ceiling.status, Status::Converted);
+    assert_eq!(ceiling.status, Status::Failed);
+    assert!(
+        ceiling
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("image-ocr-runtime-missing")),
+        "{:?}",
+        ceiling.error
+    );
 }
 
 #[test]
-fn a_long_edge_within_the_area_cap_warns_and_converts() {
-    let setup = setup();
+fn a_long_edge_within_the_area_cap_warns_on_the_fake_path() {
     // 3000x786 = 2,358,000 px, legal by area, long edge past the
-    // validated 1600, so it warns once and proceeds.
-    fs::write(setup.root.join("wide.png"), png_bytes(3000, 786)).unwrap();
+    // validated 1600, so decode emits the long-edge note once. The fake
+    // path carries the worker's warnings through to the outcome.
+    use text_mirror::convert::Converter;
+    use text_mirror::convert::subprocess::ImagePixelOcr;
 
-    let report = run(&setup);
-    assert_eq!(report.counts.converted, 1, "records: {report:?}");
-
-    let record = terminal(&setup, "wide.png");
-    assert_eq!(record.status, Status::Converted);
+    let converter = ImagePixelOcr::new_fake(Default::default());
+    let outcome = converter.convert(&png_bytes(3000, 786), "png").unwrap();
     assert!(
-        record.warnings.iter().any(|w| w.starts_with("image_ocr_long_edge:")),
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("image_ocr_long_edge:")),
         "{:?}",
-        record.warnings
+        outcome.warnings
     );
 }
 
@@ -262,9 +320,9 @@ fn heic_fails_closed_with_no_jailed_rasterizer() {
 
 #[test]
 fn a_pdf_backed_ai_still_converts_and_does_not_regress() {
-    // Amendment 1: a PDF-backed .ai routes to the pdf path and keeps
-    // extracting its text layer, so a file that converts today does not
-    // become unsupported under the new .ai routing.
+    // A PDF-backed .ai routes to the pdf path and keeps its text layer,
+    // so a file that converts today does not become unsupported under
+    // the new .ai routing.
     let setup = setup();
     fs::write(
         setup.root.join("art.ai"),
@@ -275,7 +333,10 @@ fn a_pdf_backed_ai_still_converts_and_does_not_regress() {
     run(&setup);
     let record = terminal(&setup, "art.ai");
     assert_eq!(record.detected_format, "ai");
-    assert!(!record.format_mismatch, "pdf magic under .ai is a refinement");
+    assert!(
+        !record.format_mismatch,
+        "pdf magic under .ai is a refinement"
+    );
     assert_eq!(record.status, Status::Converted);
     assert_eq!(record.converter_id.as_deref(), Some("pdf-subprocess"));
     assert_eq!(record.artifact_kind, Some(ArtifactKind::Text));
@@ -284,8 +345,8 @@ fn a_pdf_backed_ai_still_converts_and_does_not_regress() {
 
 #[test]
 fn svg_still_routes_to_text_passthrough() {
-    // Amendment 2: no silent swap. svg stays on text-passthrough as raw
-    // markup in the core; the pixel-OCR leg for svg is a provider-surface
+    // svg stays on text-passthrough as raw markup in the core and no OCR
+    // claimant is added; the pixel-OCR leg for svg is a provider-surface
     // concern that is not built here.
     let setup = setup();
     let svg = b"<?xml version=\"1.0\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\"><text>hi</text></svg>\n";
@@ -327,15 +388,17 @@ fn ai_detection_resolves_by_refinement_and_by_extension() {
     assert_eq!(detection.detected, "ai");
     assert!(!detection.mismatch);
     assert!(
-        warnings.iter().any(|w| w.starts_with("magic-format-outside-table:")),
+        warnings
+            .iter()
+            .any(|w| w.starts_with("magic-format-outside-table:")),
         "{warnings:?}"
     );
 }
 
 #[test]
 fn a_legacy_postscript_ai_fails_closed_with_a_pdf_family_reason() {
-    // Amendment 1's accepted consequence: a PostScript-backed .ai routes
-    // to the pdf path and fails closed there, not as an unknown format.
+    // The accepted consequence of routing .ai to the pdf path: a
+    // PostScript-backed .ai fails closed there, not as an unknown format.
     let setup = setup();
     fs::write(
         setup.root.join("legacy.ai"),
@@ -365,8 +428,17 @@ fn the_registry_routes_the_image_family_as_ruled() {
             "{format}"
         );
     }
-    assert_eq!(registry.converter_for("ai").map(|c| c.id()), Some("pdf-subprocess"));
-    assert_eq!(registry.converter_for("svg").map(|c| c.id()), Some("text-passthrough"));
-    assert_eq!(registry.unsupported_reason("heic"), Some("no-jailed-rasterizer"));
+    assert_eq!(
+        registry.converter_for("ai").map(|c| c.id()),
+        Some("pdf-subprocess")
+    );
+    assert_eq!(
+        registry.converter_for("svg").map(|c| c.id()),
+        Some("text-passthrough")
+    );
+    assert_eq!(
+        registry.unsupported_reason("heic"),
+        Some("no-jailed-rasterizer")
+    );
     assert_eq!(registry.unsupported_reason("tiff"), Some("engine-unpinned"));
 }

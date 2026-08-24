@@ -325,45 +325,70 @@ mod imp {
     /// byte-equality claim; only the pure-Rust decode does.
     #[cfg(feature = "image-ocr")]
     pub struct ImagePixelOcr {
-        limits: crate::runner::Limits,
+        /// The worker mode this converter drives. Production always uses
+        /// the pinned-runtime `image-ocr` mode; the test-only fake
+        /// constructor selects the harness `image-ocr-fake` mode.
+        mode: &'static str,
+        /// This instance's own runner, built from its own limits at
+        /// construction. Security ceilings are per-registry rules data,
+        /// so each converter owns its runner rather than sharing a
+        /// process-global cache whose ceilings the first caller would
+        /// fix for every later one.
+        runner: Result<Runner, RunnerError>,
     }
 
     #[cfg(feature = "image-ocr")]
     impl ImagePixelOcr {
-        /// An adapter over the rules-supplied image-OCR jail profile.
+        /// An adapter over the rules-supplied image-OCR jail profile. It
+        /// drives the production `image-ocr` worker mode, which fails
+        /// closed with `image-ocr-runtime-missing` until a deployment
+        /// wires the pinned runtime.
         pub fn new(limits: crate::convert::ImageOcrLimits) -> ImagePixelOcr {
             ImagePixelOcr {
-                limits: crate::runner::Limits {
-                    wall_timeout: std::time::Duration::from_secs(limits.wall_timeout_secs),
-                    max_response_bytes: limits.max_response_bytes,
-                    max_stderr_bytes: limits.max_stderr_bytes,
-                    address_space_bytes: limits.address_space_bytes,
-                    cpu_seconds: limits.cpu_seconds,
-                    file_size_bytes: limits.file_size_bytes,
-                    max_processes: limits.max_processes,
-                },
+                mode: "image-ocr",
+                runner: build_image_runner(image_runner_limits(&limits)),
+            }
+        }
+
+        /// A test-only converter that drives the harness `image-ocr-fake`
+        /// worker mode instead of the pinned-runtime mode. It shares the
+        /// identical decode, area guards, and outcome mapping; only stage
+        /// 3 is the deterministic fake. The registry never constructs
+        /// this, so a release build's image converter always drives the
+        /// production mode and never ships fake recognition.
+        #[cfg(feature = "test-adapters")]
+        pub fn new_fake(limits: crate::convert::ImageOcrLimits) -> ImagePixelOcr {
+            ImagePixelOcr {
+                mode: "image-ocr-fake",
+                runner: build_image_runner(image_runner_limits(&limits)),
             }
         }
     }
 
-    /// The runner for the image-OCR jail profile, built once. The
-    /// profile is rules data, effectively constant per binary, so the
-    /// first caller's limits are the runner's for the process, mirroring
-    /// `shared_runner` for the default profile.
+    /// Maps the rules-supplied image-OCR profile onto the runner limits.
     #[cfg(feature = "image-ocr")]
-    fn image_runner(limits: &crate::runner::Limits) -> Result<&'static Runner, ConvertError> {
-        static RUNNER: OnceLock<Result<Runner, RunnerError>> = OnceLock::new();
-        let built = RUNNER.get_or_init(|| {
-            Ok(Runner::new(
-                crate::runner::jail::platform_backend()?,
-                crate::runner::locate_worker()?,
-                limits.clone(),
-            ))
-        });
-        match built {
-            Ok(runner) => Ok(runner),
-            Err(error) => Err(runner_failure(error.clone())),
+    fn image_runner_limits(limits: &crate::convert::ImageOcrLimits) -> crate::runner::Limits {
+        crate::runner::Limits {
+            wall_timeout: std::time::Duration::from_secs(limits.wall_timeout_secs),
+            max_response_bytes: limits.max_response_bytes,
+            max_stderr_bytes: limits.max_stderr_bytes,
+            address_space_bytes: limits.address_space_bytes,
+            cpu_seconds: limits.cpu_seconds,
+            file_size_bytes: limits.file_size_bytes,
+            max_processes: limits.max_processes,
         }
+    }
+
+    /// Builds one runner for the image-OCR jail profile. Called once per
+    /// converter instance, so the ceilings that travel are exactly this
+    /// registry's, never a leftover from an earlier caller.
+    #[cfg(feature = "image-ocr")]
+    fn build_image_runner(limits: crate::runner::Limits) -> Result<Runner, RunnerError> {
+        Ok(Runner::new(
+            crate::runner::jail::platform_backend()?,
+            crate::runner::locate_worker()?,
+            limits,
+        ))
     }
 
     #[cfg(feature = "image-ocr")]
@@ -384,43 +409,31 @@ mod imp {
             if !matches!(detected_format, "png" | "jpeg" | "webp") {
                 return Err(ConvertError {
                     code: "unclaimed_format",
-                    message: format!("the image-pixel-ocr converter does not handle {detected_format}"),
+                    message: format!(
+                        "the image-pixel-ocr converter does not handle {detected_format}"
+                    ),
                 });
             }
+            let runner = self
+                .runner
+                .as_ref()
+                .map_err(|e| runner_failure(e.clone()))?;
             let input = format!("input.{detected_format}");
             let body: OcrOk = call(
-                image_runner(&self.limits)?,
-                "image-ocr",
+                runner,
+                self.mode,
                 &OcrRequest {
                     input: input.clone(),
                     kind: OcrInput::Image,
                 },
                 &[(&input, source)],
             )?;
+            // The worker's own notes (such as the long-edge validation
+            // note) propagate; the span mapping appends any low-confidence
+            // ones and applies the meaningful-text floor.
             let mut warnings = body.warnings;
-            let mut lines = Vec::new();
-            for (index, span) in body.spans.iter().enumerate() {
-                if !(0.0..=1.0).contains(&span.confidence) {
-                    return Err(ConvertError {
-                        code: "ocr-protocol-error",
-                        message: format!(
-                            "span {index} confidence {} is outside 0 to 1",
-                            span.confidence
-                        ),
-                    });
-                }
-                if span.confidence < OCR_CONFIDENCE_WARNING {
-                    warnings.push(format!(
-                        "ocr_low_confidence: span {index} at {:.2}",
-                        span.confidence
-                    ));
-                }
-                lines.push(single_line(&span.text));
-            }
-            let text = normalize_text(&finish_lines(lines));
-            if !source.is_empty() && text.is_empty() {
-                return Err(empty_output(source.len()));
-            }
+            let (text, low_confidence) = render_ocr_spans(&body.spans, source.len())?;
+            warnings.extend(low_confidence);
             Ok(Outcome {
                 converter_id: IMAGE_PIXEL_OCR_ID.to_string(),
                 converter_version: IMAGE_PIXEL_OCR_VERSION.to_string(),
@@ -476,7 +489,9 @@ mod imp {
                 },
                 &[(&input, source)],
             )?;
-            let mut warnings = Vec::new();
+            // Propagate the worker's own notes rather than starting a
+            // fresh vec, then append the low-confidence ones.
+            let mut warnings = body.warnings;
             let mut lines = Vec::new();
             for (index, span) in body.spans.iter().enumerate() {
                 if !(0.0..=1.0).contains(&span.confidence) {
@@ -501,7 +516,8 @@ mod imp {
                 return Err(empty_output(source.len()));
             }
             Ok(Outcome {
-                artifact_kind: ArtifactKind::Text,
+                // Recognized text is OCR, not extraction.
+                artifact_kind: ArtifactKind::Ocr,
                 converter_id: OCR_ADAPTER_ID.to_string(),
                 converter_version: OCR_ADAPTER_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
@@ -564,7 +580,8 @@ mod imp {
                 return Err(empty_output(source.len()));
             }
             Ok(Outcome {
-                artifact_kind: ArtifactKind::Text,
+                // A speech transcript, not extracted text.
+                artifact_kind: ArtifactKind::Transcript,
                 converter_id: ASR_ADAPTER_ID.to_string(),
                 converter_version: ASR_ADAPTER_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
@@ -647,10 +664,10 @@ mod imp {
     }
 }
 
-#[cfg(unix)]
-pub use imp::{AsrAdapter, OcrAdapter, PdfSubprocess, RecordsSubprocess, VideoAdapter};
 #[cfg(all(unix, feature = "image-ocr"))]
 pub use imp::ImagePixelOcr;
+#[cfg(unix)]
+pub use imp::{AsrAdapter, OcrAdapter, PdfSubprocess, RecordsSubprocess, VideoAdapter};
 
 #[cfg(not(unix))]
 mod imp {
@@ -787,6 +804,55 @@ fn finish_lines(lines: Vec<String>) -> String {
         text.push('\n');
         text
     }
+}
+
+/// Renders recognized spans to normalized text plus the low-confidence
+/// warnings, applying two floors so a well-formed but content-free
+/// recognition cannot pass as a blank success.
+///
+/// A span confidence outside 0 to 1 is a protocol error. A span under
+/// [`OCR_CONFIDENCE_WARNING`] adds one low-confidence warning. After the
+/// lines are joined and normalized, the meaningful-text floor applies:
+/// on a non-empty source, text with no meaningful character (only
+/// whitespace, control, or invisible-format code points, exactly the
+/// class the PDF recovery path gates on) fails closed with
+/// `empty_output` rather than emitting a blank artifact. This is where a
+/// well-formed but empty recognition envelope is caught: the envelope
+/// grammar keeps `ocr-protocol-error` for malformed stdout, and an
+/// empty-but-well-formed recognition lands here as `empty_output`.
+#[cfg(all(unix, feature = "image-ocr"))]
+pub(crate) fn render_ocr_spans(
+    spans: &[crate::runner::protocol::bodies::OcrSpan],
+    source_len: usize,
+) -> Result<(String, Vec<String>), ConvertError> {
+    let mut warnings = Vec::new();
+    let mut lines = Vec::new();
+    for (index, span) in spans.iter().enumerate() {
+        if !(0.0..=1.0).contains(&span.confidence) {
+            return Err(ConvertError {
+                code: "ocr-protocol-error",
+                message: format!(
+                    "span {index} confidence {} is outside 0 to 1",
+                    span.confidence
+                ),
+            });
+        }
+        if span.confidence < OCR_CONFIDENCE_WARNING {
+            warnings.push(format!(
+                "ocr_low_confidence: span {index} at {:.2}",
+                span.confidence
+            ));
+        }
+        lines.push(single_line(&span.text));
+    }
+    let text = normalize_text(&finish_lines(lines));
+    if source_len > 0 && !text.chars().any(crate::convert::is_meaningful) {
+        return Err(ConvertError {
+            code: "empty_output",
+            message: format!("source is {source_len} bytes but conversion produced no text"),
+        });
+    }
+    Ok((text, warnings))
 }
 
 #[cfg(test)]

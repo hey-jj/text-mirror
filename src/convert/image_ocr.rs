@@ -2,7 +2,11 @@
 //! subprocess sandbox.
 //!
 //! Raster images reach the pinned vision engine through three stages,
-//! all inside the jailed worker:
+//! all inside the jailed worker. Each of the three stages is an
+//! independent fail-closed layer: the parent's source-bytes ceiling
+//! bounds what stages here, the decode allocation guard bounds the
+//! decoded pixel buffers, and the area cap bounds the encoder input.
+//! No single number carries the whole containment claim.
 //!
 //! 1. DECODE. png, jpeg, and webp are already rasters and decode with
 //!    the pure-Rust `image` crate. The decode is deterministic and
@@ -28,11 +32,12 @@
 //!
 //! The engine, its weights, the multimodal projector, the fixed
 //! prompt, and the serialized limit policy are pinned by hash and
-//! named here only by role label. This core release wires no runtime
-//! into the jail, so recognition fails closed with a runtime-missing
-//! reason until a deployment supplies the pinned runtime; the live
-//! recognition and its determinism proof are the residual that seam
-//! leaves.
+//! named here only by generic role label. This core release wires no
+//! runtime into the jail, so recognition fails closed with a
+//! runtime-missing reason until a deployment supplies the pinned
+//! runtime. The live-engine recognition and its cross-restart
+//! determinism proof are pending at that runtime-missing seam and are
+//! required before the engine path is enabled.
 
 use std::path::Path;
 
@@ -51,12 +56,18 @@ pub const IMAGE_OCR_MAX_AREA_PX: u64 = 2_359_296;
 /// not fail; it logs one note for validation and proceeds.
 pub const IMAGE_OCR_VALIDATED_LONG_EDGE: u32 = 1600;
 
-/// Decode-time allocation guard, distinct from the jail's address-space
-/// limit and from the area cap. It bounds the decoder's working buffer
-/// against a decompression bomb whose declared dimensions the area cap
-/// has not yet seen: the largest in-scope raster is the area cap at 4
-/// bytes per pixel, about 9 MiB, so 64 MiB covers the decode plus codec
-/// scratch while refusing a bomb demanding hundreds of megabytes.
+/// Decode-time allocation guard: one layer of a layered containment,
+/// not a single invariant. Three independent limits bound this path.
+/// The parent's source-bytes ceiling bounds the bytes that stage into
+/// the jail; this guard bounds the decoder's working pixel buffers; and
+/// the area cap bounds the encoder input. This guard's job is only the
+/// middle layer: it caps the decoder against a decompression bomb whose
+/// declared dimensions the area preflight has not yet seen. The largest
+/// in-scope raster is the area cap at 4 bytes per pixel, about 9 MiB, so
+/// this value leaves room for the decoded buffer plus codec scratch
+/// while refusing a bomb demanding hundreds of megabytes. It is not the
+/// jail's address-space limit and not the area cap; each of the three
+/// fails closed on its own.
 pub const IMAGE_OCR_DECODE_ALLOC: u64 = 64 * 1024 * 1024;
 
 /// A recognition failure with a stable reason code. The message never
@@ -78,13 +89,12 @@ impl ImageOcrError {
     }
 }
 
-/// Recognizes text from one staged raster.
-///
-/// `request.input` is a bare name in the worker's jail directory whose
-/// extension names the resolved format, exactly as the parent staged
-/// it. The kind is always a standalone image for this converter; a page
-/// render is a paginated-source concern and never reaches here.
-pub fn recognize(request: &OcrRequest) -> Result<OcrOk, ImageOcrError> {
+/// Stages 1 and 2 for one request: read the staged input and decode it
+/// to a canonical raster, with the area preflight applied. Shared by the
+/// production [`recognize`] and, under `test-adapters`, by
+/// [`recognize_fake`], so both drive the identical decode and area
+/// guards and only stage 3 differs.
+fn stage_pixels(request: &OcrRequest) -> Result<(RgbImage, Vec<String>), ImageOcrError> {
     if !matches!(request.kind, OcrInput::Image) {
         return Err(ImageOcrError::new(
             "ocr-protocol-error",
@@ -102,8 +112,38 @@ pub fn recognize(request: &OcrRequest) -> Result<OcrOk, ImageOcrError> {
             format!("cannot read the staged input {}: {e}", request.input),
         )
     })?;
-    let (rgb, warnings) = decode_to_rgb(&bytes, format)?;
+    decode_to_rgb(&bytes, format)
+}
+
+/// Recognizes text from one staged raster.
+///
+/// `request.input` is a bare name in the worker's jail directory whose
+/// extension names the resolved format, exactly as the parent staged
+/// it. The kind is always a standalone image for this converter; a page
+/// render is a paginated-source concern and never reaches here.
+///
+/// This is the production recognition symbol and compiles one way in
+/// every feature combination: it always drives the pinned-runtime stage
+/// 3, which fails closed with `image-ocr-runtime-missing` until a
+/// deployment wires the runtime. It is never swapped for a fake, so an
+/// all-features build recognizes through this same fail-closed path.
+pub fn recognize(request: &OcrRequest) -> Result<OcrOk, ImageOcrError> {
+    let (rgb, warnings) = stage_pixels(request)?;
     let spans = recognize_pixels(&rgb)?;
+    Ok(OcrOk { spans, warnings })
+}
+
+/// The fake-engine recognition path, selected only by the test harness
+/// (the `image-ocr-fake` worker mode), never by the production worker
+/// mode or the registry. It is a separate symbol from [`recognize`], not
+/// a replacement of it: stages 1 and 2 are the same real decode and area
+/// guards, and only stage 3 is the deterministic fake below. This
+/// mirrors how the existing fake-engine worker modes sit beside the
+/// production modes rather than swapping them.
+#[cfg(feature = "test-adapters")]
+pub fn recognize_fake(request: &OcrRequest) -> Result<OcrOk, ImageOcrError> {
+    let (rgb, warnings) = stage_pixels(request)?;
+    let spans = recognize_pixels_fake(&rgb)?;
     Ok(OcrOk { spans, warnings })
 }
 
@@ -135,7 +175,10 @@ fn decode_to_rgb(bytes: &[u8], format: &str) -> Result<(RgbImage, Vec<String>), 
         }
     };
     let decode_failed = |e: image::ImageError| {
-        ImageOcrError::new("image-ocr-decode-failed", format!("cannot decode the raster: {e}"))
+        ImageOcrError::new(
+            "image-ocr-decode-failed",
+            format!("cannot decode the raster: {e}"),
+        )
     };
 
     // Probe dimensions from the header without decoding pixels.
@@ -178,7 +221,12 @@ fn decode_to_rgb(bytes: &[u8], format: &str) -> Result<(RgbImage, Vec<String>), 
 fn encode_png(rgb: &RgbImage) -> Result<Vec<u8>, ImageOcrError> {
     let mut buffer = Vec::new();
     image::codecs::png::PngEncoder::new(&mut buffer)
-        .write_image(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8)
+        .write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            ExtendedColorType::Rgb8,
+        )
         .map_err(|e| {
             ImageOcrError::new(
                 "image-ocr-decode-failed",
@@ -188,14 +236,16 @@ fn encode_png(rgb: &RgbImage) -> Result<Vec<u8>, ImageOcrError> {
     Ok(buffer)
 }
 
-/// Stage 3 under the fake engine: no pinned runtime is present in a
-/// test build, so deterministic spans are derived from the canonical
-/// pixels. The text is a stable digest of the RGB bytes, so an
-/// alpha-flattened raster and its opaque twin recognize identically,
-/// which is the flatten proof. The second span sits below the
-/// confidence floor so the low-confidence warning path is exercised.
+/// Stage 3 under the fake engine, reached only through
+/// [`recognize_fake`] and the harness-selected `image-ocr-fake` worker
+/// mode. Deterministic spans are derived from the canonical pixels. The
+/// text is a stable digest of the RGB bytes, so an alpha-flattened
+/// raster and its opaque twin recognize identically, which is the
+/// flatten proof. The second span sits below the confidence floor so the
+/// low-confidence warning path is exercised. This is a separate symbol
+/// from the production [`recognize_pixels`]; it never replaces it.
 #[cfg(feature = "test-adapters")]
-fn recognize_pixels(rgb: &RgbImage) -> Result<Vec<OcrSpan>, ImageOcrError> {
+fn recognize_pixels_fake(rgb: &RgbImage) -> Result<Vec<OcrSpan>, ImageOcrError> {
     let _canonical = encode_png(rgb)?;
     let digest = crate::hash::hash_bytes(rgb.as_raw());
     Ok(vec![
@@ -222,7 +272,11 @@ fn recognize_pixels(rgb: &RgbImage) -> Result<Vec<OcrSpan>, ImageOcrError> {
 /// engine child, and parse its fenced stdout. This core release wires
 /// no runtime, so `resolve_components` yields nothing and the verify
 /// fails closed with runtime-missing.
-#[cfg(not(feature = "test-adapters"))]
+///
+/// This is the production recognition symbol. It carries no feature cfg,
+/// so it compiles identically in every feature combination, including an
+/// all-features build: the fake stage 3 above is a separate function and
+/// never stands in for this one.
 fn recognize_pixels(rgb: &RgbImage) -> Result<Vec<OcrSpan>, ImageOcrError> {
     let canonical = encode_png(rgb)?;
     let components = runtime::resolve_components();
@@ -240,26 +294,49 @@ fn recognize_pixels(rgb: &RgbImage) -> Result<Vec<OcrSpan>, ImageOcrError> {
 /// The pinned-runtime layer: inventory verification, the accelerator
 /// class check, the engine child, and the fenced-stdout parse.
 ///
-/// These run on the production recognition path and are exercised
-/// directly by the unit tests below. A fake-engine test build (the
-/// `test-adapters` feature) recognizes through the seam above and never
-/// calls this layer, so its items are allowed dead there.
-#[cfg_attr(feature = "test-adapters", allow(dead_code))]
+/// These run on the production recognition path, which compiles in every
+/// feature combination, and are exercised directly by the unit tests
+/// below. The fake-engine path is a separate stage 3 selected only by
+/// the harness; it does not remove this layer from the build.
 mod runtime {
     use std::path::PathBuf;
 
     use super::ImageOcrError;
 
     /// The runtime roles the worker verifies before recognition. Each
-    /// is a role label only: no filename, path, host, or device
+    /// is a generic role label only: no filename, path, host, or device
     /// identity is recorded here, in error messages, or in the manifest.
+    ///
+    /// These are the five roles the core png/jpeg/webp path needs: the
+    /// engine binary, its weights, the projector, the prompt, and the
+    /// serialized limit policy. Three further raster-provider roles
+    /// exist only for the gated external-rasterizer set, which this core
+    /// ships nothing of, so verification here is deliberately scoped to
+    /// these five. Extending it to all eight is a carried obligation of
+    /// the provider build (see the provider-surface note below).
     pub(super) const CORE_ROLES: [&str; 5] = [
         "engine-cli",
-        "m3e-vision",
-        "m3e-projector",
+        "vision-weights",
+        "vision-projector",
         "ocr-prompt",
         "ocr-limit-policy",
     ];
+
+    // Provider-surface TODO (carried obligation): the gated external
+    // rasterizer build verifies eight roles, not five. It extends the
+    // inventory above with the three raster-provider roles `raster-ql`,
+    // `raster-magick`, and `raster-sips`, each a generic role label. The
+    // core ships no rasterizer, so it deliberately scopes verification to
+    // the five core roles; the provider build owns extending it to all
+    // eight.
+
+    /// A short, scrub-clean marker for the one behavior this core does
+    /// not yet carry: the live-engine recognition and the proof that it
+    /// is deterministic across a worker restart. It is required-nonempty
+    /// so the obligation cannot be quietly dropped, and it lives at the
+    /// runtime-missing seam because that is exactly where the unwired
+    /// runtime leaves the gap.
+    pub(super) const DETERMINISM_PROOF_PENDING: &str = "live-engine cross-restart determinism proof pending; required before the engine path is enabled";
 
     /// The sentinels the worker directs the model to wrap its
     /// recognized text between. Each is fenced by an ASCII record
@@ -366,15 +443,18 @@ mod runtime {
     /// The invocation is resolved from the runtime components, so no
     /// engine argv, device id, or model identity is a literal here. This
     /// core release wires no runtime, so this is unreached and the
-    /// runtime verification above is the fail-closed guard; the live
-    /// exec and its determinism proof are the residual.
+    /// runtime verification above is the fail-closed guard. The live exec
+    /// and its cross-restart determinism proof are pending here; see
+    /// [`DETERMINISM_PROOF_PENDING`].
     pub(super) fn engine_stdout(
         _components: &[Component],
         _canonical_png: &[u8],
     ) -> Result<Vec<u8>, ImageOcrError> {
         Err(ImageOcrError::new(
             "image-ocr-runtime-missing",
-            "no pinned vision runtime is wired into this build",
+            format!(
+                "no pinned vision runtime is wired into this build; {DETERMINISM_PROOF_PENDING}"
+            ),
         ))
     }
 
@@ -398,10 +478,14 @@ mod runtime {
         let begins = count_occurrences(stdout, BEGIN_SENTINEL);
         let ends = count_occurrences(stdout, END_SENTINEL);
         if begins != 1 {
-            return Err(protocol_error("the BEGIN sentinel does not appear exactly once"));
+            return Err(protocol_error(
+                "the BEGIN sentinel does not appear exactly once",
+            ));
         }
         if ends != 1 {
-            return Err(protocol_error("the END sentinel does not appear exactly once"));
+            return Err(protocol_error(
+                "the END sentinel does not appear exactly once",
+            ));
         }
         let begin = find(stdout, BEGIN_SENTINEL).expect("one BEGIN was counted");
         let end = find(stdout, END_SENTINEL).expect("one END was counted");
@@ -452,8 +536,8 @@ mod runtime {
 #[cfg(test)]
 mod tests {
     use super::runtime::{
-        BEGIN_SENTINEL, CORE_ROLES, Component, Device, DeviceClass, END_SENTINEL,
-        check_accelerator, engine_stdout, enumerate_devices, parse_fenced_envelope,
+        BEGIN_SENTINEL, CORE_ROLES, Component, DETERMINISM_PROOF_PENDING, Device, DeviceClass,
+        END_SENTINEL, check_accelerator, engine_stdout, enumerate_devices, parse_fenced_envelope,
         resolve_components, verify_inventory,
     };
     use super::*;
@@ -491,13 +575,22 @@ mod tests {
         assert!(decode_to_rgb(&jpeg, "jpeg").is_ok());
         let mut webp = Vec::new();
         image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
-            .encode(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8)
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                ExtendedColorType::Rgb8,
+            )
             .unwrap();
         assert!(decode_to_rgb(&webp, "webp").is_ok());
     }
 
     #[test]
     fn the_area_cap_fails_closed_with_no_resize() {
+        // The area cap is the encoder-input layer of a layered
+        // containment, distinct from the parent's source-bytes ceiling
+        // and from the decode allocation guard; each fails closed on its
+        // own. This exercises the area layer.
         // 2048x2048 = 4.19 MP, over the cap.
         let err = decode_to_rgb(&png(2048, 2048), "png").unwrap_err();
         assert_eq!(err.code, "image-ocr-area-exceeded");
@@ -547,7 +640,10 @@ mod tests {
 
     #[test]
     fn a_clean_envelope_parses_with_and_without_a_trailing_newline() {
-        assert_eq!(parse_fenced_envelope(&fence(b"hello world")).unwrap(), "hello world");
+        assert_eq!(
+            parse_fenced_envelope(&fence(b"hello world")).unwrap(),
+            "hello world"
+        );
         let mut with_newline = fence(b"line");
         with_newline.push(b'\n');
         assert_eq!(parse_fenced_envelope(&with_newline).unwrap(), "line");
@@ -569,14 +665,14 @@ mod tests {
         let mut leaked_log = fence(b"x");
         leaked_log.extend_from_slice(b"\nengine: loaded\n");
         for bytes in [
-            BEGIN_SENTINEL.to_vec(),                 // missing END
-            END_SENTINEL.to_vec(),                   // missing BEGIN
-            doubled_begin,                           // doubled sentinel
-            out_of_order,                            // out of order
-            leading,                                 // byte before BEGIN
-            trailing,                                // byte after END
-            leaked_log,                              // leaked log line
-            b"!!!!!!!!".to_vec(),                    // degenerate, no sentinels
+            BEGIN_SENTINEL.to_vec(), // missing END
+            END_SENTINEL.to_vec(),   // missing BEGIN
+            doubled_begin,           // doubled sentinel
+            out_of_order,            // out of order
+            leading,                 // byte before BEGIN
+            trailing,                // byte after END
+            leaked_log,              // leaked log line
+            b"!!!!!!!!".to_vec(),    // degenerate, no sentinels
         ] {
             let err = parse_fenced_envelope(&bytes).unwrap_err();
             assert_eq!(err.code, "ocr-protocol-error", "{bytes:?}");
@@ -649,8 +745,54 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_exec_is_the_runtime_missing_residual() {
+    fn the_engine_exec_fails_closed_and_carries_the_pending_determinism_note() {
         let err = engine_stdout(&[], b"png").unwrap_err();
         assert_eq!(err.code, "image-ocr-runtime-missing");
+        // The pending-proof marker is non-empty and travels with the
+        // fail-closed reason at the runtime-missing seam.
+        assert!(!DETERMINISM_PROOF_PENDING.is_empty());
+        assert!(err.message.contains(DETERMINISM_PROOF_PENDING));
+    }
+
+    #[test]
+    fn the_production_recognize_fails_closed_in_every_feature_combination() {
+        // recognize() is the production symbol and is never swapped for a
+        // fake, so even an all-features build reaches the pinned-runtime
+        // stage 3 and fails closed because no runtime is wired. This is
+        // the guard that a fake never ships behind the production path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.png");
+        std::fs::write(&path, png(8, 8)).unwrap();
+        let request = OcrRequest {
+            input: path.to_str().unwrap().to_string(),
+            kind: OcrInput::Image,
+        };
+        let err = recognize(&request).unwrap_err();
+        assert_eq!(err.code, "image-ocr-runtime-missing");
+    }
+
+    #[test]
+    fn a_well_formed_but_content_free_envelope_is_empty_output_not_protocol_error() {
+        // Only whitespace and control bytes between the sentinels: the
+        // envelope is well-formed, so it is not a protocol error, and it
+        // carries no meaningful character, so the converter's meaningful
+        // floor fails it closed with empty_output on a non-empty source.
+        let text = parse_fenced_envelope(&fence(b" \t\r\n\x07")).unwrap();
+        assert!(!text.chars().any(crate::convert::is_meaningful));
+        let span = OcrSpan {
+            text,
+            confidence: 1.0,
+        };
+        let err = crate::convert::subprocess::render_ocr_spans(&[span], 128).unwrap_err();
+        assert_eq!(err.code, "empty_output");
+    }
+
+    #[test]
+    fn the_inventory_is_scoped_to_the_five_core_roles() {
+        // The core ships no rasterizer, so it verifies exactly the five
+        // core roles; the three raster-provider roles are the gated
+        // provider build's carried obligation.
+        assert_eq!(CORE_ROLES.len(), 5);
+        assert!(!CORE_ROLES.iter().any(|role| role.starts_with("raster-")));
     }
 }

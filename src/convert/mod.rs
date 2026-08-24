@@ -232,6 +232,33 @@ pub fn normalize_text(input: &str) -> String {
     unified.nfc().collect()
 }
 
+/// Invisible format characters: code points that render nothing yet are
+/// neither whitespace nor control characters, so a bare emptiness check
+/// would let them through. The set is the soft hyphen, the zero-width
+/// and bidi marks (`U+200B`–`U+200F`), the bidi overrides and embeddings
+/// (`U+202A`–`U+202E`), the word joiner and invisible-operator block
+/// (`U+2060`–`U+2064`), and the byte-order mark (`U+FEFF`). Text whose
+/// only characters are these carries nothing a reader would see. The set
+/// is a documented minimum and is not narrowed; whitespace and control
+/// characters are handled separately by [`is_meaningful`], so the two
+/// together cover the empty-render cases.
+pub(crate) fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0xFEFF
+    )
+}
+
+/// Whether a character is meaningful content: something a reader would
+/// see on the page. Whitespace, control characters, and invisible format
+/// characters are not. This is the shared meaningful-text floor: the PDF
+/// recovery path and the image-OCR converter both gate on the presence
+/// of at least one such character, so a well-formed but content-free
+/// result fails closed rather than passing as a blank success.
+pub(crate) fn is_meaningful(c: char) -> bool {
+    !c.is_whitespace() && !c.is_control() && !is_invisible_format(c)
+}
+
 /// Passthrough for text-native formats.
 ///
 /// Reads the source as plain text and applies [`normalize_text`]. It
@@ -914,6 +941,43 @@ mod tests {
             registry.unsupported_reason("msg"),
             Some(NO_CONVERTER_REASON)
         );
+    }
+
+    // The raster family routes to a live converter when the `image-ocr`
+    // feature is built with a jail backend, and to a deliberate
+    // `image-ocr-not-built` capability gap otherwise. Both arms are
+    // asserted here through a runtime branch, so both compile in every
+    // configuration and neither rots. The self dev-dependency turns the
+    // feature on for the normal suite, so `cargo test` runs the feature-
+    // present arm; the feature-absent arm runs whenever the crate is
+    // built without the feature, which is a documented CI step:
+    //
+    //   cargo test --no-default-features -p text-mirror   # crate built
+    //   without the self dev-dependency, so the feature is genuinely off
+    //
+    // The unsupported reason itself is asserted directly regardless of
+    // configuration so the not-built plumbing never goes untested.
+    #[test]
+    fn the_raster_family_routes_by_the_image_ocr_feature() {
+        let registry = Registry::builtin().unwrap();
+        let feature_present = cfg!(all(unix, feature = "image-ocr"));
+        for format in ["png", "jpeg", "webp"] {
+            if feature_present {
+                // A live converter claims the format, so it carries no
+                // unsupported reason.
+                assert!(registry.converter_for(format).is_some(), "{format}");
+                assert_eq!(registry.unsupported_reason(format), None, "{format}");
+            } else {
+                // A deliberate capability gap: no converter, and the
+                // not-built reason rather than a converter error.
+                assert!(registry.converter_for(format).is_none(), "{format}");
+                assert_eq!(
+                    registry.unsupported_reason(format),
+                    Some(IMAGE_OCR_NOT_BUILT_REASON),
+                    "{format}"
+                );
+            }
+        }
     }
 
     #[test]

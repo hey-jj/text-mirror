@@ -181,7 +181,7 @@ impl Converter for WorkbookIr {
         }
 
         Ok(Outcome {
-        artifact_kind: crate::manifest::ArtifactKind::Text,
+            artifact_kind: crate::manifest::ArtifactKind::Text,
             converter_id: WORKBOOK_ID.to_string(),
             converter_version: WORKBOOK_VERSION.to_string(),
             detected_format: detected_format.to_string(),

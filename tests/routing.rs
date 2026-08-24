@@ -142,11 +142,7 @@ fn unsupported_reasons_name_every_deliberate_exclusion() {
     // tiff stays engine-unpinned: the in-jail decoder excludes it. png,
     // jpeg, and webp moved to the image-pixel-ocr converter and are
     // exercised in the image-OCR suite.
-    fs::write(
-        setup.root.join("scan.tiff"),
-        b"II*\x00\x08\x00\x00\x00",
-    )
-    .unwrap();
+    fs::write(setup.root.join("scan.tiff"), b"II*\x00\x08\x00\x00\x00").unwrap();
     fs::write(setup.root.join("opaque.blob"), b"\x00\xfe\xedopaque bytes").unwrap();
 
     let report = run(&setup);
