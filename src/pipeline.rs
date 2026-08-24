@@ -833,7 +833,7 @@ impl Expander<'_> {
                     let text_hash = hash::hash_bytes(outcome.text.as_bytes());
                     record.text_path = Some(text_relative.clone());
                     record.text_hash = Some(text_hash.clone());
-                    record.artifact_kind = Some(ArtifactKind::Text);
+                    record.artifact_kind = Some(outcome.artifact_kind);
                     record.converter_id = Some(outcome.converter_id.clone());
                     record.converter_version = Some(outcome.converter_version.clone());
                     record.warnings.extend(outcome.warnings.iter().cloned());
@@ -1203,6 +1203,7 @@ impl Expander<'_> {
                     text: listing,
                     warnings: Vec::new(),
                     segments,
+                    artifact_kind: manifest::ArtifactKind::Text,
                 };
                 if let Err(reason) = validate_output(&outcome) {
                     return self.fail(&meta, reason, started);
@@ -1601,7 +1602,7 @@ mod tests {
     #[test]
     fn builtin_rules_agree_on_a_version() {
         let rules = Rules::builtin().unwrap();
-        assert_eq!(rules.version(), "7");
+        assert_eq!(rules.version(), "8");
     }
 
     #[test]
@@ -1658,6 +1659,7 @@ mod tests {
                 text: "ok".to_string(),
                 warnings: Vec::new(),
                 segments: vec![Segment::span(0, 999, "document")],
+                artifact_kind: manifest::ArtifactKind::Text,
             })
         }
     }

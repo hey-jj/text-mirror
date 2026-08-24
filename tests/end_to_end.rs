@@ -52,8 +52,11 @@ fn run_converts_skips_and_counts_the_true_denominator() {
     assert_eq!(first.sources, 8);
     assert_eq!(first.counts.converted, 4);
     assert_eq!(first.counts.dedup, 1);
-    assert_eq!(first.counts.unsupported, 2);
-    assert_eq!(first.counts.failed, 1);
+    // image.png and trick.txt both carry png bytes. png is a claimed
+    // converter now (image-pixel-ocr), so their truncated bytes fail
+    // closed in the jailed decoder rather than recording unsupported.
+    assert_eq!(first.counts.unsupported, 0);
+    assert_eq!(first.counts.failed, 3);
     assert_eq!(first.counts.skipped_unchanged, 0);
 
     // The mirror parallels the source tree with .txt appended, and
@@ -84,11 +87,20 @@ fn run_converts_skips_and_counts_the_true_denominator() {
         "duplicate payload\n"
     );
 
-    // A mislabeled binary is detected by magic bytes and flagged.
+    // A mislabeled binary is detected by magic bytes and flagged. Its
+    // png bytes are truncated, so the image converter fails closed.
     let trick = &terminal["trick.txt"];
-    assert_eq!(trick.status, Status::Unsupported);
+    assert_eq!(trick.status, Status::Failed);
     assert_eq!(trick.detected_format, "png");
     assert!(trick.format_mismatch);
+    assert!(
+        trick
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("image-ocr-decode-failed")),
+        "{:?}",
+        trick.error
+    );
 
     // A converter failure carries a machine-readable reason.
     let broken = &terminal["broken.txt"];
@@ -102,8 +114,8 @@ fn run_converts_skips_and_counts_the_true_denominator() {
     assert_eq!(second.counts.converted, 0);
     assert_eq!(second.counts.dedup, 0);
     assert_eq!(second.counts.skipped_unchanged, 5);
-    assert_eq!(second.counts.unsupported, 2);
-    assert_eq!(second.counts.failed, 1);
+    assert_eq!(second.counts.unsupported, 0);
+    assert_eq!(second.counts.failed, 3);
 
     // The shard is append-only and the true denominator holds: every
     // walked source has exactly one terminal record.
@@ -125,8 +137,8 @@ fn run_converts_skips_and_counts_the_true_denominator() {
     assert_eq!(division.sources, 8);
     assert_eq!(division.with_text, 5);
     assert_eq!(division.counts.skipped_unchanged, 5);
-    assert_eq!(division.counts.unsupported, 2);
-    assert_eq!(division.counts.failed, 1);
+    assert_eq!(division.counts.unsupported, 0);
+    assert_eq!(division.counts.failed, 3);
 
     // Explain returns the full append history for one source.
     let history = pipeline::explain(&manifest_dir, "docs/crlf.txt").unwrap();

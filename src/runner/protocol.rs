@@ -450,6 +450,11 @@ pub mod bodies {
     pub struct OcrOk {
         /// Recognized spans in reading order.
         pub spans: Vec<OcrSpan>,
+        /// Non-fatal notes from the worker, such as the long-edge
+        /// validation note. Skipped from the wire when empty, so the
+        /// pre-existing engine-unpinned scaffold serializes unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub warnings: Vec<String>,
     }
 
     /// Request body for the `asr` adapter.

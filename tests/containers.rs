@@ -187,10 +187,12 @@ fn a_normal_zip_expands_to_a_listing_and_children() {
     let rules = Rules::builtin().unwrap();
 
     let report = run_with(&setup, &rules);
-    // Parent listing, the docx, and the txt convert. The png is
-    // unsupported. Four records touched, three converted.
+    // Parent listing, the docx, and the txt convert. The png is claimed
+    // by the image converter now, so its truncated bytes fail closed in
+    // the jailed decoder. Four records touched, three converted.
     assert_eq!(report.counts.converted, 3);
-    assert_eq!(report.counts.unsupported, 1);
+    assert_eq!(report.counts.unsupported, 0);
+    assert_eq!(report.counts.failed, 1);
 
     let parent = terminal(&setup, "update.zip").unwrap();
     assert_eq!(parent.status, Status::Converted);
@@ -215,9 +217,15 @@ fn a_normal_zip_expands_to_a_listing_and_children() {
     );
 
     let png = terminal(&setup, "update.zip.d/pic.png").unwrap();
-    assert_eq!(png.status, Status::Unsupported);
+    assert_eq!(png.status, Status::Failed);
     assert_eq!(png.parent_source.as_deref(), Some("update.zip"));
-    assert_eq!(png.error.as_deref(), Some("engine-unpinned"));
+    assert!(
+        png.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("image-ocr-decode-failed")),
+        "{:?}",
+        png.error
+    );
 }
 
 // Nested zips expand recursively down to the depth cap.

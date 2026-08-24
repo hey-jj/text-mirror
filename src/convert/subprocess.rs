@@ -58,6 +58,11 @@ pub const RECORDS_SUBPROCESS_ID: &str = "records-worker";
 /// Version of the jailed records worker adapter.
 pub const RECORDS_SUBPROCESS_VERSION: &str = "1.0.0";
 
+/// Registry id of the in-jail pixel-OCR converter for raster images.
+pub const IMAGE_PIXEL_OCR_ID: &str = "image-pixel-ocr";
+/// Version of the in-jail pixel-OCR converter.
+pub const IMAGE_PIXEL_OCR_VERSION: &str = "1.0.0";
+
 /// Registry id of the OCR adapter.
 pub const OCR_ADAPTER_ID: &str = "ocr-adapter";
 /// Version of the OCR adapter.
@@ -101,6 +106,7 @@ mod imp {
 
     use super::*;
     use crate::convert::RecordsLimits;
+    use crate::manifest::ArtifactKind;
     use crate::runner::protocol::bodies::{
         AsrOk, AsrRequest, OcrInput, OcrOk, OcrRequest, PdfOk, PdfRequest, RecordsOk,
         RecordsRequest, VideoOk, VideoRequest,
@@ -128,6 +134,15 @@ mod imp {
             "record-limit-exceeded",
             "records_read_error",
             "not_sqlite",
+            // Image-OCR worker reasons. Each must survive the wire-to-
+            // static mapping so the manifest keeps the specific reason
+            // rather than collapsing it to adapter_error.
+            "image-ocr-decode-failed",
+            "image-ocr-area-exceeded",
+            "image-ocr-runtime-missing",
+            "image-ocr-runtime-mismatch",
+            "image-ocr-no-accelerator",
+            "ocr-protocol-error",
         ];
         KNOWN
             .iter()
@@ -197,7 +212,12 @@ mod imp {
             source: &[u8],
             detected_format: &str,
         ) -> std::result::Result<Outcome, ConvertError> {
-            if detected_format != "pdf" {
+            // ai routes here too: a modern .ai is a PDF-compatible
+            // container, so the same worker path extracts its text
+            // layer with the pdf-family warnings and recovery route. A
+            // legacy PostScript-backed .ai has no PDF text layer and
+            // fails closed with a pdf-family reason.
+            if !matches!(detected_format, "pdf" | "ai") {
                 return Err(ConvertError {
                     code: "unclaimed_format",
                     message: format!(
@@ -215,6 +235,7 @@ mod imp {
             )?;
             let (converter_id, converter_version) = pdf_converter_identity(body.recovered);
             Ok(Outcome {
+                artifact_kind: ArtifactKind::Text,
                 converter_id: converter_id.to_string(),
                 converter_version: converter_version.to_string(),
                 detected_format: detected_format.to_string(),
@@ -280,12 +301,134 @@ mod imp {
                 &[(&input, source)],
             )?;
             Ok(Outcome {
+                artifact_kind: ArtifactKind::Text,
                 converter_id: RECORDS_SUBPROCESS_ID.to_string(),
                 converter_version: RECORDS_SUBPROCESS_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
                 text: body.text,
                 warnings: body.warnings,
                 segments: body.segments,
+            })
+        }
+    }
+
+    /// The in-jail pixel-OCR converter for raster images.
+    ///
+    /// png, jpeg, and webp stage into the jail by bare name and the
+    /// worker decodes them with the pure-Rust image crate, asserts the
+    /// encoder-input area cap, re-encodes a canonical raster, and hands
+    /// it to the pinned vision engine as a hash-verified jailed child.
+    /// The parent does no image parsing: it selects the worker mode,
+    /// stages the bytes, and maps the fenced recognition to the outcome
+    /// shape with [`ArtifactKind::Ocr`]. The engine is machine-class
+    /// scoped, so the recognized text carries no cross-platform
+    /// byte-equality claim; only the pure-Rust decode does.
+    #[cfg(feature = "image-ocr")]
+    pub struct ImagePixelOcr {
+        limits: crate::runner::Limits,
+    }
+
+    #[cfg(feature = "image-ocr")]
+    impl ImagePixelOcr {
+        /// An adapter over the rules-supplied image-OCR jail profile.
+        pub fn new(limits: crate::convert::ImageOcrLimits) -> ImagePixelOcr {
+            ImagePixelOcr {
+                limits: crate::runner::Limits {
+                    wall_timeout: std::time::Duration::from_secs(limits.wall_timeout_secs),
+                    max_response_bytes: limits.max_response_bytes,
+                    max_stderr_bytes: limits.max_stderr_bytes,
+                    address_space_bytes: limits.address_space_bytes,
+                    cpu_seconds: limits.cpu_seconds,
+                    file_size_bytes: limits.file_size_bytes,
+                    max_processes: limits.max_processes,
+                },
+            }
+        }
+    }
+
+    /// The runner for the image-OCR jail profile, built once. The
+    /// profile is rules data, effectively constant per binary, so the
+    /// first caller's limits are the runner's for the process, mirroring
+    /// `shared_runner` for the default profile.
+    #[cfg(feature = "image-ocr")]
+    fn image_runner(limits: &crate::runner::Limits) -> Result<&'static Runner, ConvertError> {
+        static RUNNER: OnceLock<Result<Runner, RunnerError>> = OnceLock::new();
+        let built = RUNNER.get_or_init(|| {
+            Ok(Runner::new(
+                crate::runner::jail::platform_backend()?,
+                crate::runner::locate_worker()?,
+                limits.clone(),
+            ))
+        });
+        match built {
+            Ok(runner) => Ok(runner),
+            Err(error) => Err(runner_failure(error.clone())),
+        }
+    }
+
+    #[cfg(feature = "image-ocr")]
+    impl Converter for ImagePixelOcr {
+        fn id(&self) -> &'static str {
+            IMAGE_PIXEL_OCR_ID
+        }
+
+        fn version(&self) -> &'static str {
+            IMAGE_PIXEL_OCR_VERSION
+        }
+
+        fn convert(
+            &self,
+            source: &[u8],
+            detected_format: &str,
+        ) -> std::result::Result<Outcome, ConvertError> {
+            if !matches!(detected_format, "png" | "jpeg" | "webp") {
+                return Err(ConvertError {
+                    code: "unclaimed_format",
+                    message: format!("the image-pixel-ocr converter does not handle {detected_format}"),
+                });
+            }
+            let input = format!("input.{detected_format}");
+            let body: OcrOk = call(
+                image_runner(&self.limits)?,
+                "image-ocr",
+                &OcrRequest {
+                    input: input.clone(),
+                    kind: OcrInput::Image,
+                },
+                &[(&input, source)],
+            )?;
+            let mut warnings = body.warnings;
+            let mut lines = Vec::new();
+            for (index, span) in body.spans.iter().enumerate() {
+                if !(0.0..=1.0).contains(&span.confidence) {
+                    return Err(ConvertError {
+                        code: "ocr-protocol-error",
+                        message: format!(
+                            "span {index} confidence {} is outside 0 to 1",
+                            span.confidence
+                        ),
+                    });
+                }
+                if span.confidence < OCR_CONFIDENCE_WARNING {
+                    warnings.push(format!(
+                        "ocr_low_confidence: span {index} at {:.2}",
+                        span.confidence
+                    ));
+                }
+                lines.push(single_line(&span.text));
+            }
+            let text = normalize_text(&finish_lines(lines));
+            if !source.is_empty() && text.is_empty() {
+                return Err(empty_output(source.len()));
+            }
+            Ok(Outcome {
+                converter_id: IMAGE_PIXEL_OCR_ID.to_string(),
+                converter_version: IMAGE_PIXEL_OCR_VERSION.to_string(),
+                detected_format: detected_format.to_string(),
+                artifact_kind: ArtifactKind::Ocr,
+                segments: vec![Segment::span(0, text.len(), "document")],
+                text,
+                warnings,
             })
         }
     }
@@ -358,6 +501,7 @@ mod imp {
                 return Err(empty_output(source.len()));
             }
             Ok(Outcome {
+                artifact_kind: ArtifactKind::Text,
                 converter_id: OCR_ADAPTER_ID.to_string(),
                 converter_version: OCR_ADAPTER_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
@@ -420,6 +564,7 @@ mod imp {
                 return Err(empty_output(source.len()));
             }
             Ok(Outcome {
+                artifact_kind: ArtifactKind::Text,
                 converter_id: ASR_ADAPTER_ID.to_string(),
                 converter_version: ASR_ADAPTER_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
@@ -483,6 +628,7 @@ mod imp {
                 return Err(empty_output(source.len()));
             }
             Ok(Outcome {
+                artifact_kind: ArtifactKind::Text,
                 converter_id: VIDEO_ADAPTER_ID.to_string(),
                 converter_version: VIDEO_ADAPTER_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
@@ -503,6 +649,8 @@ mod imp {
 
 #[cfg(unix)]
 pub use imp::{AsrAdapter, OcrAdapter, PdfSubprocess, RecordsSubprocess, VideoAdapter};
+#[cfg(all(unix, feature = "image-ocr"))]
+pub use imp::ImagePixelOcr;
 
 #[cfg(not(unix))]
 mod imp {

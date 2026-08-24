@@ -66,6 +66,46 @@ impl Default for RecordsLimits {
     }
 }
 
+/// The image-OCR jail limit profile, held as rules data beside the
+/// records ceilings so a deployment raises it in a visible versioned
+/// bump. The default runner limits are tuned for the pure-Rust
+/// document worker; the pinned vision runtime maps a far larger
+/// working set, so the image-OCR converter carries its own envelope.
+/// The registry reads this into the converter, which maps it into the
+/// runner limits its jailed worker enforces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageOcrLimits {
+    /// Wall-clock ceiling for one image, in seconds.
+    pub wall_timeout_secs: u64,
+    /// Ceiling on the response frame payload, in bytes.
+    pub max_response_bytes: u32,
+    /// Ceiling on stderr bytes.
+    pub max_stderr_bytes: u64,
+    /// RLIMIT_AS for the child, in bytes. Linux only.
+    pub address_space_bytes: u64,
+    /// RLIMIT_CPU for the child, in seconds.
+    pub cpu_seconds: u64,
+    /// RLIMIT_FSIZE for the child, in bytes.
+    pub file_size_bytes: u64,
+    /// RLIMIT_NPROC for the child.
+    pub max_processes: u64,
+}
+
+impl Default for ImageOcrLimits {
+    fn default() -> ImageOcrLimits {
+        ImageOcrLimits {
+            wall_timeout_secs: 300,
+            max_response_bytes: 8 * 1024 * 1024,
+            max_stderr_bytes: 4 * 1024 * 1024,
+            address_space_bytes: 64 * 1024 * 1024 * 1024,
+            cpu_seconds: 600,
+            file_size_bytes: 64 * 1024 * 1024,
+            max_processes: 64,
+        }
+    }
+}
+
 use std::collections::HashMap;
 use std::fmt;
 
@@ -90,6 +130,12 @@ pub mod pdf;
 // crate path.
 #[cfg(all(unix, feature = "records-worker"))]
 pub(crate) mod records;
+// The in-jail raster decode and recognize path. Crate-private for the
+// same reason records is: a library consumer must not run the decode
+// and engine path in process and bypass the jail. The worker dispatch
+// reaches it through a crate path.
+#[cfg(all(unix, feature = "image-ocr"))]
+pub(crate) mod image_ocr;
 pub mod subprocess;
 mod visibility;
 mod workbook;
@@ -123,6 +169,11 @@ pub struct Outcome {
     pub warnings: Vec<String>,
     /// Structure spans over `text` for the segments file.
     pub segments: Vec<Segment>,
+    /// How the text was derived. Every text and structured converter
+    /// sets [`ArtifactKind::Text`]; the pixel-OCR converter sets
+    /// [`ArtifactKind::Ocr`], so the manifest records recognized text
+    /// as OCR rather than extraction.
+    pub artifact_kind: crate::manifest::ArtifactKind,
 }
 
 /// A conversion failure with a machine-readable reason.
@@ -207,6 +258,15 @@ pub const NO_CONVERTER_REASON: &str = "no-converter";
 /// to it, but this binary's worker has no records mode, so the format
 /// is a deliberate capability gap rather than a converter error.
 pub const RECORDS_NOT_BUILT_REASON: &str = "records-worker-not-built";
+
+/// The reason raster-image formats record on a build without the
+/// `image-ocr` feature, or on a platform with no jail backend. The
+/// converter exists and the rules route to it, but this binary has no
+/// in-jail decode-plus-recognize path, so the format is a deliberate
+/// capability gap rather than a converter error. The checkpoint key
+/// includes `rules_version`, so a later feature-carrying build
+/// reconverts every such record.
+pub const IMAGE_OCR_NOT_BUILT_REASON: &str = "image-ocr-not-built";
 
 /// Registry id of the passthrough converter.
 pub const PASSTHROUGH_ID: &str = "text-passthrough";
@@ -330,6 +390,7 @@ impl Converter for PlainTextPassthrough {
             text,
             warnings,
             segments,
+            artifact_kind: crate::manifest::ArtifactKind::Text,
         })
     }
 }
@@ -345,6 +406,8 @@ struct RawRegistry {
     containers: Option<ContainerLimits>,
     #[serde(default)]
     records: Option<RecordsLimits>,
+    #[serde(default)]
+    image_ocr: Option<ImageOcrLimits>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +437,7 @@ pub struct Registry {
     unsupported_reasons: HashMap<String, String>,
     container_limits: ContainerLimits,
     records_limits: RecordsLimits,
+    image_ocr_limits: ImageOcrLimits,
 }
 
 impl Registry {
@@ -392,6 +456,7 @@ impl Registry {
             message: e.to_string(),
         })?;
         let records_limits = raw.records.clone().unwrap_or_default();
+        let image_ocr_limits = raw.image_ocr.clone().unwrap_or_default();
         let mut converters: Vec<Box<dyn Converter>> = Vec::new();
         let mut by_format = HashMap::new();
         let mut unsupported_reasons = HashMap::new();
@@ -424,6 +489,34 @@ impl Registry {
                 }
                 continue;
             }
+            // A build without the in-jail image decode path, or a
+            // platform with no jail backend, has no way to decode and
+            // recognize a raster, so route the image formats to a
+            // deliberate unsupported reason instead of a converter that
+            // cannot serve them. The rules stay one shared file: the
+            // routing decision is made here at construction.
+            #[cfg(not(all(unix, feature = "image-ocr")))]
+            if entry.id == subprocess::IMAGE_PIXEL_OCR_ID {
+                for format in &entry.formats {
+                    if RESERVED_FORMAT_IDS.contains(&format.as_str()) {
+                        return Err(Error::Rules {
+                            name: name.to_string(),
+                            message: format!("format id {format:?} is reserved"),
+                        });
+                    }
+                    if by_format.contains_key(format)
+                        || unsupported_reasons
+                            .insert(format.clone(), IMAGE_OCR_NOT_BUILT_REASON.to_string())
+                            .is_some()
+                    {
+                        return Err(Error::Rules {
+                            name: name.to_string(),
+                            message: format!("format {format:?} claimed twice"),
+                        });
+                    }
+                }
+                continue;
+            }
             let converter: Box<dyn Converter> = match entry.id.as_str() {
                 PASSTHROUGH_ID => Box::new(PlainTextPassthrough),
                 html::HTML_STRIP_ID => Box::new(HtmlStrip),
@@ -433,6 +526,10 @@ impl Registry {
                 subprocess::PDF_SUBPROCESS_ID => Box::new(PdfSubprocess),
                 subprocess::RECORDS_SUBPROCESS_ID => {
                     Box::new(RecordsSubprocess::new(records_limits.clone()))
+                }
+                #[cfg(all(unix, feature = "image-ocr"))]
+                subprocess::IMAGE_PIXEL_OCR_ID => {
+                    Box::new(subprocess::ImagePixelOcr::new(image_ocr_limits.clone()))
                 }
                 other => {
                     return Err(Error::Rules {
@@ -496,6 +593,7 @@ impl Registry {
             unsupported_reasons,
             container_limits: raw.containers.unwrap_or_default(),
             records_limits,
+            image_ocr_limits,
         })
     }
 
@@ -519,6 +617,11 @@ impl Registry {
     /// The records worker ceilings from the rules.
     pub fn records_limits(&self) -> &RecordsLimits {
         &self.records_limits
+    }
+
+    /// The image-OCR jail limit profile from the rules.
+    pub fn image_ocr_limits(&self) -> &ImageOcrLimits {
+        &self.image_ocr_limits
     }
 
     /// The reason a format is unsupported.
@@ -564,6 +667,7 @@ impl Registry {
             unsupported_reasons: HashMap::new(),
             container_limits: ContainerLimits::default(),
             records_limits: RecordsLimits::default(),
+            image_ocr_limits: ImageOcrLimits::default(),
         }
     }
 }
@@ -711,7 +815,7 @@ mod tests {
     #[test]
     fn builtin_registry_claims_the_text_family() {
         let registry = Registry::builtin().unwrap();
-        assert_eq!(registry.version(), "7");
+        assert_eq!(registry.version(), "8");
         assert!(registry.converter_for("json").is_some());
         assert!(registry.converter_for("yaml").is_some());
         assert!(registry.converter_for("svg").is_some());
@@ -746,7 +850,32 @@ mod tests {
             registry.unsupported_reason("pickle"),
             Some("pickle-deserialization-unsafe")
         );
-        assert_eq!(registry.unsupported_reason("webp"), Some("engine-unpinned"));
+        // png, jpeg, and webp are claimed by the image-pixel-ocr
+        // converter now (the image-ocr feature is on under test), so
+        // they carry no unsupported reason. tiff stays engine-unpinned:
+        // the in-jail decoder deliberately excludes it.
+        for format in ["png", "jpeg", "webp"] {
+            assert_eq!(
+                registry.converter_for(format).map(|c| c.id()),
+                Some("image-pixel-ocr"),
+                "{format}"
+            );
+            assert_eq!(registry.unsupported_reason(format), None, "{format}");
+        }
+        assert_eq!(registry.unsupported_reason("tiff"), Some("engine-unpinned"));
+        // heic cannot be decoded by the pure-Rust jail path and fails
+        // closed until the opt-in external provider is built.
+        assert_eq!(
+            registry.unsupported_reason("heic"),
+            Some("no-jailed-rasterizer")
+        );
+        // ai routes to the pdf path: a PDF-backed .ai keeps its text
+        // layer, and a legacy PostScript-backed .ai fails closed with a
+        // pdf-family reason rather than as an unknown format.
+        assert_eq!(
+            registry.converter_for("ai").map(|c| c.id()),
+            Some("pdf-subprocess")
+        );
         // Parquet, avro, and sqlite are claimed by the records worker
         // now, so they carry no unsupported reason. arrow and the rest
         // stay deferred.
@@ -777,7 +906,6 @@ mod tests {
         );
         // A claimed format has no unsupported reason.
         assert_eq!(registry.unsupported_reason("text"), None);
-        assert_eq!(registry.unsupported_reason("png"), Some("engine-unpinned"));
         assert_eq!(registry.unsupported_reason("mp4"), Some("engine-unpinned"));
         // html is claimed now, and msg stays on the floor: it is a
         // compound file, not an RFC 822 message.

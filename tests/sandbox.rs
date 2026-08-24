@@ -292,24 +292,17 @@ fn a_scanned_pdf_fails_closed_behind_the_runner() {
 #[test]
 fn media_formats_record_unsupported_with_engine_unpinned() {
     let setup = setup();
-    // One representative per adapter class: image, audio, and video.
-    fs::write(
-        setup.root.join("scan.png"),
-        [0x89, b'P', b'N', b'G', 0, 1, 2, 3],
-    )
-    .unwrap();
+    // Audio and video engines are still unpinned. png, jpeg, and webp
+    // moved to the image-pixel-ocr converter, so a png is no longer
+    // engine-unpinned: it routes to a live converter, exercised below.
     fs::write(setup.root.join("call.mp3"), b"ID3fake audio bytes").unwrap();
     fs::write(setup.root.join("clip.mp4"), b"\0\0\0\x18ftypmp42fake").unwrap();
 
     let rules = Rules::builtin().unwrap();
     let report = run(&setup, &rules);
-    assert_eq!(report.counts.unsupported, 3, "records: {report:?}");
+    assert_eq!(report.counts.unsupported, 2, "records: {report:?}");
 
-    for (source, format) in [
-        ("scan.png", "png"),
-        ("call.mp3", "mp3"),
-        ("clip.mp4", "mp4"),
-    ] {
+    for (source, format) in [("call.mp3", "mp3"), ("clip.mp4", "mp4")] {
         let record = terminal(&setup, source);
         assert_eq!(record.status, Status::Unsupported, "{source}");
         assert_eq!(record.detected_format, format, "{source}");
@@ -327,13 +320,39 @@ fn media_formats_record_unsupported_with_engine_unpinned() {
 }
 
 #[test]
-fn an_engine_unpinned_record_reruns_every_pass() {
+fn a_raster_image_now_routes_to_the_image_pixel_ocr_converter() {
     let setup = setup();
+    // Truncated png bytes: the format is claimed by image-pixel-ocr now,
+    // so these fail closed in the jailed decoder rather than recording
+    // as an unsupported engine gap.
     fs::write(
         setup.root.join("scan.png"),
         [0x89, b'P', b'N', b'G', 0, 1, 2, 3],
     )
     .unwrap();
+    let rules = Rules::builtin().unwrap();
+    let report = run(&setup, &rules);
+    assert_eq!(report.counts.unsupported, 0, "records: {report:?}");
+    assert_eq!(report.counts.failed, 1, "records: {report:?}");
+
+    let record = terminal(&setup, "scan.png");
+    assert_eq!(record.status, Status::Failed);
+    assert_eq!(record.detected_format, "png");
+    assert!(
+        record
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("image-ocr-decode-failed")),
+        "{:?}",
+        record.error
+    );
+    assert!(record.text_path.is_none());
+}
+
+#[test]
+fn an_engine_unpinned_record_reruns_every_pass() {
+    let setup = setup();
+    fs::write(setup.root.join("clip.mp4"), b"\0\0\0\x18ftypmp42fake").unwrap();
     let rules = Rules::builtin().unwrap();
 
     run(&setup, &rules);
@@ -342,6 +361,6 @@ fn an_engine_unpinned_record_reruns_every_pass() {
     let second = run(&setup, &rules);
     assert_eq!(second.counts.unsupported, 1);
     assert_eq!(second.counts.skipped_unchanged, 0);
-    let record = terminal(&setup, "scan.png");
+    let record = terminal(&setup, "clip.mp4");
     assert_eq!(record.error.as_deref(), Some("engine-unpinned"));
 }

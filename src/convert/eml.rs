@@ -338,6 +338,7 @@ pub fn expand_eml(source: &[u8], detected_format: &str) -> Result<EmlExpansion, 
     let segments = vec![Segment::span(0, text.len(), "document")];
     Ok(EmlExpansion {
         outcome: Outcome {
+            artifact_kind: crate::manifest::ArtifactKind::Text,
             converter_id: EML_ID.to_string(),
             converter_version: EML_VERSION.to_string(),
             detected_format: detected_format.to_string(),

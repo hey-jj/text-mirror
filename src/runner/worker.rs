@@ -80,6 +80,11 @@ fn run_mode(mode: &str) -> Result<Response, HardExit> {
         // compile only under the feature and run only in the jail.
         #[cfg(all(unix, feature = "records-worker"))]
         "records" => records::records(read_request()?),
+        // The in-jail raster decode plus recognize path. Compiles only
+        // under the feature and runs only in the jail: the pure-Rust
+        // decode and the engine child both stay behind the sandbox.
+        #[cfg(all(unix, feature = "image-ocr"))]
+        "image-ocr" => image_ocr::image_ocr(read_request()?),
         // Held descendants get no stdin, so this mode never reads a
         // request frame.
         #[cfg(feature = "test-adapters")]
@@ -194,6 +199,29 @@ mod records {
                     segments: conversion.segments,
                 })
                 .expect("RecordsOk serializes"),
+            )),
+            Err(error) => Ok(Response::err(error.code, error.message)),
+        }
+    }
+}
+
+/// The jailed image-OCR mode: decode a raster, assert the area cap,
+/// re-encode a canonical raster, and hand it to the pinned vision
+/// engine, all inside the sandbox.
+#[cfg(all(unix, feature = "image-ocr"))]
+mod image_ocr {
+    use super::*;
+    use crate::convert::image_ocr::recognize;
+    use crate::runner::protocol::bodies::OcrRequest;
+
+    pub(super) fn image_ocr(request: Request) -> Result<Response, HardExit> {
+        let body: OcrRequest = serde_json::from_value(request.payload.clone()).map_err(|e| {
+            eprintln!("worker_bad_payload: {e}");
+            HardExit(2)
+        })?;
+        match recognize(&body) {
+            Ok(ok) => Ok(Response::ok(
+                serde_json::to_value(ok).expect("OcrOk serializes"),
             )),
             Err(error) => Ok(Response::err(error.code, error.message)),
         }
@@ -388,6 +416,7 @@ mod harness {
                     confidence: 0.31,
                 },
             ],
+            warnings: Vec::new(),
         };
         Ok(Response::ok(serde_json::to_value(ok).expect("OcrOk")))
     }

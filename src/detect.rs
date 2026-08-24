@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn builtin_table_parses() {
         let table = FormatTable::builtin().unwrap();
-        assert_eq!(table.version(), "7");
+        assert_eq!(table.version(), "8");
         assert_eq!(table.id_for_extension("txt"), Some("text"));
         assert_eq!(table.id_for_extension("docx"), Some("docx"));
         assert_eq!(table.id_for_extension("json"), Some("json"));
