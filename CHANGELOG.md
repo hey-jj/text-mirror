@@ -36,6 +36,12 @@ Versioning.
   gap. This release wires no engine, so a build with the feature decodes
   the raster and then fails closed with `image-ocr-runtime-missing` until
   a deployment supplies the pinned runtime.
+- Capability gaps carried into this release: pixel OCR for heic and for
+  svg is not built. A heic source fails closed with reason
+  `no-jailed-rasterizer`, because decoding it needs an external
+  rasterizer and that provider lands in a later release. An svg source
+  passes through as raw markup, and pixel OCR over its rendered form
+  waits for the same rasterizer provider.
 
 ### Changed
 
