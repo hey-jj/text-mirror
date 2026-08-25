@@ -7,7 +7,7 @@
 # must match the version in formats.toml and is recorded in every
 # manifest record as rules_version.
 
-version = "8"
+version = "9"
 
 # The passthrough validates UTF-8 and fails closed on anything else,
 # so a binary wearing one of these extensions records failed with
@@ -249,9 +249,9 @@ max_processes = 64
 # compressed iTXt streams above all. Checked incrementally during
 # inflation so a decompression bomb is stopped before it lands. 16 MiB.
 max_decompressed_bytes = 16777216
-# Nesting-depth ceiling for an xmp or svg parse.
+# Nesting-depth ceiling for an xmp parse.
 max_xml_depth = 100
-# Event-count ceiling for an xmp or svg parse.
+# Event-count ceiling for an xmp parse.
 max_xml_events = 1000000
 # Box-count ceiling for an iso base media file format carrier.
 max_boxes = 10000

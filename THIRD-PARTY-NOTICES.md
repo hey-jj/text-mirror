@@ -17,7 +17,7 @@ and compression crates. Their notices are below. A build without that
 feature links none of them.
 
 The image-metadata feature pulls the kamadak-exif, png, and img-parts
-crates, and img-parts pulls mutate_once. png and img-parts are MIT or
+crates, and kamadak-exif pulls mutate_once. png and img-parts are MIT or
 Apache-2.0 and carry no separate notice; kamadak-exif and mutate_once
 are BSD-2-Clause and appear in the section below. A build without that
 feature links none of them.
@@ -529,15 +529,14 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ## BSD-2-Clause
 
 Covered crates: arrayref 0.3.9, and, under the image-metadata feature,
-kamadak-exif 0.6.1 (Copyright (c) 2016-2023 KAMADA Ken'ichi) and
-mutate_once 0.1.2 (Copyright (c) 2019 KAMADA Ken'ichi). Each is consumed
-unmodified. The three copyright notices are reproduced above the shared
-BSD-2-Clause terms below.
+kamadak-exif 0.6.1 and mutate_once 0.1.2. Each is consumed unmodified.
+Each crate's license file is reproduced in full below, because the
+three texts differ in their disclaimer wording.
+
+arrayref 0.3.9:
 
 ```text
 Copyright (c) 2015 David Roundy <roundyd@physics.oregonstate.edu>
-Copyright (c) 2016-2023 KAMADA Ken'ichi (kamadak-exif)
-Copyright (c) 2019 KAMADA Ken'ichi (mutate_once)
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -563,6 +562,62 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+kamadak-exif 0.6.1:
+
+```text
+Copyright (c) 2016-2023 KAMADA Ken'ichi.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
+```
+
+mutate_once 0.1.2:
+
+```text
+Copyright (c) 2019 KAMADA Ken'ichi.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
 ```
 
 ## Unicode-3.0

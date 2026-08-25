@@ -14,7 +14,7 @@ Binding rules for every agent working in this repo.
 
 - Every file, commit message, issue, and PR must read as written from scratch for this crate.
 - Never write customer names, personal names, email addresses other than the git identity, or deployment paths into anything in this repo.
-- Status files and orchestration markers live outside the repo tree.
+- Status files and run-coordination markers live outside the repo tree.
 
 ## Pipeline contract
 

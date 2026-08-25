@@ -122,9 +122,9 @@ pub struct ImageMetadataLimits {
     /// incrementally during inflation so a decompression bomb is stopped
     /// before it lands.
     pub max_decompressed_bytes: u64,
-    /// Nesting-depth ceiling for an xmp or svg parse.
+    /// Nesting-depth ceiling for an xmp parse.
     pub max_xml_depth: u32,
-    /// Event-count ceiling for an xmp or svg parse.
+    /// Event-count ceiling for an xmp parse.
     pub max_xml_events: u64,
     /// Box-count ceiling for an iso base media file format carrier.
     pub max_boxes: u64,
@@ -738,6 +738,25 @@ impl Registry {
         &self.image_metadata_limits
     }
 
+    /// Test-only: drives the image formats through the fake-engine
+    /// image-OCR adapter instead of the pinned-runtime one, so a pipeline
+    /// test can compose a succeeding primary leg with the metadata leg.
+    /// The shared decode, area guards, and outcome mapping are the
+    /// production ones; only the recognition stage is the fake. A release
+    /// build has no such hook.
+    #[cfg(all(unix, feature = "image-ocr", feature = "test-adapters"))]
+    pub fn use_fake_image_ocr(&mut self) {
+        if let Some(index) = self
+            .converters
+            .iter()
+            .position(|c| c.id() == subprocess::IMAGE_PIXEL_OCR_ID)
+        {
+            self.converters[index] = Box::new(subprocess::ImagePixelOcr::new_fake(
+                self.image_ocr_limits.clone(),
+            ));
+        }
+    }
+
     /// The auxiliary image-metadata converter, if the feature built one.
     /// It never enters `by_format`, so the pipeline reaches it here to
     /// run the derived-child leg. `None` means the leg does not run.
@@ -939,7 +958,7 @@ mod tests {
     #[test]
     fn builtin_registry_claims_the_text_family() {
         let registry = Registry::builtin().unwrap();
-        assert_eq!(registry.version(), "8");
+        assert_eq!(registry.version(), "9");
         assert!(registry.converter_for("json").is_some());
         assert!(registry.converter_for("yaml").is_some());
         assert!(registry.converter_for("svg").is_some());

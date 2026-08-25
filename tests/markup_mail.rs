@@ -78,7 +78,7 @@ fn an_html_page_converts_to_clean_text() {
     assert_eq!(record.status, Status::Converted);
     assert_eq!(record.detected_format, "html");
     assert_eq!(record.converter_id.as_deref(), Some("html-strip"));
-    assert_eq!(record.rules_version, "8");
+    assert_eq!(record.rules_version, "9");
 
     let text = fs::read_to_string(setup.mirror.join("alpha/page.html.txt")).unwrap();
     assert_eq!(
@@ -342,7 +342,7 @@ fn a_v4_era_unsupported_html_record_reconverts_under_v5() {
     let record = terminal(&setup, "report.html");
     assert_eq!(record.status, Status::Converted);
     assert_eq!(record.converter_id.as_deref(), Some("html-strip"));
-    assert_eq!(record.rules_version, "8");
+    assert_eq!(record.rules_version, "9");
     assert_eq!(
         fs::read_to_string(setup.mirror.join("alpha/report.html.txt")).unwrap(),
         "quarterly numbers\n"

@@ -19,11 +19,14 @@
 #![cfg(all(unix, feature = "image-metadata"))]
 
 use std::fs;
+use std::io::{Cursor, Write};
 use std::path::PathBuf;
 
-use text_mirror::manifest::{self, ArtifactKind, Record, Status};
+use text_mirror::manifest::{self, ArtifactKind, ManifestWriter, Record, Status};
 use text_mirror::pipeline::{self, Rules, RunOptions};
 use text_mirror::walk::WalkOptions;
+use zip::CompressionMethod;
+use zip::write::SimpleFileOptions;
 
 struct Setup {
     _dir: tempfile::TempDir,
@@ -45,8 +48,12 @@ fn setup() -> Setup {
 }
 
 fn run(setup: &Setup) -> text_mirror::report::RunReport {
+    run_with(setup, &Rules::builtin().unwrap())
+}
+
+fn run_with(setup: &Setup, rules: &Rules) -> text_mirror::report::RunReport {
     pipeline::run(
-        &Rules::builtin().unwrap(),
+        rules,
         &RunOptions {
             root: &setup.root,
             mirror_root: &setup.mirror,
@@ -56,6 +63,48 @@ fn run(setup: &Setup) -> text_mirror::report::RunReport {
         },
     )
     .unwrap()
+}
+
+/// The builtin rules with the image formats driven through the fake
+/// OCR engine, so the primary leg succeeds with a real artifact and the
+/// composition with the metadata leg can be observed end to end.
+fn fake_ocr_rules() -> Rules {
+    let mut rules = Rules::builtin().unwrap();
+    rules.registry.use_fake_image_ocr();
+    rules
+}
+
+/// Rewrites the manifest shard through a transform, so a test can stand
+/// in a prior run's records without the run that produced them.
+fn rewrite_shard(setup: &Setup, transform: impl FnOnce(Vec<Record>) -> Vec<Record>) {
+    let path = setup.manifest_dir.join("alpha.jsonl");
+    let records = transform(manifest::read_shard(&path).unwrap().records);
+    fs::remove_file(&path).unwrap();
+    let mut writer = ManifestWriter::open(&path).unwrap();
+    for record in &records {
+        writer.append(record).unwrap();
+    }
+}
+
+/// Removes a child's artifact and segments sidecar from the mirror.
+fn remove_child_artifact(setup: &Setup, source_path: &str) {
+    fs::remove_file(setup.mirror.join(format!("alpha/{source_path}.txt"))).unwrap();
+    fs::remove_file(
+        setup
+            .mirror
+            .join(format!("alpha/{source_path}.segments.jsonl")),
+    )
+    .unwrap();
+}
+
+fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    for (name, bytes) in entries {
+        writer.start_file(*name, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
 }
 
 fn records(setup: &Setup) -> Vec<Record> {
@@ -155,10 +204,47 @@ fn a_metadata_bearing_image_yields_a_hidden_converted_child() {
 
 #[test]
 fn the_pixel_purity_tripwire_holds_through_the_pipeline() {
-    // A metadata-bearing image: the metadata sentinel lands in the child
-    // and the OCR primary leg produces no artifact for it to leak into.
-    // The two legs are independent: the primary fails closed for want of
-    // a wired runtime while the child converts.
+    // The composition through the pipeline against a working OCR
+    // engine: the primary succeeds with a real artifact, and the
+    // metadata sentinel appears only in the child while the OCR
+    // recognition appears only in the primary. Neither leg carries the
+    // other's content once the pipeline has assembled both records.
+    let setup = setup();
+    let sentinel = "METADATA ONLY SENTINEL";
+    fs::write(
+        setup.root.join("photo.png"),
+        png_with_xmp(&xmp_description(sentinel)),
+    )
+    .unwrap();
+
+    run_with(&setup, &fake_ocr_rules());
+
+    let primary = terminal(&setup, "photo.png").expect("primary image record");
+    assert_eq!(primary.status, Status::Converted);
+    assert_eq!(primary.converter_id.as_deref(), Some("image-pixel-ocr"));
+    assert_eq!(primary.artifact_kind, Some(ArtifactKind::Ocr));
+    let ocr_text = artifact(&setup, "photo.png");
+    assert!(
+        !ocr_text.contains(sentinel),
+        "metadata leaked into the primary artifact: {ocr_text}"
+    );
+
+    let child = terminal(&setup, "photo.png.d/#image-metadata").expect("metadata child");
+    assert_eq!(child.status, Status::Converted);
+    let child_text = artifact(&setup, "photo.png.d/#image-metadata");
+    assert!(child_text.contains(sentinel), "{child_text}");
+    let recognition = ocr_text.lines().next().unwrap_or_default();
+    assert!(
+        !recognition.is_empty() && !child_text.contains(recognition),
+        "ocr recognition leaked into the metadata child: {child_text}"
+    );
+}
+
+#[test]
+fn a_failed_primary_never_touches_the_child() {
+    // Through the builtin registry the production OCR mode fails closed
+    // for want of a wired runtime. The metadata child still converts,
+    // so the two legs are independent in the failure direction too.
     let setup = setup();
     fs::write(
         setup.root.join("photo.png"),
@@ -179,7 +265,6 @@ fn the_pixel_purity_tripwire_holds_through_the_pipeline() {
         "{:?}",
         primary.error
     );
-    // No OCR artifact exists, so the sentinel cannot appear in one.
     assert!(!setup.mirror.join("alpha/photo.png.txt").exists());
 
     let child = terminal(&setup, "photo.png.d/#image-metadata").expect("metadata child");
@@ -358,4 +443,280 @@ fn a_re_run_retires_a_prior_metadata_child_that_no_longer_applies() {
             .join("alpha/changing.png.d/#image-metadata.txt")
             .exists()
     );
+}
+
+#[test]
+fn an_over_ceiling_image_source_fails_the_primary_and_mints_no_child() {
+    // A sparse file over the source ceiling, wearing png magic. It is
+    // refused on size before anything reads its body: one failed
+    // primary with the resource-limit reason, and no metadata child.
+    let setup = setup();
+    let path = setup.root.join("huge.png");
+    let mut file = fs::File::create(&path).unwrap();
+    file.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+    file.set_len(text_mirror::convert::MAX_SOURCE_BYTES + 1)
+        .unwrap();
+    drop(file);
+
+    let report = run(&setup);
+
+    let primary = terminal(&setup, "huge.png").expect("primary record");
+    assert_eq!(primary.status, Status::Failed);
+    assert!(
+        primary
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("resource_limit")),
+        "{:?}",
+        primary.error
+    );
+    assert_eq!(report.counts.failed, 1);
+    assert!(terminal(&setup, "huge.png.d/#image-metadata").is_none());
+    assert!(
+        !setup
+            .mirror
+            .join("alpha/huge.png.d/#image-metadata.txt")
+            .exists()
+    );
+}
+
+#[test]
+fn a_literal_member_before_the_image_occupies_the_child_path() {
+    // The archive names a real member exactly where the image's
+    // metadata child would go, and that member comes first. The image
+    // records the namespace-occupied warning and no synthetic child is
+    // written, so the real member is neither overwritten nor relabeled.
+    let setup = setup();
+    let bytes = stored_zip(&[
+        ("photo.png.d/#image-metadata", b"a literal member"),
+        (
+            "photo.png",
+            &png_with_xmp(&xmp_description("must not be written")),
+        ),
+    ]);
+    fs::write(setup.root.join("bundle.zip"), bytes).unwrap();
+
+    run(&setup);
+
+    // The record at the child path is the literal member's own, routed
+    // by its own detection (extensionless, so unsupported), never the
+    // metadata converter's.
+    let occupant = terminal(&setup, "bundle.zip.d/photo.png.d/#image-metadata")
+        .expect("the literal member record");
+    assert_eq!(occupant.status, Status::Unsupported);
+    assert_ne!(occupant.converter_id.as_deref(), Some("image-metadata"));
+    assert_eq!(occupant.parent_source.as_deref(), Some("bundle.zip"));
+    assert!(
+        !setup
+            .mirror
+            .join("alpha/bundle.zip.d/photo.png.d/#image-metadata.txt")
+            .exists()
+    );
+
+    let image = terminal(&setup, "bundle.zip.d/photo.png").expect("image member record");
+    assert!(
+        image
+            .warnings
+            .iter()
+            .any(|w| w == "image-metadata-namespace-occupied"),
+        "{:?}",
+        image.warnings
+    );
+    assert!(terminal(&setup, "bundle.zip.d/#collision-1").is_none());
+}
+
+#[test]
+fn a_literal_member_after_the_image_is_the_collision() {
+    // The image comes first and mints its child; the later real member
+    // at the child path is refused as a member-path collision, so the
+    // metadata child is neither overwritten nor silently dropped.
+    let setup = setup();
+    let bytes = stored_zip(&[
+        (
+            "photo.png",
+            &png_with_xmp(&xmp_description("kept sentinel")),
+        ),
+        ("photo.png.d/#image-metadata", b"a literal member"),
+    ]);
+    fs::write(setup.root.join("bundle.zip"), bytes).unwrap();
+
+    run(&setup);
+
+    let child = terminal(&setup, "bundle.zip.d/photo.png.d/#image-metadata")
+        .expect("the metadata child record");
+    assert_eq!(child.status, Status::Converted);
+    assert_eq!(child.converter_id.as_deref(), Some("image-metadata"));
+    let text = artifact(&setup, "bundle.zip.d/photo.png.d/#image-metadata");
+    assert!(text.contains("kept sentinel"), "{text}");
+
+    let refused = terminal(&setup, "bundle.zip.d/#collision-1").expect("collision record");
+    assert_eq!(refused.status, Status::Failed);
+    assert_eq!(refused.error.as_deref(), Some("member-path-collision"));
+}
+
+#[test]
+fn a_prior_record_from_the_previous_rules_generation_is_not_skipped() {
+    // A primary record written under the previous rules generation,
+    // before the metadata leg existed: same bytes, same converter
+    // version, an intact artifact, and no child. The rules bump makes it
+    // a checkpoint miss, so the image re-runs and the child is minted.
+    let setup = setup();
+    fs::write(
+        setup.root.join("old.png"),
+        png_with_xmp(&xmp_description("minted on upgrade")),
+    )
+    .unwrap();
+    let rules = fake_ocr_rules();
+    run_with(&setup, &rules);
+    assert!(terminal(&setup, "old.png.d/#image-metadata").is_some());
+
+    remove_child_artifact(&setup, "old.png.d/#image-metadata");
+    rewrite_shard(&setup, |records| {
+        records
+            .into_iter()
+            .filter(|r| r.source_path == "old.png")
+            .map(|mut r| {
+                r.rules_version = "8".to_string();
+                r
+            })
+            .collect()
+    });
+
+    let report = run_with(&setup, &rules);
+    assert_eq!(report.counts.skipped_unchanged, 0);
+    let primary = terminal(&setup, "old.png").unwrap();
+    assert_eq!(primary.status, Status::Converted);
+    assert_eq!(primary.rules_version, "9");
+    let child = terminal(&setup, "old.png.d/#image-metadata").expect("minted child");
+    assert_eq!(child.status, Status::Converted);
+    assert!(artifact(&setup, "old.png.d/#image-metadata").contains("minted on upgrade"));
+}
+
+#[test]
+fn an_identical_image_borrows_its_primary_and_still_gets_a_child() {
+    // Two byte-identical images: the second borrows the first's OCR
+    // artifact as a dedup record, and its own metadata child is still
+    // written under its own path.
+    let setup = setup();
+    let bytes = png_with_xmp(&xmp_description("shared sentinel"));
+    fs::write(setup.root.join("a.png"), &bytes).unwrap();
+    fs::write(setup.root.join("b.png"), &bytes).unwrap();
+
+    let report = run_with(&setup, &fake_ocr_rules());
+
+    assert_eq!(report.counts.dedup, 1);
+    let second = terminal(&setup, "b.png").unwrap();
+    assert_eq!(second.status, Status::Dedup);
+    assert_eq!(second.dedup_of.as_deref(), Some("a.png"));
+    for image in ["a.png", "b.png"] {
+        let path = format!("{image}.d/#image-metadata");
+        let child = terminal(&setup, &path).unwrap_or_else(|| panic!("{path}"));
+        assert_eq!(child.status, Status::Converted);
+        assert_eq!(child.parent_source.as_deref(), Some(image));
+        assert!(artifact(&setup, &path).contains("shared sentinel"));
+    }
+}
+
+#[test]
+fn a_missing_child_artifact_re_runs_the_image() {
+    // The primary artifact is intact but the metadata child's artifact
+    // is gone. The checkpoint validates the image's descendants the way
+    // it validates a container's, so the image is not skipped and the
+    // child is written again rather than left pointing at nothing.
+    let setup = setup();
+    fs::write(
+        setup.root.join("shot.png"),
+        png_with_xmp(&xmp_description("restored sentinel")),
+    )
+    .unwrap();
+    let rules = fake_ocr_rules();
+    run_with(&setup, &rules);
+    remove_child_artifact(&setup, "shot.png.d/#image-metadata");
+
+    let report = run_with(&setup, &rules);
+
+    assert_eq!(report.counts.skipped_unchanged, 0);
+    assert_eq!(
+        terminal(&setup, "shot.png").unwrap().status,
+        Status::Converted
+    );
+    let child = terminal(&setup, "shot.png.d/#image-metadata").unwrap();
+    assert_eq!(child.status, Status::Converted);
+    assert!(artifact(&setup, "shot.png.d/#image-metadata").contains("restored sentinel"));
+}
+
+#[test]
+fn a_skipped_member_image_keeps_its_child_when_the_container_re_expands() {
+    // The container changes, so it re-expands, but the image member is
+    // unchanged with an intact primary and child, so it skips. The
+    // skip must carry the prior child forward as emitted, or the
+    // owner's reconciliation would retire it as a removed member.
+    let setup = setup();
+    let image = png_with_xmp(&xmp_description("carried forward"));
+    let first = stored_zip(&[("photo.png", &image), ("note.txt", b"one\n")]);
+    fs::write(setup.root.join("bundle.zip"), first).unwrap();
+    let rules = fake_ocr_rules();
+    run_with(&setup, &rules);
+    let child_path = "bundle.zip.d/photo.png.d/#image-metadata";
+    assert_eq!(
+        terminal(&setup, child_path).unwrap().status,
+        Status::Converted
+    );
+
+    let second = stored_zip(&[
+        ("photo.png", &image),
+        ("note.txt", b"one\n"),
+        ("extra.txt", b"two\n"),
+    ]);
+    fs::write(setup.root.join("bundle.zip"), second).unwrap();
+    run_with(&setup, &rules);
+
+    let member = terminal(&setup, "bundle.zip.d/photo.png").unwrap();
+    assert_eq!(member.status, Status::SkippedUnchanged);
+    let child = terminal(&setup, child_path).unwrap();
+    assert_eq!(child.status, Status::Converted, "{:?}", child.error);
+    assert!(artifact(&setup, child_path).contains("carried forward"));
+}
+
+#[test]
+fn a_prior_record_from_a_build_without_the_converter_is_not_skipped() {
+    // A primary record whose warnings say the metadata leg never ran,
+    // as a build without the converter writes it. Once the converter is
+    // present that record is not skippable even with an intact artifact
+    // and a matching key, so the child is minted.
+    let setup = setup();
+    fs::write(
+        setup.root.join("later.png"),
+        png_with_xmp(&xmp_description("minted once built")),
+    )
+    .unwrap();
+    let rules = fake_ocr_rules();
+    run_with(&setup, &rules);
+
+    remove_child_artifact(&setup, "later.png.d/#image-metadata");
+    rewrite_shard(&setup, |records| {
+        records
+            .into_iter()
+            .filter(|r| r.source_path == "later.png")
+            .map(|mut r| {
+                r.warnings.push("image-metadata-not-built".to_string());
+                r
+            })
+            .collect()
+    });
+
+    let report = run_with(&setup, &rules);
+    assert_eq!(report.counts.skipped_unchanged, 0);
+    let primary = terminal(&setup, "later.png").unwrap();
+    assert_eq!(primary.status, Status::Converted);
+    assert!(
+        !primary
+            .warnings
+            .iter()
+            .any(|w| w == "image-metadata-not-built"),
+        "{:?}",
+        primary.warnings
+    );
+    let child = terminal(&setup, "later.png.d/#image-metadata").expect("minted child");
+    assert_eq!(child.status, Status::Converted);
 }

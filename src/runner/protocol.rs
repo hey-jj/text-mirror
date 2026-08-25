@@ -421,15 +421,15 @@ pub mod bodies {
     pub struct ImageMetadataRequest {
         /// Input file name inside the jail.
         pub input: String,
-        /// The detected carrier format: `png`, `jpeg`, `webp`, `heic`,
-        /// or `svg`.
+        /// The detected carrier format: `png`, `jpeg`, `webp`, or
+        /// `heic`.
         pub format: String,
         /// Ceiling on the inflated size of any single compressed text
         /// block, checked incrementally during inflation.
         pub max_decompressed_bytes: u64,
-        /// Ceiling on the nesting depth of an xmp or svg parse.
+        /// Ceiling on the nesting depth of an xmp parse.
         pub max_xml_depth: u32,
-        /// Ceiling on the event count of an xmp or svg parse.
+        /// Ceiling on the event count of an xmp parse.
         pub max_xml_events: u64,
         /// Ceiling on the box count walked in an iso base media file
         /// format carrier.
@@ -456,7 +456,7 @@ pub mod bodies {
         /// `xmp-dc-description`, or `iptc-2-120-caption`.
         pub surface: String,
         /// The addressing detail, such as the exif tag number, the xmp
-        /// property path, the iptc dataset, or the svg element path.
+        /// property path, or the iptc dataset.
         pub path: String,
         /// The language tag when the surface carries one, such as an
         /// `iTXt` language tag or an xmp `xml:lang`.

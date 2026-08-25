@@ -44,15 +44,24 @@ pub const IMAGE_METADATA_NOT_APPLICABLE: &str = "image-metadata-not-applicable";
 /// leg is skipped rather than overwriting a real source's artifact.
 pub const IMAGE_METADATA_NAMESPACE_OCCUPIED: &str = "image-metadata-namespace-occupied";
 
-/// Whether the metadata derived-child leg applies to a detected format.
+/// The warning recorded on an image's parent record when the build
+/// carries no image-metadata converter, so the metadata leg did not run.
+/// The checkpoint treats a prior record carrying it as non-skippable once
+/// a build with the converter runs, so the child is minted on the first
+/// build that can produce it.
+pub const IMAGE_METADATA_NOT_BUILT: &str = "image-metadata-not-built";
+
+/// Whether the metadata derived-child leg runs for a detected format.
 ///
-/// The leg attaches to the raster and vector image carriers whose
-/// textual metadata the worker can lift: the three the pixel-OCR
-/// converter claims, plus the vector and modern-container carriers that
-/// have their own metadata surfaces. It is auxiliary and never a format
-/// claim, so it does not compete with a primary converter.
+/// The leg covers the raster image carriers whose textual metadata
+/// the worker can lift: the three the pixel-OCR converter claims, plus
+/// the modern-container carrier that has its own metadata surfaces. A
+/// vector image's metadata is already carried verbatim by its raw-text
+/// primary artifact, so the leg does not apply to it. The leg is
+/// auxiliary and never a format claim, so it does not compete with a
+/// primary converter.
 pub fn image_metadata_applies(format: &str) -> bool {
-    matches!(format, "png" | "jpeg" | "webp" | "heic" | "svg")
+    matches!(format, "png" | "jpeg" | "webp" | "heic")
 }
 
 #[cfg(all(unix, feature = "image-metadata"))]
@@ -172,7 +181,7 @@ mod render {
 
         #[test]
         fn a_backslash_or_quote_in_a_value_is_escaped() {
-            let rows = vec![row("svg", "svg-title", "/svg/title", "a\\b\"c")];
+            let rows = vec![row("png-itxt-xmp", "xmp-dc-title", "dc:title", "a\\b\"c")];
             let (text, segments) = render_rows(&rows);
             assert!(text.contains("a\\\\b\\\"c"));
             crate::segments::validate(&segments, &text).unwrap();
@@ -196,9 +205,9 @@ pub(crate) mod extract {
     pub struct Ceilings {
         /// Inflated-size ceiling for any single compressed text block.
         pub max_decompressed_bytes: u64,
-        /// Nesting-depth ceiling for an xmp or svg parse.
+        /// Nesting-depth ceiling for an xmp parse.
         pub max_xml_depth: u32,
-        /// Event-count ceiling for an xmp or svg parse.
+        /// Event-count ceiling for an xmp parse.
         pub max_xml_events: u64,
         /// Box-count ceiling for an iso base media file format carrier.
         pub max_boxes: u64,
@@ -313,7 +322,6 @@ pub(crate) mod extract {
             "jpeg" => jpeg::collect(&bytes, &mut collector, ceilings)?,
             "webp" => webp::collect(&bytes, &mut collector, ceilings)?,
             "heic" => heic::collect(&bytes, &mut collector, ceilings)?,
-            "svg" => svg::collect(&bytes, &mut collector, ceilings)?,
             other => {
                 return Err(MetadataError::new(
                     "image-metadata-unsupported",
@@ -391,8 +399,17 @@ pub(crate) mod extract {
             ceilings: &Ceilings,
         ) -> Result<(), MetadataError> {
             let decoder = ::png::Decoder::new(Cursor::new(bytes));
-            let reader = decoder
+            let mut reader = decoder
                 .read_info()
+                .map_err(|e| MetadataError::malformed(format!("unreadable png: {e}")))?;
+            // `read_info` stops at the first IDAT, and a text chunk may
+            // legitimately sit between the last IDAT and IEND. Drive the
+            // reader to the end of the stream so every text chunk is
+            // collected; the pixel data is discarded, not decoded into an
+            // image, and a stream that cannot be walked to IEND is a
+            // malformed carrier rather than a silently shortened one.
+            reader
+                .finish()
                 .map_err(|e| MetadataError::malformed(format!("unreadable png: {e}")))?;
             let info = reader.info();
 
@@ -504,8 +521,8 @@ pub(crate) mod extract {
             match xmp_segments.len() {
                 0 => {}
                 1 => {
-                    let text = String::from_utf8_lossy(xmp_segments[0]).into_owned();
-                    super::xmp::collect(&text, "jpeg-app1-xmp", collector, ceilings)?;
+                    let text = utf8_or_malformed(xmp_segments[0], "jpeg xmp packet")?;
+                    super::xmp::collect(text, "jpeg-app1-xmp", collector, ceilings)?;
                 }
                 _ => {
                     return Err(MetadataError::malformed(
@@ -544,15 +561,15 @@ pub(crate) mod extract {
                 if chunk.id() == CHUNK_EXIF {
                     collect_exif(data, collector)?;
                 } else if chunk.id() == CHUNK_XMP {
-                    let text = String::from_utf8_lossy(data).into_owned();
-                    super::xmp::collect(&text, "webp-xmp", collector, ceilings)?;
+                    let text = utf8_or_malformed(data, "webp xmp chunk")?;
+                    super::xmp::collect(text, "webp-xmp", collector, ceilings)?;
                 }
             }
             Ok(())
         }
     }
 
-    // --- xmp and svg, via quick-xml -----------------------------------
+    // --- xmp, via quick-xml -------------------------------------------
 
     mod xmp {
         use super::*;
@@ -586,9 +603,11 @@ pub(crate) mod extract {
             let mut depth: u32 = 0;
             let mut events: u64 = 0;
             // The currently open scored property, if any: its surface,
-            // path, the text runs collected, and any language seen.
-            let mut active: Option<(&'static str, &'static str, Vec<String>, Option<String>)> =
-                None;
+            // path, the text runs collected, any language seen, and the
+            // depth its start tag opened at, so only the end tag at that
+            // depth closes it and a nested list item never closes it
+            // early.
+            let mut active: Option<Active> = None;
             loop {
                 events += 1;
                 if events > ceilings.max_xml_events {
@@ -613,12 +632,21 @@ pub(crate) mod extract {
                         if active.is_none()
                             && let Some((surface, path)) = property(start.local_name().as_ref())
                         {
-                            active = Some((surface, path, Vec::new(), None));
-                        } else if let Some((_, _, _, language)) = active.as_mut() {
-                            // A language tag on an alternative or list item
-                            // inside the open property.
-                            if let Some(found) = attribute_language(&start) {
-                                *language = Some(found);
+                            active = Some(Active {
+                                surface,
+                                path,
+                                runs: Vec::new(),
+                                current: String::new(),
+                                language: None,
+                                depth,
+                            });
+                        } else if let Some(open) = active.as_mut() {
+                            // A nested alternative or list item: the text
+                            // so far is one run, and a language tag on the
+                            // item applies to the property.
+                            open.flush();
+                            if let Some(found) = attribute_language(&start)? {
+                                open.language = Some(found);
                             }
                         }
                     }
@@ -626,32 +654,105 @@ pub(crate) mod extract {
                         collect_attribute_properties(&start, carrier, collector)?;
                     }
                     Event::Text(text) => {
-                        if let Some((_, _, runs, _)) = active.as_mut() {
+                        if let Some(open) = active.as_mut() {
                             let decoded = text
                                 .decode()
                                 .map_err(|e| MetadataError::malformed(format!("bad text: {e}")))?;
-                            let unescaped = quick_xml::escape::unescape(&decoded)
-                                .map(|c| c.into_owned())
-                                .unwrap_or_else(|_| decoded.into_owned());
-                            let trimmed = unescaped.trim();
-                            if !trimmed.is_empty() {
-                                runs.push(trimmed.to_string());
-                            }
+                            open.current.push_str(&unescape_or_malformed(&decoded)?);
+                        }
+                    }
+                    Event::GeneralRef(reference) => {
+                        // The reader tokenizes `&name;` and `&#n;` out of
+                        // text as their own events. A character reference
+                        // or a predefined entity resolves to text; any
+                        // other reference is undefined here and fails the
+                        // child rather than leaking the raw reference.
+                        let resolved = resolve_reference(&reference)?;
+                        if let Some(open) = active.as_mut() {
+                            open.current.push_str(&resolved);
                         }
                     }
                     Event::End(_) => {
-                        depth = depth.saturating_sub(1);
-                        if let Some((surface, path, runs, language)) = active.take()
-                            && !runs.is_empty()
-                        {
-                            collector.push(carrier, surface, path, language, runs.join("; "))?;
+                        // Only the end tag at the depth the property
+                        // opened at closes it; an inner end tag belongs to
+                        // a nested alternative or list item.
+                        if let Some(open) = active.as_mut() {
+                            open.flush();
                         }
+                        if active.as_ref().is_some_and(|open| open.depth == depth)
+                            && let Some(open) = active.take()
+                            && !open.runs.is_empty()
+                        {
+                            collector.push(
+                                carrier,
+                                open.surface,
+                                open.path,
+                                open.language,
+                                open.runs.join("; "),
+                            )?;
+                        }
+                        depth = depth.saturating_sub(1);
                     }
                     Event::Eof => break,
                     _ => {}
                 }
             }
             Ok(())
+        }
+
+        /// One open scored property.
+        struct Active {
+            surface: &'static str,
+            path: &'static str,
+            /// The completed text runs, one per alternative or list item.
+            runs: Vec<String>,
+            /// The text of the run in progress, across text and reference
+            /// events.
+            current: String,
+            language: Option<String>,
+            /// The nesting depth at which the property's start tag was
+            /// seen, so its own end tag is the one that closes it.
+            depth: u32,
+        }
+
+        impl Active {
+            /// Closes the run in progress, keeping it when it holds text.
+            fn flush(&mut self) {
+                let trimmed = self.current.trim();
+                if !trimmed.is_empty() {
+                    self.runs.push(trimmed.to_string());
+                }
+                self.current.clear();
+            }
+        }
+
+        /// Resolves one tokenized reference to its text: a character
+        /// reference by code point, a predefined entity by name. Anything
+        /// else is undefined in an xmp packet and fails the child.
+        fn resolve_reference(
+            reference: &quick_xml::events::BytesRef<'_>,
+        ) -> Result<String, MetadataError> {
+            if let Some(c) = reference
+                .resolve_char_ref()
+                .map_err(|e| MetadataError::malformed(format!("bad character reference: {e}")))?
+            {
+                return Ok(c.to_string());
+            }
+            let name = reference
+                .decode()
+                .map_err(|e| MetadataError::malformed(format!("bad reference: {e}")))?;
+            quick_xml::escape::resolve_predefined_entity(&name)
+                .map(str::to_string)
+                .ok_or_else(|| MetadataError::malformed(format!("undefined entity &{name};")))
+        }
+
+        /// Unescapes xml character and entity references strictly: an
+        /// undefined entity or a malformed reference fails the child
+        /// instead of leaking the raw reference text into a row.
+        fn unescape_or_malformed(raw: &str) -> Result<String, MetadataError> {
+            quick_xml::escape::unescape(raw)
+                .map(|c| c.into_owned())
+                .map_err(|e| MetadataError::malformed(format!("bad xml reference: {e}")))
         }
 
         /// The compact xmp form carries properties as attributes on
@@ -667,105 +768,28 @@ pub(crate) mod extract {
                     .map_err(|e| MetadataError::malformed(format!("bad attribute: {e}")))?;
                 let local = local_name(attribute.key.as_ref());
                 if let Some((surface, path)) = property(local) {
-                    let raw = String::from_utf8_lossy(&attribute.value);
-                    let value = quick_xml::escape::unescape(&raw)
-                        .map(|c| c.into_owned())
-                        .unwrap_or_else(|_| raw.into_owned());
+                    let raw = utf8_or_malformed(&attribute.value, "xmp attribute")?;
+                    let value = unescape_or_malformed(raw)?;
                     collector.push(carrier, surface, path, None, value)?;
                 }
             }
             Ok(())
         }
 
-        /// The `xml:lang` attribute value on an element, if present.
-        fn attribute_language(start: &quick_xml::events::BytesStart<'_>) -> Option<String> {
-            for attribute in start.attributes().flatten() {
+        /// The `xml:lang` attribute value on an element, if present. A
+        /// malformed attribute list fails the child.
+        fn attribute_language(
+            start: &quick_xml::events::BytesStart<'_>,
+        ) -> Result<Option<String>, MetadataError> {
+            for attribute in start.attributes() {
+                let attribute = attribute
+                    .map_err(|e| MetadataError::malformed(format!("bad attribute: {e}")))?;
                 if attribute.key.as_ref() == b"xml:lang" {
-                    return Some(String::from_utf8_lossy(&attribute.value).into_owned());
+                    let raw = utf8_or_malformed(&attribute.value, "xml:lang attribute")?;
+                    return Ok(Some(raw.to_string()));
                 }
             }
-            None
-        }
-    }
-
-    mod svg {
-        use super::*;
-        use quick_xml::Reader;
-        use quick_xml::events::Event;
-
-        fn element(local: &[u8]) -> Option<(&'static str, &'static str)> {
-            match local {
-                b"metadata" => Some(("svg-metadata", "/svg/metadata")),
-                b"title" => Some(("svg-title", "/svg/title")),
-                b"desc" => Some(("svg-desc", "/svg/desc")),
-                _ => None,
-            }
-        }
-
-        pub(super) fn collect(
-            bytes: &[u8],
-            collector: &mut Collector,
-            ceilings: &Ceilings,
-        ) -> Result<(), MetadataError> {
-            let xml = std::str::from_utf8(bytes)
-                .map_err(|e| MetadataError::malformed(format!("svg is not utf-8: {e}")))?;
-            let mut reader = Reader::from_str(xml);
-            let mut depth: u32 = 0;
-            let mut events: u64 = 0;
-            let mut active: Option<(&'static str, &'static str, Vec<String>)> = None;
-            loop {
-                events += 1;
-                if events > ceilings.max_xml_events {
-                    return Err(MetadataError::new(
-                        "image-metadata-xml-exceeded",
-                        "svg event count over the ceiling",
-                    ));
-                }
-                let event = reader
-                    .read_event()
-                    .map_err(|e| MetadataError::malformed(format!("malformed svg: {e}")))?;
-                match event {
-                    Event::Start(start) => {
-                        depth += 1;
-                        if depth > ceilings.max_xml_depth {
-                            return Err(MetadataError::new(
-                                "image-metadata-xml-exceeded",
-                                "svg nesting over the depth ceiling",
-                            ));
-                        }
-                        if active.is_none()
-                            && let Some((surface, path)) = element(start.local_name().as_ref())
-                        {
-                            active = Some((surface, path, Vec::new()));
-                        }
-                    }
-                    Event::Text(text) => {
-                        if let Some((_, _, runs)) = active.as_mut() {
-                            let decoded = text
-                                .decode()
-                                .map_err(|e| MetadataError::malformed(format!("bad text: {e}")))?;
-                            let unescaped = quick_xml::escape::unescape(&decoded)
-                                .map(|c| c.into_owned())
-                                .unwrap_or_else(|_| decoded.into_owned());
-                            let trimmed = unescaped.trim();
-                            if !trimmed.is_empty() {
-                                runs.push(trimmed.to_string());
-                            }
-                        }
-                    }
-                    Event::End(_) => {
-                        depth = depth.saturating_sub(1);
-                        if let Some((surface, path, runs)) = active.take()
-                            && !runs.is_empty()
-                        {
-                            collector.push("svg", surface, path, None, runs.join(" "))?;
-                        }
-                    }
-                    Event::Eof => break,
-                    _ => {}
-                }
-            }
-            Ok(())
+            Ok(None)
         }
     }
 
@@ -802,9 +826,12 @@ pub(crate) mod extract {
             let irb = &app13[start..];
             let mut pos = 0usize;
             let mut blocks: u64 = 0;
-            while pos + 4 <= irb.len() {
-                if &irb[pos..pos + 4] != b"8BIM" {
-                    break;
+            while pos < irb.len() {
+                // Every block begins with the marker. A tail that is not
+                // a block, whether a short leftover or foreign bytes, is
+                // a malformed resource walk, never a silent stop.
+                if irb.get(pos..pos + 4) != Some(b"8BIM") {
+                    return Err(MetadataError::malformed("bad image resource block marker"));
                 }
                 pos += 4;
                 blocks += 1;
@@ -826,7 +853,7 @@ pub(crate) mod extract {
                     .checked_add(name_len)
                     .ok_or_else(|| MetadataError::malformed("resource name overruns"))?;
                 if (1 + name_len) % 2 == 1 {
-                    pos += 1;
+                    pos = pad_byte(irb, pos, "resource name")?;
                 }
                 let data_len = read_u32(irb, &mut pos)? as usize;
                 let end = pos
@@ -840,10 +867,20 @@ pub(crate) mod extract {
                 }
                 pos = end;
                 if data_len % 2 == 1 {
-                    pos += 1;
+                    pos = pad_byte(irb, pos, "resource data")?;
                 }
             }
             Ok(())
+        }
+
+        /// Steps over the pad byte an odd-length field requires. The
+        /// byte must exist: a block that ends where its pad should be is
+        /// truncated, and a truncated block fails the child.
+        fn pad_byte(irb: &[u8], pos: usize, what: &str) -> Result<usize, MetadataError> {
+            if pos >= irb.len() {
+                return Err(MetadataError::malformed(format!("missing {what} pad byte")));
+            }
+            Ok(pos + 1)
         }
 
         /// Walks the flat iim dataset sequence: each dataset is a `0x1C`
@@ -981,7 +1018,11 @@ pub(crate) mod extract {
             visit: &mut dyn FnMut(&BoxHeader) -> Result<(), MetadataError>,
         ) -> Result<(), MetadataError> {
             let mut pos = start;
-            while pos + 8 <= end {
+            while pos < end {
+                // `read_box` fails a header that does not fit, so a
+                // short tail after the last whole box is malformed rather
+                // than a clean stop: the walk ends exactly at `end` or
+                // not at all.
                 let header = read_box(data, pos, end)?;
                 *count += 1;
                 if *count > ceilings.max_boxes {
@@ -992,6 +1033,11 @@ pub(crate) mod extract {
                 }
                 visit(&header)?;
                 pos = header.next;
+            }
+            if pos != end {
+                return Err(MetadataError::malformed(
+                    "box walk does not end at its parent",
+                ));
             }
             Ok(())
         }
@@ -1019,8 +1065,8 @@ pub(crate) mod extract {
             })?;
 
             for (s, e) in &xmp_packets {
-                let text = String::from_utf8_lossy(&bytes[*s..*e]).into_owned();
-                super::xmp::collect(&text, "heic-uuid", collector, ceilings)?;
+                let text = utf8_or_malformed(&bytes[*s..*e], "heic xmp box")?;
+                super::xmp::collect(text, "heic-uuid", collector, ceilings)?;
             }
 
             if let Some((meta_start, meta_end)) = meta_range {
@@ -1065,8 +1111,8 @@ pub(crate) mod extract {
             })?;
 
             for (s, e) in &nested_xmp {
-                let text = String::from_utf8_lossy(&data[*s..*e]).into_owned();
-                super::xmp::collect(&text, "heic-uuid", collector, ceilings)?;
+                let text = utf8_or_malformed(&data[*s..*e], "heic xmp box")?;
+                super::xmp::collect(text, "heic-uuid", collector, ceilings)?;
             }
 
             let (Some(iinf), Some(iloc)) = (iinf, iloc) else {
@@ -1074,11 +1120,16 @@ pub(crate) mod extract {
             };
             let types = parse_iinf(data, iinf.0, iinf.1, count, ceilings)?;
             let locations = parse_iloc(data, iloc.0, iloc.1)?;
+            // A reconstructed item can never legitimately exceed the
+            // carrier it is cut from, and it must fit the output ceiling
+            // to be rendered at all, so the smaller of the two bounds the
+            // extents an addressing table may repeat or overlap.
+            let budget = (data.len() as u64).min(ceilings.max_output_bytes);
             for (item_id, item_type) in &types {
                 let Some(location) = locations.iter().find(|l| l.item_id == *item_id) else {
                     continue;
                 };
-                let item = resolve_item(data, location, idat)?;
+                let item = resolve_item(data, location, idat, budget)?;
                 match item_type.as_slice() {
                     b"Exif" => {
                         // The exif item payload begins with a four-byte
@@ -1096,9 +1147,13 @@ pub(crate) mod extract {
                         }
                     }
                     b"mime" => {
-                        let text = String::from_utf8_lossy(&item).into_owned();
-                        if text.contains('<') {
-                            super::xmp::collect(&text, "heic-mime", collector, ceilings)?;
+                        // A mime item is an xmp packet only when it is
+                        // text holding markup; any other mime payload is
+                        // not a scored surface and is left alone.
+                        if let Ok(text) = std::str::from_utf8(&item)
+                            && text.contains('<')
+                        {
+                            super::xmp::collect(text, "heic-mime", collector, ceilings)?;
                         }
                     }
                     _ => {}
@@ -1116,26 +1171,23 @@ pub(crate) mod extract {
             count: &mut u64,
             ceilings: &Ceilings,
         ) -> Result<Vec<(u32, Vec<u8>)>, MetadataError> {
-            if start + 6 > end {
-                return Err(MetadataError::malformed("truncated iinf box"));
-            }
-            let version = data[start];
-            // version(1) flags(3) then the entry count.
-            let mut pos = start + 4;
+            // version(1) flags(3) then the entry count, whose width
+            // depends on the version. Every read is checked against the
+            // box end, so a short payload fails closed instead of
+            // indexing past it.
+            let mut cursor = Cur::new(data, start, end);
+            let version = cursor.u8()?;
+            cursor.skip(3)?; // flags
             let _entry_count = if version == 0 {
-                let value = u16::from_be_bytes([data[pos], data[pos + 1]]) as u32;
-                pos += 2;
-                value
+                cursor.u16()? as u32
             } else {
-                let value =
-                    u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                pos += 4;
-                value
+                cursor.u32()?
             };
+            let pos = cursor.pos;
             let mut types = Vec::new();
             walk(data, pos, end, count, ceilings, &mut |header| {
                 if &header.kind == b"infe"
-                    && let Some(entry) = parse_infe(data, header.payload.0, header.payload.1)
+                    && let Some(entry) = parse_infe(data, header.payload.0, header.payload.1)?
                 {
                     types.push(entry);
                 }
@@ -1146,43 +1198,25 @@ pub(crate) mod extract {
 
         /// Parses one `infe` entry to its item id and item type. Only the
         /// version-2 and version-3 shapes are modeled; an older shape
-        /// yields nothing rather than a misread.
-        fn parse_infe(data: &[u8], start: usize, end: usize) -> Option<(u32, Vec<u8>)> {
-            if start + 4 > end {
-                return None;
-            }
-            let version = data[start];
-            let mut pos = start + 4;
+        /// yields nothing rather than a misread. A truncated entry of a
+        /// modeled shape is malformed and fails the child, never dropped.
+        fn parse_infe(
+            data: &[u8],
+            start: usize,
+            end: usize,
+        ) -> Result<Option<(u32, Vec<u8>)>, MetadataError> {
+            let mut cursor = Cur::new(data, start, end);
+            let version = cursor.u8()?;
+            cursor.skip(3)?; // flags
             let item_id = match version {
-                2 => {
-                    if pos + 2 > end {
-                        return None;
-                    }
-                    let id = u16::from_be_bytes([data[pos], data[pos + 1]]) as u32;
-                    pos += 2;
-                    id
-                }
-                3 => {
-                    if pos + 4 > end {
-                        return None;
-                    }
-                    let id = u32::from_be_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
-                    ]);
-                    pos += 4;
-                    id
-                }
-                _ => return None,
+                2 => cursor.u16()? as u32,
+                3 => cursor.u32()?,
+                _ => return Ok(None),
             };
             // protection index (2), then the four-byte item type.
-            pos += 2;
-            if pos + 4 > end {
-                return None;
-            }
-            Some((item_id, data[pos..pos + 4].to_vec()))
+            cursor.skip(2)?;
+            let item_type = cursor.take(4)?;
+            Ok(Some((item_id, item_type.to_vec())))
         }
 
         /// One item's storage: its construction method and byte extents.
@@ -1258,9 +1292,23 @@ pub(crate) mod extract {
             data: &[u8],
             location: &Location,
             idat: Option<(usize, usize)>,
+            budget: u64,
         ) -> Result<Vec<u8>, MetadataError> {
             let mut out = Vec::new();
+            let mut charged: u64 = 0;
             for (offset, length) in &location.extents {
+                // Charge the extent before reading it, so an addressing
+                // table that repeats or overlaps extents cannot grow the
+                // item past the carrier or the output ceiling.
+                charged = charged
+                    .checked_add(*length)
+                    .filter(|total| *total <= budget)
+                    .ok_or_else(|| {
+                        MetadataError::new(
+                            "image-metadata-limit-exceeded",
+                            "item extents over the reconstruction budget",
+                        )
+                    })?;
                 let base = location.base_offset;
                 let start = base
                     .checked_add(*offset)
@@ -1307,9 +1355,9 @@ pub(crate) mod extract {
                 let to = self
                     .pos
                     .checked_add(n)
-                    .ok_or_else(|| MetadataError::malformed("iloc read overflows"))?;
+                    .ok_or_else(|| MetadataError::malformed("box read overflows"))?;
                 if to > self.end {
-                    return Err(MetadataError::malformed("iloc read past the box"));
+                    return Err(MetadataError::malformed("box read past its end"));
                 }
                 let slice = &self.data[self.pos..to];
                 self.pos = to;
@@ -1355,6 +1403,14 @@ pub(crate) mod extract {
         }
     }
 
+    /// Decodes a text surface strictly. A packet that is not valid UTF-8
+    /// is a malformed carrier and fails the child; it is never repaired
+    /// with replacement characters into a successful row.
+    fn utf8_or_malformed<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str, MetadataError> {
+        std::str::from_utf8(bytes)
+            .map_err(|e| MetadataError::malformed(format!("{what} is not utf-8: {e}")))
+    }
+
     /// The local part of a possibly-prefixed xml name.
     fn local_name(qname: &[u8]) -> &[u8] {
         match qname.iter().rposition(|&b| b == b':') {
@@ -1390,7 +1446,7 @@ pub(crate) mod extract {
             rows.iter().find(|r| r.surface == surface)
         }
 
-        // --- png text chunks and the inflate path (build check b) -----
+        // --- png text chunks and the inflate path -----------------------
 
         fn png_with<F: FnOnce(&mut ::png::Encoder<'_, &mut Vec<u8>>)>(build: F) -> Vec<u8> {
             let mut out = Vec::new();
@@ -1450,6 +1506,82 @@ pub(crate) mod extract {
             let bytes = png_with(|e| {
                 e.add_ztxt_chunk("Comment".to_string(), big).unwrap();
             });
+            let mut tight = ceilings();
+            tight.max_decompressed_bytes = 4096;
+            let mut collector = Collector::new(&tight);
+            let error = png::collect(&bytes, &mut collector, &tight).unwrap_err();
+            assert_eq!(error.code, "image-metadata-decompress-exceeded");
+        }
+
+        /// One raw png chunk: length, type, data, crc over type and data.
+        fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            let mut crc: u32 = 0xFFFF_FFFF;
+            for byte in kind.iter().chain(data) {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            let crc = !crc;
+            let mut out = Vec::new();
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            out.extend_from_slice(&crc.to_be_bytes());
+            out
+        }
+
+        /// Inserts a raw chunk between the last IDAT and IEND, so it
+        /// sits past the point `read_info` stops at.
+        fn splice_before_iend(mut png: Vec<u8>, chunk: &[u8]) -> Vec<u8> {
+            let iend = find(&png, b"IEND").expect("IEND") - 4;
+            png.splice(iend..iend, chunk.iter().copied());
+            png
+        }
+
+        /// Cuts the first raw chunk of the given type out of a png.
+        fn raw_chunk(png: &[u8], kind: &[u8; 4]) -> Vec<u8> {
+            let at = find(png, kind).expect("chunk") - 4;
+            let len = u32::from_be_bytes([png[at], png[at + 1], png[at + 2], png[at + 3]]) as usize;
+            png[at..at + 12 + len].to_vec()
+        }
+
+        #[test]
+        fn png_itxt_after_the_last_idat_is_extracted() {
+            // An uncompressed iTXt: keyword, compression flag 0, method
+            // 0, empty language, empty translated keyword, text.
+            let mut itxt = Vec::new();
+            itxt.extend_from_slice(b"Comment\x00\x00\x00\x00\x00");
+            itxt.extend_from_slice(b"trailing caption");
+            let bytes = splice_before_iend(png_with(|_| {}), &png_chunk(b"iTXt", &itxt));
+            let mut collector = Collector::new(&ceilings());
+            png::collect(&bytes, &mut collector, &ceilings()).unwrap();
+            let rows = collector.into_rows();
+            let row = rows
+                .iter()
+                .find(|r| r.path == "Comment")
+                .expect("post-IDAT row");
+            assert_eq!(row.carrier, "png-itxt");
+            assert_eq!(row.value, "trailing caption");
+        }
+
+        #[test]
+        fn png_ztxt_bomb_after_the_last_idat_fails_closed() {
+            // The same bomb chunk, cut out of an encoder-built png and
+            // spliced past the image data, still reaches the bounded
+            // inflate and fails closed rather than being skipped.
+            let big = "A".repeat(4 * 1024 * 1024);
+            let bomb = raw_chunk(
+                &png_with(|e| {
+                    e.add_ztxt_chunk("Comment".to_string(), big).unwrap();
+                }),
+                b"zTXt",
+            );
+            let bytes = splice_before_iend(png_with(|_| {}), &bomb);
             let mut tight = ceilings();
             tight.max_decompressed_bytes = 4096;
             let mut collector = Collector::new(&tight);
@@ -1531,7 +1663,7 @@ pub(crate) mod extract {
             assert_eq!(error.code, "image-metadata-malformed");
         }
 
-        // --- xmp and svg ----------------------------------------------
+        // --- xmp ------------------------------------------------------
 
         #[test]
         fn xmp_attribute_form_is_scored() {
@@ -1564,18 +1696,95 @@ pub(crate) mod extract {
         }
 
         #[test]
-        fn svg_metadata_title_and_desc_are_scored() {
-            let svg = br#"<svg xmlns="svg"><title>the drawing</title><desc>a description</desc>
-                <metadata>the metadata block</metadata></svg>"#;
+        fn an_undefined_xml_entity_fails_closed() {
+            let xmp = r#"<rdf:RDF xmlns:rdf="rdf" xmlns:dc="dc"><rdf:Description>
+                <dc:title>&bogus;</dc:title></rdf:Description></rdf:RDF>"#;
             let mut collector = Collector::new(&ceilings());
-            svg::collect(svg, &mut collector, &ceilings()).unwrap();
+            let error =
+                xmp::collect(xmp, "jpeg-app1-xmp", &mut collector, &ceilings()).unwrap_err();
+            assert_eq!(error.code, "image-metadata-malformed");
+        }
+
+        #[test]
+        fn nested_list_items_all_reach_the_open_property() {
+            // Two rdf:li values inside one dc:description: the first
+            // inner end tag must not close the property early, so both
+            // values land in the one row.
+            let xmp = r#"<rdf:RDF xmlns:rdf="rdf" xmlns:dc="dc"><rdf:Description>
+                <dc:description><rdf:Alt>
+                <rdf:li xml:lang="x-default">first value</rdf:li>
+                <rdf:li xml:lang="fr">second value</rdf:li>
+                </rdf:Alt></dc:description></rdf:Description></rdf:RDF>"#;
+            let mut collector = Collector::new(&ceilings());
+            xmp::collect(xmp, "png-itxt-xmp", &mut collector, &ceilings()).unwrap();
             let rows = collector.into_rows();
-            assert_eq!(
-                row_for(&rows, "svg-metadata").map(|r| r.path.as_str()),
-                Some("/svg/metadata")
-            );
-            assert!(row_for(&rows, "svg-title").is_some());
-            assert!(row_for(&rows, "svg-desc").is_some());
+            let described: Vec<&MetadataRow> = rows
+                .iter()
+                .filter(|r| r.surface == "xmp-dc-description")
+                .collect();
+            assert_eq!(described.len(), 1, "{rows:?}");
+            assert_eq!(described[0].value, "first value; second value");
+        }
+
+        // --- webp -----------------------------------------------------
+
+        /// A riff webp built by hand: a VP8X header chunk followed by the
+        /// given metadata chunks, each padded to an even length.
+        fn webp_with(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(b"WEBP");
+            let mut vp8x = vec![0x28u8, 0, 0, 0]; // exif and xmp flags
+            vp8x.extend_from_slice(&[1, 0, 0, 1, 0, 0]); // 2x2 canvas
+            let mut all: Vec<(&[u8; 4], Vec<u8>)> = vec![(b"VP8X", vp8x)];
+            for (kind, data) in chunks {
+                all.push((kind, data.to_vec()));
+            }
+            for (kind, data) in &all {
+                body.extend_from_slice(*kind);
+                body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                body.extend_from_slice(data);
+                if data.len() % 2 == 1 {
+                    body.push(0);
+                }
+            }
+            let mut out = Vec::new();
+            out.extend_from_slice(b"RIFF");
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
+            out
+        }
+
+        #[test]
+        fn webp_xmp_and_exif_chunks_are_scored() {
+            use exif::{Field, In, Tag, Value};
+            let xmp = r#"<rdf:RDF xmlns:rdf="rdf" xmlns:dc="dc"><rdf:Description dc:title="webp title"/></rdf:RDF>"#;
+            let tiff = exif_tiff(vec![Field {
+                tag: Tag::ImageDescription,
+                ifd_num: In::PRIMARY,
+                value: Value::Ascii(vec![b"webp exif caption".to_vec()]),
+            }]);
+            let bytes = webp_with(&[(b"XMP ", xmp.as_bytes()), (b"EXIF", &tiff)]);
+            let mut collector = Collector::new(&ceilings());
+            webp::collect(&bytes, &mut collector, &ceilings()).unwrap();
+            let rows = collector.into_rows();
+            let title = row_for(&rows, "xmp-dc-title").expect("webp xmp row");
+            assert_eq!(title.carrier, "webp-xmp");
+            assert_eq!(title.value, "webp title");
+            let caption = row_for(&rows, "exif-imagedescription").expect("webp exif row");
+            assert_eq!(caption.carrier, "exif");
+            assert_eq!(caption.value, "webp exif caption");
+        }
+
+        #[test]
+        fn an_xmp_packet_that_is_not_utf8_fails_closed() {
+            let mut xmp =
+                br#"<rdf:RDF xmlns:rdf="rdf" xmlns:dc="dc"><rdf:Description dc:title=""#.to_vec();
+            xmp.extend_from_slice(&[0xFF, 0xFE, b'x']);
+            xmp.extend_from_slice(br#""/></rdf:RDF>"#);
+            let bytes = webp_with(&[(b"XMP ", &xmp)]);
+            let mut collector = Collector::new(&ceilings());
+            let error = webp::collect(&bytes, &mut collector, &ceilings()).unwrap_err();
+            assert_eq!(error.code, "image-metadata-malformed");
         }
 
         // --- iptc iim -------------------------------------------------
@@ -1618,6 +1827,26 @@ pub(crate) mod extract {
         }
 
         #[test]
+        fn a_missing_iptc_pad_byte_fails_closed() {
+            // An odd-length resource payload ending exactly at the end
+            // of the block: the required pad byte is absent.
+            let mut app13 = app13_with_caption("four");
+            assert_eq!(app13.pop(), Some(0), "the builder padded the odd payload");
+            let mut collector = Collector::new(&ceilings());
+            let error = iptc::collect(&app13, &mut collector, &ceilings()).unwrap_err();
+            assert_eq!(error.code, "image-metadata-malformed");
+        }
+
+        #[test]
+        fn a_foreign_tail_after_the_resource_blocks_fails_closed() {
+            let mut app13 = app13_with_caption("caption");
+            app13.extend_from_slice(b"junk");
+            let mut collector = Collector::new(&ceilings());
+            let error = iptc::collect(&app13, &mut collector, &ceilings()).unwrap_err();
+            assert_eq!(error.code, "image-metadata-malformed");
+        }
+
+        #[test]
         fn an_overrunning_iptc_length_fails_closed() {
             let mut app13 = app13_with_caption("cap");
             // Corrupt the dataset length to overrun the block.
@@ -1654,54 +1883,130 @@ pub(crate) mod extract {
             assert_eq!(row.value, "heic sentinel");
         }
 
-        #[test]
-        fn heic_exif_item_via_meta_is_scored() {
+        /// An exif item payload: the four-byte tiff offset then the tiff.
+        fn exif_item(caption: &str) -> Vec<u8> {
             use exif::{Field, In, Tag, Value};
             let tiff = exif_tiff(vec![Field {
                 tag: Tag::ImageDescription,
                 ifd_num: In::PRIMARY,
-                value: Value::Ascii(vec![b"heic exif caption".to_vec()]),
+                value: Value::Ascii(vec![caption.as_bytes().to_vec()]),
             }]);
-            // The exif item payload begins with a four-byte tiff offset.
-            let mut exif_item = vec![0u8, 0, 0, 0];
-            exif_item.extend_from_slice(&tiff);
+            let mut item = vec![0u8, 0, 0, 0];
+            item.extend_from_slice(&tiff);
+            item
+        }
 
-            // infe: version 2, item_id 1, protection 0, type "Exif".
+        /// An `infe` payload: version 2, item id 1, protection 0, type
+        /// "Exif".
+        fn exif_infe() -> Vec<u8> {
             let mut infe = vec![2u8, 0, 0, 0];
             infe.extend_from_slice(&1u16.to_be_bytes());
             infe.extend_from_slice(&0u16.to_be_bytes());
             infe.extend_from_slice(b"Exif");
+            infe
+        }
+
+        /// A heic carrier whose `meta` box holds one `infe`, an `iloc`
+        /// placing item 1 in `idat` by the given extents (construction
+        /// method 1, four-byte offset and length fields), and the `idat`.
+        fn heic_with_item(infe: &[u8], extents: &[(u32, u32)], idat: &[u8]) -> Vec<u8> {
             let mut iinf = vec![0u8, 0, 0, 0];
             iinf.extend_from_slice(&1u16.to_be_bytes());
-            let mut iinf_box = Vec::new();
-            push_box(&mut iinf_box, b"infe", &infe);
-            iinf.extend_from_slice(&iinf_box);
+            push_box(&mut iinf, b"infe", infe);
 
-            // iloc: version 1, offset/length size 4, base/index 0, one
-            // item, construction method 1 (idat), one extent at offset 0.
             let mut iloc = vec![1u8, 0, 0, 0, 0x44, 0x00];
             iloc.extend_from_slice(&1u16.to_be_bytes()); // item_count
             iloc.extend_from_slice(&1u16.to_be_bytes()); // item_id
             iloc.extend_from_slice(&1u16.to_be_bytes()); // construction method 1
             iloc.extend_from_slice(&0u16.to_be_bytes()); // data ref
-            iloc.extend_from_slice(&1u16.to_be_bytes()); // extent count
-            iloc.extend_from_slice(&0u32.to_be_bytes()); // extent offset
-            iloc.extend_from_slice(&(exif_item.len() as u32).to_be_bytes()); // extent length
+            iloc.extend_from_slice(&(extents.len() as u16).to_be_bytes());
+            for (offset, length) in extents {
+                iloc.extend_from_slice(&offset.to_be_bytes());
+                iloc.extend_from_slice(&length.to_be_bytes());
+            }
 
             let mut meta_body = vec![0u8, 0, 0, 0]; // fullbox header
             push_box(&mut meta_body, b"iinf", &iinf);
             push_box(&mut meta_body, b"iloc", &iloc);
-            push_box(&mut meta_body, b"idat", &exif_item);
+            push_box(&mut meta_body, b"idat", idat);
 
             let mut bytes = Vec::new();
             push_box(&mut bytes, b"ftyp", b"heic\x00\x00\x00\x00heic");
             push_box(&mut bytes, b"meta", &meta_body);
+            bytes
+        }
 
+        #[test]
+        fn heic_exif_item_via_meta_is_scored() {
+            let item = exif_item("heic exif caption");
+            let bytes = heic_with_item(&exif_infe(), &[(0, item.len() as u32)], &item);
             let mut collector = Collector::new(&ceilings());
             heic::collect(&bytes, &mut collector, &ceilings()).unwrap();
             let rows = collector.into_rows();
             let row = row_for(&rows, "exif-imagedescription").expect("heic exif row");
             assert_eq!(row.value, "heic exif caption");
+        }
+
+        #[test]
+        fn a_truncated_box_after_a_valid_xmp_box_fails_closed() {
+            // The earlier uuid box is valid on its own; the seven-byte
+            // tail that follows is not a box, so the whole child fails
+            // rather than emitting the earlier surface.
+            let xmp = r#"<rdf:RDF xmlns:rdf="rdf" xmlns:dc="dc"><rdf:Description dc:description="partial"/></rdf:RDF>"#;
+            let mut uuid_payload = heic::XMP_UUID.to_vec();
+            uuid_payload.extend_from_slice(xmp.as_bytes());
+            let mut bytes = Vec::new();
+            push_box(&mut bytes, b"ftyp", b"heic\x00\x00\x00\x00heic");
+            push_box(&mut bytes, b"uuid", &uuid_payload);
+            bytes.extend_from_slice(&[0, 0, 0, 16, b'f', b'r', b'e']);
+            let mut collector = Collector::new(&ceilings());
+            let error = heic::collect(&bytes, &mut collector, &ceilings()).unwrap_err();
+            assert_eq!(error.code, "image-metadata-malformed");
+        }
+
+        #[test]
+        fn a_truncated_infe_fails_closed_instead_of_dropping_the_item() {
+            // The only infe stops short of its item type. Dropping it
+            // would leave the carrier not-applicable with the exif item
+            // silently hidden; instead the child fails.
+            let item = exif_item("hidden by truncation");
+            let mut infe = exif_infe();
+            infe.truncate(infe.len() - 2);
+            let bytes = heic_with_item(&infe, &[(0, item.len() as u32)], &item);
+            let mut collector = Collector::new(&ceilings());
+            let error = heic::collect(&bytes, &mut collector, &ceilings()).unwrap_err();
+            assert_eq!(error.code, "image-metadata-malformed");
+        }
+
+        #[test]
+        fn a_short_versioned_iinf_fails_closed_instead_of_panicking() {
+            // A version-1 iinf payload of seven bytes: the four-byte
+            // entry count does not fit after the fullbox header.
+            let mut meta_body = vec![0u8, 0, 0, 0];
+            push_box(&mut meta_body, b"iinf", &[1, 0, 0, 0, 0, 0, 0]);
+            push_box(&mut meta_body, b"iloc", &[0, 0, 0, 0, 0x44, 0, 0, 0]);
+            let mut bytes = Vec::new();
+            push_box(&mut bytes, b"ftyp", b"heic\x00\x00\x00\x00heic");
+            push_box(&mut bytes, b"meta", &meta_body);
+            let mut collector = Collector::new(&ceilings());
+            let error = heic::collect(&bytes, &mut collector, &ceilings()).unwrap_err();
+            assert_eq!(error.code, "image-metadata-malformed");
+        }
+
+        #[test]
+        fn repeated_item_extents_over_the_budget_fail_closed() {
+            // Eight extents each addressing the whole idat: the item
+            // would reconstruct to eight times the idat, past a ceiling
+            // set just under that, so the addressing table is refused.
+            let item = exif_item("repeated");
+            let len = item.len() as u32;
+            let extents = vec![(0, len); 8];
+            let bytes = heic_with_item(&exif_infe(), &extents, &item);
+            let mut tight = ceilings();
+            tight.max_output_bytes = u64::from(len) * 4;
+            let mut collector = Collector::new(&tight);
+            let error = heic::collect(&bytes, &mut collector, &tight).unwrap_err();
+            assert_eq!(error.code, "image-metadata-limit-exceeded");
         }
 
         #[test]

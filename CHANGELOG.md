@@ -9,20 +9,24 @@ Versioning.
 ### Added
 
 - An in-jail image-metadata converter that lifts the textual metadata a
-  raster or vector image carries and records it as a hidden derived
-  child. One image source yields two independent artifacts: the pixel
-  text from the image-OCR converter as the primary artifact, and the
-  metadata as a child at `<source>.d/#image-metadata`, every row marked
-  hidden, reusing the same derived-child record shape a container member
-  already uses. The exif, png text-chunk, container-packet, xmp, iptc,
-  and iso base media file format parsers all run behind the same
-  subprocess jail as the records worker, and a decompression bomb, an
-  xml event flood, or a box-count flood fails the child closed without
-  touching the pipeline or the primary leg. The converter is gated
-  behind a new `image-metadata` feature; a build without it does not run
-  the leg. `manifest@1` is unchanged. This adds the public
-  `ImageMetadataLimits` rules struct and the `ImageMetadata` converter,
-  both additive.
+  raster image carries and records it as a hidden derived child. One
+  image source yields two independent artifacts: the pixel text from
+  the image-OCR converter as the primary artifact, and the metadata as
+  a child at `<source>.d/#image-metadata`, every row marked hidden,
+  reusing the same derived-child record shape a container member
+  already uses. The leg runs for png, jpeg, webp, and heic. It does not
+  run for svg, whose raw-text primary artifact already carries every
+  metadata string verbatim. The exif, png text-chunk, container-packet,
+  xmp, iptc, and iso base media file format parsers all run behind the
+  same subprocess jail as the records worker, and a decompression bomb,
+  an xml event flood, or a box-count flood fails the child closed
+  without touching the pipeline or the primary leg. The converter is
+  gated behind a new `image-metadata` feature. A build without it does
+  not run the leg, and records the warning `image-metadata-not-built`
+  on each image so a later build that carries the converter mints the
+  child instead of skipping the image as unchanged. `manifest@1` is
+  unchanged. This adds the public `ImageMetadataLimits` rules struct
+  and the `ImageMetadata` converter, both additive.
 - An in-jail image-OCR converter for png, jpeg, and webp. The raster is
   decoded by the pure-Rust `image` crate inside the subprocess sandbox,
   the encoder-input area cap is asserted before the full decode, and the
@@ -35,6 +39,15 @@ Versioning.
 
 ### Changed
 
+- The rules version moves from 8 to 9, so every image is re-run once
+  under this release and gains its metadata child where one applies.
+- A malformed png, jpeg, webp, or heic now yields two failed records
+  where it yielded one: its primary image record, and a failed
+  `<source>.d/#image-metadata` child with a machine-readable reason,
+  the same two-record shape a container gives an unreadable member. A
+  metadata-bearing image likewise adds one converted child. Run failure
+  and record counts over a corpus rise by those children. A clean image
+  with no metadata adds nothing.
 - The public `Outcome` struct gained an `artifact_kind` field and the
   `OcrOk` struct gained a `warnings` field. Both structs are exhaustive,
   so external code that constructs them or destructures them by listing

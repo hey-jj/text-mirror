@@ -14,20 +14,58 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// One forbidden token: its spelling, and whether it matches only as a
+/// whole word. A whole-word token is one whose spelling is also the
+/// start of ordinary words in this crate (an English word that begins
+/// with it, or a phrase whose last letter begins another word), so a
+/// bare substring match would fire on legitimate prose; every other
+/// token matches anywhere.
+struct Forbidden {
+    token: String,
+    whole_word: bool,
+}
+
 /// The tokens that must never appear in the crate, matched
 /// case-insensitively. Each spelling is stored reversed and rebuilt at run
 /// time, so the forbidden byte sequence appears nowhere as a literal —
 /// neither in this source nor in the compiled test binary's read-only data
 /// (a forward-fragment concat would leave the short fragments in rodata for
 /// the linker to pack back into the token). The set is: the internal engine
-/// codename in every form (including any role label built from it); and the
-/// two pieces of process and review vocabulary that must not ship.
-fn forbidden() -> [String; 3] {
-    [
-        "e3m".chars().rev().collect(),
-        "laudiser".chars().rev().collect(),
-        "tnemdnema".chars().rev().collect(),
-    ]
+/// codename in every form (including any role label built from it); the
+/// process, review, and decision vocabulary that must not ship; the labels
+/// of the review stages and their participants; the internal document
+/// series names; and the names of the tools and models that took part.
+fn forbidden() -> Vec<Forbidden> {
+    let reversed: &[(&str, bool)] = &[
+        ("e3m", false),
+        ("laudiser", false),
+        ("tnemdnema", false),
+        ("kcehc dliub", false),
+        ("nocer", true),
+        ("xedoc", false),
+        ("elbaf", false),
+        ("tartsehcro", false),
+        ("ffo-ngis", false),
+        ("ffongis", false),
+        ("gnilur", false),
+        ("fitar", false),
+        ("detag-renwo", false),
+        ("gel weiver", false),
+        ("a gel", true),
+        ("b gel", true),
+        ("1-egats", false),
+        ("2-egats", false),
+        ("citehtnys cd", false),
+        ("dliub-rorrim-txet", false),
+        ("6202-noisiced", false),
+    ];
+    reversed
+        .iter()
+        .map(|(spelling, whole_word)| Forbidden {
+            token: spelling.chars().rev().collect(),
+            whole_word: *whole_word,
+        })
+        .collect()
 }
 
 /// Directory names skipped: build output and VCS metadata. Every other
@@ -65,13 +103,40 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// A byte that continues a word, for the whole-word tokens.
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Whether `text` contains `token`, as a substring or, for a whole-word
+/// token, only where no word byte touches either end of the match.
+fn contains_token(text: &str, forbidden: &Forbidden) -> bool {
+    let haystack = text.as_bytes();
+    let needle = forbidden.token.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(forbidden.token.as_str()) {
+        let start = from + offset;
+        let end = start + needle.len();
+        if !forbidden.whole_word {
+            return true;
+        }
+        let before = start.checked_sub(1).map(|i| haystack[i]);
+        let after = haystack.get(end).copied();
+        if !before.is_some_and(is_word_byte) && !after.is_some_and(is_word_byte) {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// Scan one body of text, appending a violation line for each forbidden
 /// token it contains. Shared by the crate sweep and the negative control.
 fn scan_text(label: &str, text: &str, violations: &mut Vec<String>) {
     let lowered = text.to_ascii_lowercase();
-    for token in forbidden() {
-        if lowered.contains(token.as_str()) {
-            violations.push(format!("{label} contains {token:?}"));
+    for forbidden in forbidden() {
+        if contains_token(&lowered, &forbidden) {
+            violations.push(format!("{label} contains {:?}", forbidden.token));
         }
     }
 }
@@ -105,16 +170,37 @@ fn no_forbidden_token_appears_in_the_crate() {
     );
 }
 
-/// Negative control: a body that names all three forbidden tokens must
-/// trip the gate. The probe is assembled from the same run-time fragments,
-/// so this file still holds no literal token. The inner assertion is the
+/// The whole-word tokens match a bare word and not a longer word that
+/// merely begins with one, so the sweep cannot fire on ordinary prose.
+#[test]
+fn whole_word_tokens_do_not_match_inside_longer_words() {
+    let bounded: Vec<Forbidden> = forbidden().into_iter().filter(|f| f.whole_word).collect();
+    assert!(!bounded.is_empty(), "the set has whole-word tokens");
+    for forbidden in &bounded {
+        let inside = format!("x{}x", forbidden.token);
+        let mut violations = Vec::new();
+        scan_text("embedded", &inside, &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+        let bare = format!("({}).", forbidden.token);
+        scan_text("bare", &bare, &mut violations);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+}
+
+/// Negative control: a body that names every forbidden token must trip
+/// the gate. The probe is assembled from the same run-time fragments, so
+/// this file still holds no literal token. The inner assertion is the
 /// exact one the crate sweep uses, so a body carrying the tokens makes it
 /// fire (panic / exit 101) — proving the gate catches every token rather
 /// than silently passing.
 #[test]
 #[should_panic(expected = "forbidden tokens found")]
 fn negative_control_gate_fires_on_all_forbidden_tokens() {
-    let probe = forbidden().join(" and ");
+    let probe = forbidden()
+        .iter()
+        .map(|f| f.token.clone())
+        .collect::<Vec<String>>()
+        .join(" and ");
     let mut violations = Vec::new();
     scan_text("planted-probe", &probe, &mut violations);
     assert_eq!(
