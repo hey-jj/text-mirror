@@ -723,10 +723,12 @@ fn a_prior_record_from_a_build_without_the_converter_is_not_skipped() {
 
 #[test]
 fn a_dedup_seeded_over_ceiling_image_is_refused_before_any_load() {
-    // A prior current-rules converted record whose source hash equals a
-    // sparse over-ceiling png-magic file, so the dedup index would
-    // borrow for it. The ceiling precedes the borrow: one resource-limit
-    // failure, no dedup record, no child.
+    // Run-level control for the dedup shape: a prior current-rules
+    // converted record whose source hash equals a sparse over-ceiling
+    // png-magic file. At the run level the walker refuses the file
+    // before a unit exists; the in-process guard on the dedup borrow is
+    // proven by the pipeline unit test that drives the expander
+    // directly.
     let setup = setup();
     let rules = fake_ocr_rules();
     fs::write(

@@ -1934,6 +1934,131 @@ mod tests {
         assert_eq!(rules.version(), "9");
     }
 
+    /// Drives `Expander::process` directly with an over-ceiling image
+    /// carrier whose hash has a current-rules canonical in the dedup
+    /// index, past the run-level walker gate that would otherwise refuse
+    /// the file before a unit exists. The ceiling precedes the dedup
+    /// borrow, so the source falls through to the leaf path: one failed
+    /// record with the resource-limit reason, no dedup record, no
+    /// metadata child, and the body never loaded for the borrow.
+    #[cfg(all(unix, feature = "image-metadata"))]
+    #[test]
+    fn an_over_ceiling_image_with_a_dedup_seed_is_refused_before_the_borrow() {
+        use std::collections::HashSet;
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        fs::create_dir_all(&root).unwrap();
+        let mirror_root = dir.path().join("mirror");
+        let manifest_dir = dir.path().join("manifest");
+        let division = "unit";
+        let rules = Rules::builtin().unwrap();
+        assert!(
+            rules.registry.image_metadata_converter().is_some(),
+            "the metadata leg must be present for this path"
+        );
+
+        // A sparse over-ceiling png-magic source.
+        let huge = root.join("huge.png");
+        let mut file = fs::File::create(&huge).unwrap();
+        file.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+        file.set_len(convert::MAX_SOURCE_BYTES + 1).unwrap();
+        drop(file);
+        let source_size = fs::metadata(&huge).unwrap().len();
+        let source_hash = hash::hash_bytes(&fs::read(&huge).unwrap());
+
+        // An intact canonical artifact for that hash, under the current
+        // primary converter, so the dedup borrow would otherwise fire.
+        let converter = rules.registry.converter_for("png").unwrap();
+        let canon_text = "recognized line\n";
+        let canon_text_path = mirror::mirror_path(&mirror_root, division, Path::new("canon.png"));
+        let canon_segments =
+            segments::segments_path(&mirror_root, division, Path::new("canon.png"));
+        let lines = segments::to_jsonl(&[Segment::span(0, canon_text.len(), "ocr")]).unwrap();
+        mirror::write_atomic(&canon_text_path, canon_text).unwrap();
+        mirror::write_atomic(&canon_segments, &lines).unwrap();
+        let mut dedup = DedupIndex::default();
+        dedup.insert(
+            &source_hash,
+            CanonicalArtifact {
+                source_path: "canon.png".to_string(),
+                text_path: mirror::recorded_text_path(division, "canon.png"),
+                text_hash: hash::hash_bytes(canon_text.as_bytes()),
+                converter_id: converter.id().to_string(),
+                converter_version: converter.version().to_string(),
+                artifact_kind: Some(ArtifactKind::Ocr),
+                warnings: Vec::new(),
+            },
+        );
+
+        let shard = manifest_dir.join("unit.jsonl");
+        let mut writer = ManifestWriter::open(&shard).unwrap();
+        let mut terminal = HashMap::new();
+        let mut counts = StatusCounts::default();
+        let walked = HashSet::new();
+        let unit = Unit {
+            meta: Meta {
+                source_path: "huge.png".to_string(),
+                parent_source: None,
+                source_hash,
+                source_size,
+                detection: Detection {
+                    declared: Some("png".to_string()),
+                    detected: "png".to_string(),
+                    mismatch: false,
+                },
+                detect_warnings: Vec::new(),
+            },
+            bytes: UnitBytes::Disk(huge),
+            depth: 0,
+            ancestors: Vec::new(),
+        };
+        let mut expander = Expander {
+            rules: &rules,
+            mirror_root: &mirror_root,
+            division,
+            walked: &walked,
+            limits: rules.registry.container_limits(),
+            writer: &mut writer,
+            terminal: &mut terminal,
+            counts: &mut counts,
+            dedup: &mut dedup,
+            claim: None,
+        };
+        let mut expanded = 0u64;
+        expander
+            .process(unit, Instant::now(), &mut expanded)
+            .unwrap();
+        drop(writer);
+
+        let records = manifest::read_shard(&shard).unwrap().records;
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record.source_path, "huge.png");
+        assert_eq!(record.status, Status::Failed);
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("resource_limit")),
+            "{:?}",
+            record.error
+        );
+        assert!(record.dedup_of.is_none());
+        assert_eq!(counts.dedup, 0);
+        assert_eq!(counts.failed, 1);
+        assert!(!terminal.contains_key("huge.png.d/#image-metadata"));
+        assert!(
+            !mirror::mirror_path(
+                &mirror_root,
+                division,
+                Path::new("huge.png.d/#image-metadata")
+            )
+            .exists()
+        );
+    }
+
     #[test]
     fn the_quine_guard_matches_an_ancestor_hash() {
         let chain = vec!["aa".to_string(), "bb".to_string()];
