@@ -145,10 +145,15 @@ fn scan_text(label: &str, text: &str, violations: &mut Vec<String>) {
 fn no_forbidden_token_appears_in_the_crate() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    for sub in ["src", "tests", "rules"] {
+    for sub in ["src", "tests", "rules", "docs", "skills"] {
         collect(&root.join(sub), &mut files);
     }
-    for top in ["Cargo.toml", "CHANGELOG.md", "README.md"] {
+    for top in [
+        "Cargo.toml",
+        "CHANGELOG.md",
+        "README.md",
+        "THIRD-PARTY-NOTICES.md",
+    ] {
         let path = root.join(top);
         if path.is_file() {
             files.push(path);
