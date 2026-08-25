@@ -4,6 +4,67 @@ All notable changes to this project are documented here. The format
 follows Keep a Changelog, and the project adheres to Semantic
 Versioning.
 
+## [0.6.0] - 2026-08-24
+
+### Added
+
+- An in-jail image-metadata converter that lifts the textual metadata a
+  raster image carries and records it as a hidden derived child. One
+  image source yields two independent artifacts: the pixel text from
+  the image-OCR converter as the primary artifact, and the metadata as
+  a child at `<source>.d/#image-metadata`, every row marked hidden,
+  reusing the same derived-child record shape a container member
+  already uses. The leg runs for png, jpeg, webp, and heic. It does not
+  run for svg, whose raw-text primary artifact already carries every
+  metadata string verbatim. The exif, png text-chunk, container-packet,
+  xmp, iptc, and iso base media file format parsers all run behind the
+  same subprocess jail as the records worker, and a decompression bomb,
+  an xml event flood, or a box-count flood fails the child closed
+  without touching the pipeline or the primary leg. The converter is
+  gated behind a new `image-metadata` feature. A build without it does
+  not run the leg, and records the warning `image-metadata-not-built`
+  on each image so a later build that carries the converter mints the
+  child instead of skipping the image as unchanged. `manifest@1` is
+  unchanged. This adds the public `ImageMetadataLimits` rules struct
+  and the `ImageMetadata` converter, both additive.
+- An in-jail image-OCR converter for png, jpeg, and webp. The raster is
+  decoded by the pure-Rust `image` crate inside the subprocess sandbox,
+  the encoder-input area cap is asserted before the full decode, and the
+  canonical pixels are handed to the pinned vision engine inside the
+  jail. The converter is gated behind a new `image-ocr` feature. A build
+  without it routes those formats to the `image-ocr-not-built` capability
+  gap. This release wires no engine, so a build with the feature decodes
+  the raster and then fails closed with `image-ocr-runtime-missing` until
+  a deployment supplies the pinned runtime.
+- Capability gaps carried into this release: pixel OCR for heic and for
+  svg is not built. A heic source fails closed with reason
+  `no-jailed-rasterizer`, because decoding it needs an external
+  rasterizer and that provider lands in a later release. An svg source
+  passes through as raw markup, and pixel OCR over its rendered form
+  waits for the same rasterizer provider.
+
+### Changed
+
+- The rules version moves from 8 to 9, so every image is re-run once
+  under this release and gains its metadata child where one applies.
+- A malformed png, jpeg, webp, or heic now yields two failed records
+  where it yielded one: its primary image record, and a failed
+  `<source>.d/#image-metadata` child with a machine-readable reason,
+  the same two-record shape a container gives an unreadable member. A
+  metadata-bearing image likewise adds one converted child. Run failure
+  and record counts over a corpus rise by those children. A clean image
+  with no metadata adds nothing.
+- The public `Outcome` struct gained an `artifact_kind` field and the
+  `OcrOk` struct gained a `warnings` field. Both structs are exhaustive,
+  so external code that constructs them or destructures them by listing
+  every field must account for the new fields. This is a breaking change
+  for those callers, which is why this release moves to 0.6.0. The
+  on-disk `manifest@1` and `adapter-response@1` serialization stays the
+  same: `artifact_kind` is an existing optional manifest field, and
+  `OcrOk.warnings` is omitted from the wire when empty, so a
+  warning-free success is byte-identical to the previous reader and only
+  an actual warning trips a mixed-version pairing.
+
 ## [0.5.0] - 2026-08-22
 
 ### Changed

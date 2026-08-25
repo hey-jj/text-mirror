@@ -409,6 +409,76 @@ pub mod bodies {
         pub segments: Vec<Segment>,
     }
 
+    /// Request body for the `image-metadata` adapter, which lifts
+    /// textual metadata out of a raster behind the jail.
+    ///
+    /// The ceilings travel in the request because the worker, not the
+    /// parent, enforces them, and they are rules data the parent reads
+    /// from the registry, matching [`RecordsRequest`]. A source over any
+    /// ceiling fails closed with a stable `image-metadata-*` reason.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ImageMetadataRequest {
+        /// Input file name inside the jail.
+        pub input: String,
+        /// The detected carrier format: `png`, `jpeg`, `webp`, or
+        /// `heic`.
+        pub format: String,
+        /// Ceiling on the inflated size of any single compressed text
+        /// block, checked incrementally during inflation.
+        pub max_decompressed_bytes: u64,
+        /// Ceiling on the nesting depth of an xmp parse.
+        pub max_xml_depth: u32,
+        /// Ceiling on the event count of an xmp parse.
+        pub max_xml_events: u64,
+        /// Ceiling on the box count walked in an iso base media file
+        /// format carrier.
+        pub max_boxes: u64,
+        /// Ceiling on emitted metadata rows across all surfaces.
+        pub max_rows: u64,
+        /// Ceiling on the rendered artifact text, under the runner
+        /// response cap.
+        pub max_output_bytes: u64,
+    }
+
+    /// One extracted metadata value, addressed by carrier, surface, and
+    /// path. The parent renders these to the tabular artifact and builds
+    /// one hidden segment per row, so the output contract and the hidden
+    /// marking stay in the crate rather than the worker.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct MetadataRow {
+        /// The container the value came from, such as `exif`,
+        /// `png-itxt`, `jpeg-app1-xmp`, `webp-xmp`, `iptc-iim`, or
+        /// `heic-uuid`.
+        pub carrier: String,
+        /// The surface family, such as `exif-imagedescription`,
+        /// `xmp-dc-description`, or `iptc-2-120-caption`.
+        pub surface: String,
+        /// The addressing detail, such as the exif tag number, the xmp
+        /// property path, or the iptc dataset.
+        pub path: String,
+        /// The language tag when the surface carries one, such as an
+        /// `iTXt` language tag or an xmp `xml:lang`.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub language: Option<String>,
+        /// The extracted text.
+        pub value: String,
+    }
+
+    /// Success body for the `image-metadata` adapter.
+    ///
+    /// An empty `rows` is the not-applicable outcome: the parent writes
+    /// nothing for the metadata leg. One or more rows renders to a
+    /// non-empty artifact and records a converted child.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ImageMetadataOk {
+        /// Extracted rows, one per metadata value. Zero rows is the
+        /// no-metadata outcome.
+        pub rows: Vec<MetadataRow>,
+    }
+
     /// What an OCR request asks the engine to read.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -450,6 +520,11 @@ pub mod bodies {
     pub struct OcrOk {
         /// Recognized spans in reading order.
         pub spans: Vec<OcrSpan>,
+        /// Non-fatal notes from the worker, such as the long-edge
+        /// validation note. Skipped from the wire when empty, so the
+        /// pre-existing engine-unpinned scaffold serializes unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub warnings: Vec<String>,
     }
 
     /// Request body for the `asr` adapter.

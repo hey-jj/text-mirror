@@ -5,7 +5,7 @@
 # rules_version, so a change here is a visible versioned event. It must
 # match the version in converters.toml.
 
-version = "7"
+version = "9"
 
 [[formats]]
 id = "text"
@@ -106,6 +106,18 @@ extensions = ["ppt"]
 id = "pdf"
 name = "Portable Document Format"
 extensions = ["pdf"]
+
+# Modern Adobe Illustrator artwork is a PDF-compatible container, so
+# magic resolves the bytes to the generic pdf parent and the declared
+# .ai extension refines it to this more specific id with no mismatch,
+# exactly as svg refines xml. A PDF-magic file with no .ai extension
+# stays pdf. A legacy PostScript-backed .ai, whose magic the table
+# does not name, resolves by extension to ai.
+[[formats]]
+id = "ai"
+name = "Adobe Illustrator artwork"
+extensions = ["ai"]
+refines = "pdf"
 
 [[formats]]
 id = "png"

@@ -52,8 +52,14 @@ fn run_converts_skips_and_counts_the_true_denominator() {
     assert_eq!(first.sources, 8);
     assert_eq!(first.counts.converted, 4);
     assert_eq!(first.counts.dedup, 1);
-    assert_eq!(first.counts.unsupported, 2);
-    assert_eq!(first.counts.failed, 1);
+    // image.png and trick.txt both carry png bytes. png is a claimed
+    // converter now (image-pixel-ocr), so their truncated bytes fail
+    // closed in the jailed decoder rather than recording unsupported.
+    // Each also gets an auxiliary metadata derived child that fails
+    // closed on the same malformed carrier, so the two malformed pngs
+    // touch four failed records, plus broken.txt for five.
+    assert_eq!(first.counts.unsupported, 0);
+    assert_eq!(first.counts.failed, 5);
     assert_eq!(first.counts.skipped_unchanged, 0);
 
     // The mirror parallels the source tree with .txt appended, and
@@ -70,10 +76,11 @@ fn run_converts_skips_and_counts_the_true_denominator() {
 
     let shard = manifest_dir.join("alpha.jsonl");
     let after_first = manifest::read_shard(&shard).unwrap().records;
-    assert_eq!(after_first.len(), 8);
+    // Eight walked sources plus the two malformed-png metadata children.
+    assert_eq!(after_first.len(), 10);
 
     let terminal = terminal_records(&shard);
-    assert_eq!(terminal.len(), 8);
+    assert_eq!(terminal.len(), 10);
 
     // Dedup: sorted traversal makes docs/dup-b.txt canonical.
     let duplicate = &terminal["dup-a.txt"];
@@ -84,11 +91,20 @@ fn run_converts_skips_and_counts_the_true_denominator() {
         "duplicate payload\n"
     );
 
-    // A mislabeled binary is detected by magic bytes and flagged.
+    // A mislabeled binary is detected by magic bytes and flagged. Its
+    // png bytes are truncated, so the image converter fails closed.
     let trick = &terminal["trick.txt"];
-    assert_eq!(trick.status, Status::Unsupported);
+    assert_eq!(trick.status, Status::Failed);
     assert_eq!(trick.detected_format, "png");
     assert!(trick.format_mismatch);
+    assert!(
+        trick
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("image-ocr-decode-failed")),
+        "{:?}",
+        trick.error
+    );
 
     // A converter failure carries a machine-readable reason.
     let broken = &terminal["broken.txt"];
@@ -102,31 +118,39 @@ fn run_converts_skips_and_counts_the_true_denominator() {
     assert_eq!(second.counts.converted, 0);
     assert_eq!(second.counts.dedup, 0);
     assert_eq!(second.counts.skipped_unchanged, 5);
-    assert_eq!(second.counts.unsupported, 2);
-    assert_eq!(second.counts.failed, 1);
+    assert_eq!(second.counts.unsupported, 0);
+    // The three failed sources re-evaluate, and the two malformed-png
+    // metadata legs re-run and fail closed again.
+    assert_eq!(second.counts.failed, 5);
 
-    // The shard is append-only and the true denominator holds: every
-    // walked source has exactly one terminal record.
+    // The shard is append-only. Every walked source has exactly one
+    // terminal record, and each malformed png adds one metadata child,
+    // so the terminal set is the walked set plus the two children.
     let after_second = manifest::read_shard(&shard).unwrap().records;
-    assert_eq!(after_second.len(), 16);
+    assert_eq!(after_second.len(), 20);
     let terminal = terminal_records(&shard);
-    assert_eq!(terminal.len(), 8);
+    assert_eq!(terminal.len(), 10);
     let walked = text_mirror::walk::walk_division(&root, &WalkOptions::default()).unwrap();
-    assert_eq!(walked.len(), terminal.len());
+    assert_eq!(walked.len(), 8);
     for entry in &walked {
         assert!(terminal.contains_key(&entry.path.to_string_lossy().into_owned()));
     }
+    // The extra terminal records are the two metadata children.
+    assert!(terminal.contains_key("image.png.d/#image-metadata"));
+    assert!(terminal.contains_key("trick.txt.d/#image-metadata"));
 
     // Coverage over terminal records.
     let status = pipeline::status(&manifest_dir).unwrap();
     assert_eq!(status.divisions.len(), 1);
     let division = &status.divisions[0];
     assert_eq!(division.division, "alpha");
-    assert_eq!(division.sources, 8);
+    // Status counts every terminal record: the eight walked sources plus
+    // the two metadata children.
+    assert_eq!(division.sources, 10);
     assert_eq!(division.with_text, 5);
     assert_eq!(division.counts.skipped_unchanged, 5);
-    assert_eq!(division.counts.unsupported, 2);
-    assert_eq!(division.counts.failed, 1);
+    assert_eq!(division.counts.unsupported, 0);
+    assert_eq!(division.counts.failed, 5);
 
     // Explain returns the full append history for one source.
     let history = pipeline::explain(&manifest_dir, "docs/crlf.txt").unwrap();

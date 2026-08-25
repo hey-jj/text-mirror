@@ -316,6 +316,7 @@ impl Converter for HtmlStrip {
         }
         let segments = vec![Segment::span(0, text.len(), "document")];
         Ok(Outcome {
+            artifact_kind: crate::manifest::ArtifactKind::Text,
             converter_id: HTML_STRIP_ID.to_string(),
             converter_version: HTML_STRIP_VERSION.to_string(),
             detected_format: detected_format.to_string(),

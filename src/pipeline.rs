@@ -460,6 +460,11 @@ fn collision_key(source_path: &str) -> String {
     source_path.nfc().collect::<String>().to_lowercase()
 }
 
+/// The synthetic derived-child path an image's metadata leg writes to.
+fn metadata_child_path(source_path: &str) -> String {
+    format!("{source_path}.d/#image-metadata")
+}
+
 /// The claimed-path state for one top-level container's whole
 /// expansion, so members cannot alias each other's paths and a
 /// re-expansion can retire the descendants a shrunken member set
@@ -574,6 +579,12 @@ impl Expander<'_> {
             _ => converter.map(|c| c.version()),
         };
 
+        // An image carrier whose metadata leg runs owns a derived child
+        // the way a container owns members: the checkpoint and dedup
+        // decisions below account for that child.
+        let metadata_leg = self.metadata_leg_applies(&meta.detection.detected);
+        let has_children = kind.is_some() || metadata_leg;
+
         // Checkpoint: an unchanged source with an intact artifact
         // skips, containers included. A skipped container leaves its
         // children untouched, and their prior records stay terminal.
@@ -585,7 +596,16 @@ impl Expander<'_> {
                 previous.status,
                 Status::Converted | Status::Dedup | Status::SkippedUnchanged
             );
-            if key_matches && has_text {
+            // A prior record from a build without the metadata converter
+            // never had its metadata leg run. Once the converter is
+            // present that record is not skippable, so the child is
+            // minted on the first build that can produce it.
+            let leg_never_ran = metadata_leg
+                && previous
+                    .warnings
+                    .iter()
+                    .any(|w| w == convert::image_metadata::IMAGE_METADATA_NOT_BUILT);
+            if key_matches && has_text && !leg_never_ran {
                 let intact = match (&previous.text_path, &previous.text_hash) {
                     (Some(text_path), Some(text_hash)) => {
                         mirror::resolve_recorded_path(self.mirror_root, text_path).is_ok_and(
@@ -594,18 +614,21 @@ impl Expander<'_> {
                     }
                     _ => false,
                 };
-                // A container is reachable only through its parent,
-                // so an intact parent envelope is not enough: every
-                // text-bearing descendant must still hash to its
-                // record, or the container re-expands.
-                let descendants_ok = kind.is_none() || self.descendants_intact(&meta.source_path);
+                // A container's members, and an image's metadata child,
+                // are reachable only through their parent, so an intact
+                // parent envelope is not enough: every text-bearing
+                // descendant must still hash to its record, or the
+                // parent re-runs.
+                let descendants_ok = !has_children || self.descendants_intact(&meta.source_path);
                 if intact && descendants_ok {
-                    // A nested container that skips inside a
-                    // re-expanding parent just validated its whole
-                    // subtree intact, so every prior descendant under
-                    // it is kept: the owner's reconciliation must not
-                    // retire them as removed.
-                    if kind.is_some() && self.claim.is_some() {
+                    // A nested container, or an image carrier, that
+                    // skips inside a re-expanding parent just validated
+                    // its whole subtree intact, so every prior descendant
+                    // under it is kept: the owner's reconciliation must
+                    // not retire them as removed. A kept metadata child
+                    // also keeps its claim on its path, so a later
+                    // literal member cannot write over it.
+                    if has_children && self.claim.is_some() {
                         let prefix = format!("{}.d/", meta.source_path);
                         let kept: Vec<String> = self
                             .terminal
@@ -614,6 +637,11 @@ impl Expander<'_> {
                             .cloned()
                             .collect();
                         if let Some(claim) = &mut self.claim {
+                            if metadata_leg {
+                                for path in &kept {
+                                    claim.claimed.insert(collision_key(path));
+                                }
+                            }
                             claim.emitted.extend(kept);
                         }
                     }
@@ -638,10 +666,18 @@ impl Expander<'_> {
             }
         }
 
+        // The source ceiling precedes every parent-side load. An image
+        // whose metadata leg would load its bytes for the dedup borrow
+        // is over the ceiling here, so it skips the borrow and falls
+        // through to the leaf path, which records the resource-limit
+        // failure with no child, exactly as an unborrowed image would.
+        let over_ceiling = meta.source_size > convert::MAX_SOURCE_BYTES;
+
         // Dedup borrow, non-containers only. A container never dedups,
         // because borrowing its artifact would skip re-expanding its
         // members under their own paths.
         if kind.is_none()
+            && !(metadata_leg && over_ceiling)
             && let Some(canonical) = self.dedup.get(&meta.source_hash)
             && canonical.source_path != meta.source_path
             && converter.is_some_and(|c| {
@@ -664,6 +700,27 @@ impl Expander<'_> {
                 && segments::parse_jsonl(&segment_lines)
                     .is_ok_and(|segs| segments::validate(&segs, &text).is_ok())
             {
+                // The metadata leg still runs for a borrowed primary:
+                // the bytes are identical by hash, the parse is cheap,
+                // and the child belongs to this path. The bytes are
+                // loaded here, before the record, so a load failure is
+                // recorded the way the leaf path records it.
+                #[cfg(all(unix, feature = "image-metadata"))]
+                let raw = if metadata_leg {
+                    match bytes.load(&meta.source_hash) {
+                        Ok(raw) => Some(raw),
+                        Err(reason) => return self.fail(&meta, reason, started),
+                    }
+                } else {
+                    None
+                };
+                let mut meta = meta;
+                let collides = metadata_leg && self.metadata_collides(&meta.source_path);
+                if collides {
+                    meta.detect_warnings.push(
+                        convert::image_metadata::IMAGE_METADATA_NAMESPACE_OCCUPIED.to_string(),
+                    );
+                }
                 let mut record = self.base_record(&meta, Status::Dedup);
                 for warning in &canonical.warnings {
                     if !record.warnings.contains(warning) {
@@ -688,12 +745,29 @@ impl Expander<'_> {
                     }
                 }
                 record.duration_ms = Some(elapsed_ms(started));
-                return self.emit(record);
+                self.emit(record)?;
+                #[cfg(all(unix, feature = "image-metadata"))]
+                if let Some(raw) = raw
+                    && !collides
+                {
+                    let format = meta.detection.detected.clone();
+                    let declared = meta.detection.declared.clone();
+                    return self.run_metadata_leg(
+                        &meta.source_path,
+                        &format,
+                        declared,
+                        &meta.source_hash,
+                        meta.source_size,
+                        &raw,
+                        started,
+                    );
+                }
+                return Ok(());
             }
         }
 
         let Some(kind) = kind else {
-            return self.convert_leaf(meta, bytes, started);
+            return self.convert_leaf_with_metadata(meta, bytes, started);
         };
         // A top-level container owns the claim state for its whole
         // subtree. Nested containers share the owner's state.
@@ -833,7 +907,7 @@ impl Expander<'_> {
                     let text_hash = hash::hash_bytes(outcome.text.as_bytes());
                     record.text_path = Some(text_relative.clone());
                     record.text_hash = Some(text_hash.clone());
-                    record.artifact_kind = Some(ArtifactKind::Text);
+                    record.artifact_kind = Some(outcome.artifact_kind);
                     record.converter_id = Some(outcome.converter_id.clone());
                     record.converter_version = Some(outcome.converter_version.clone());
                     record.warnings.extend(outcome.warnings.iter().cloned());
@@ -870,6 +944,256 @@ impl Expander<'_> {
         self.emit(record)
     }
 
+    /// The leaf path plus, for an image carrier, the auxiliary
+    /// metadata derived-child leg.
+    ///
+    /// The primary conversion is the unchanged leaf path. When the format
+    /// is an image carrier and the metadata converter is built, one
+    /// image source additionally yields a hidden metadata child at
+    /// `<source>.d/#image-metadata`, structurally parallel to a container
+    /// member. The two legs share nothing: a failure of the metadata
+    /// child never touches the primary image record.
+    fn convert_leaf_with_metadata(
+        &mut self,
+        mut meta: Meta,
+        bytes: UnitBytes,
+        started: Instant,
+    ) -> Result<()> {
+        #[cfg(all(unix, feature = "image-metadata"))]
+        if self.metadata_leg_applies(&meta.detection.detected) {
+            return self.convert_image_with_metadata(meta, bytes, started);
+        }
+        // An image carrier in a build without the metadata converter
+        // records that its leg never ran, so a later build that carries
+        // the converter does not skip this record as unchanged.
+        if convert::image_metadata::image_metadata_applies(&meta.detection.detected) {
+            meta.detect_warnings
+                .push(convert::image_metadata::IMAGE_METADATA_NOT_BUILT.to_string());
+        }
+        self.convert_leaf(meta, bytes, started)
+    }
+
+    /// Whether the metadata derived-child leg runs for a detected
+    /// format: the format is an image carrier and the build carries the
+    /// converter.
+    fn metadata_leg_applies(&self, format: &str) -> bool {
+        #[cfg(all(unix, feature = "image-metadata"))]
+        {
+            convert::image_metadata::image_metadata_applies(format)
+                && self.rules.registry.image_metadata_converter().is_some()
+        }
+        #[cfg(not(all(unix, feature = "image-metadata")))]
+        {
+            let _ = format;
+            false
+        }
+    }
+
+    /// Whether the metadata child of an image at `source_path` would
+    /// collide with a real source, claiming the child path inside a
+    /// container expansion as it checks.
+    ///
+    /// A real walked source in the image `.d/` namespace occupies it. So
+    /// does a container member already claimed at the child path: the
+    /// literal member came first, so the child yields to it. When the
+    /// image comes first, the claim made here makes the later literal
+    /// member the collision, so archive order never silently overwrites
+    /// either artifact.
+    fn metadata_collides(&mut self, source_path: &str) -> bool {
+        let child_path = metadata_child_path(source_path);
+        self.expansion_collides(source_path)
+            || (self.claim.is_some()
+                && !self
+                    .claim
+                    .as_mut()
+                    .expect("checked above")
+                    .claimed
+                    .insert(collision_key(&child_path)))
+    }
+
+    /// Runs the primary OCR leg, then the metadata derived-child leg,
+    /// for one image source, loading the bytes once for both.
+    #[cfg(all(unix, feature = "image-metadata"))]
+    fn convert_image_with_metadata(
+        &mut self,
+        mut meta: Meta,
+        bytes: UnitBytes,
+        started: Instant,
+    ) -> Result<()> {
+        // The source ceiling is checked before any load, exactly as the
+        // leaf path checks it, so an over-ceiling source records the same
+        // resource-limit failure there and no child is attempted.
+        if meta.source_size > convert::MAX_SOURCE_BYTES {
+            return self.convert_leaf(meta, bytes, started);
+        }
+        // Load once. A load error means the primary leg records it and no
+        // metadata child is attempted, so route it through the leaf path.
+        let raw = match bytes.load(&meta.source_hash) {
+            Ok(raw) => raw,
+            Err(reason) => return self.fail(&meta, reason, started),
+        };
+        // Collision guard on the image `.d/` namespace, before the primary
+        // leg records, so the warning rides the parent image record. A
+        // real walked source in the namespace means the metadata leg is
+        // skipped rather than overwriting that source's artifact.
+        let collides = self.metadata_collides(&meta.source_path);
+        if collides {
+            meta.detect_warnings
+                .push(convert::image_metadata::IMAGE_METADATA_NAMESPACE_OCCUPIED.to_string());
+        }
+        let source_path = meta.source_path.clone();
+        let format = meta.detection.detected.clone();
+        let declared = meta.detection.declared.clone();
+        let source_hash = meta.source_hash.clone();
+        let source_size = meta.source_size;
+        // The primary OCR leg is the unchanged leaf path. It emits the
+        // parent image record, carrying the collision warning when set.
+        self.convert_leaf(meta, UnitBytes::Mem(raw.clone()), started)?;
+        if collides {
+            return Ok(());
+        }
+        self.run_metadata_leg(
+            &source_path,
+            &format,
+            declared,
+            &source_hash,
+            source_size,
+            &raw,
+            started,
+        )
+    }
+
+    /// Runs the metadata child under the claim-and-reconcile machinery,
+    /// so a re-run that finds no metadata retires a prior metadata child.
+    ///
+    /// A top-level image owns a claim over its own `.d/` namespace; an
+    /// image that is itself a container member shares the owning
+    /// container's claim, which already covers the child path.
+    #[cfg(all(unix, feature = "image-metadata"))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_metadata_leg(
+        &mut self,
+        source_path: &str,
+        format: &str,
+        declared: Option<String>,
+        source_hash: &str,
+        source_size: u64,
+        raw: &[u8],
+        started: Instant,
+    ) -> Result<()> {
+        let owns_claim = self.claim.is_none();
+        if owns_claim {
+            self.claim = Some(ClaimState {
+                prefix: format!("{source_path}.d/"),
+                claimed: std::collections::HashSet::new(),
+                emitted: std::collections::HashSet::new(),
+                collisions: 0,
+            });
+        }
+        let result = self.emit_metadata_child(
+            source_path,
+            format,
+            declared,
+            source_hash,
+            source_size,
+            raw,
+            started,
+        );
+        if owns_claim && let Some(claim) = self.claim.take() {
+            self.reconcile(source_path, &claim, started)?;
+        }
+        result
+    }
+
+    /// Converts the metadata child and emits its record. Zero rows is the
+    /// not-applicable outcome: nothing is written and reconciliation
+    /// retires any prior child. A malformation records one failed child
+    /// with a machine-readable reason and no artifact.
+    #[cfg(all(unix, feature = "image-metadata"))]
+    #[allow(clippy::too_many_arguments)]
+    fn emit_metadata_child(
+        &mut self,
+        source_path: &str,
+        format: &str,
+        declared: Option<String>,
+        source_hash: &str,
+        source_size: u64,
+        raw: &[u8],
+        started: Instant,
+    ) -> Result<()> {
+        let child_path = metadata_child_path(source_path);
+        let (text_absolute, segments_absolute, text_relative) = self.artifact_paths(&child_path);
+        let converter = self
+            .rules
+            .registry
+            .image_metadata_converter()
+            .expect("the metadata leg runs only when the converter is present");
+        let detection = Detection {
+            declared,
+            detected: format.to_string(),
+            mismatch: false,
+        };
+        let child_meta = Meta {
+            source_path: child_path.clone(),
+            parent_source: Some(source_path.to_string()),
+            source_hash: source_hash.to_string(),
+            source_size,
+            detection,
+            detect_warnings: Vec::new(),
+        };
+        match run_converter(converter, raw, format) {
+            Ok(outcome) => {
+                match segments::to_jsonl(&outcome.segments)
+                    .map_err(|e| e.to_string())
+                    .and_then(|lines| {
+                        mirror::write_atomic(&text_absolute, &outcome.text)
+                            .and_then(|()| mirror::write_atomic(&segments_absolute, &lines))
+                            .map_err(|e| e.to_string())
+                    }) {
+                    Ok(()) => {
+                        let mut record = self.base_record(&child_meta, Status::Converted);
+                        record.text_path = Some(text_relative);
+                        record.text_hash = Some(hash::hash_bytes(outcome.text.as_bytes()));
+                        record.artifact_kind = Some(outcome.artifact_kind);
+                        record.converter_id = Some(outcome.converter_id.clone());
+                        record.converter_version = Some(outcome.converter_version.clone());
+                        record.warnings.extend(outcome.warnings.iter().cloned());
+                        record.duration_ms = Some(elapsed_ms(started));
+                        self.emit(record)
+                    }
+                    Err(detail) => {
+                        let mut record = self.base_record(&child_meta, Status::Failed);
+                        record.converter_id =
+                            Some(convert::image_metadata::IMAGE_METADATA_ID.to_string());
+                        record.converter_version =
+                            Some(convert::image_metadata::IMAGE_METADATA_VERSION.to_string());
+                        record.error = Some(format!("mirror_write_error: {detail}"));
+                        record.duration_ms = Some(elapsed_ms(started));
+                        remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
+                        self.emit(record)
+                    }
+                }
+            }
+            Err(reason)
+                if reason.starts_with(convert::image_metadata::IMAGE_METADATA_NOT_APPLICABLE) =>
+            {
+                // No textual metadata: write nothing. A prior child, if
+                // any, is retired by the owning reconciliation.
+                Ok(())
+            }
+            Err(reason) => {
+                let mut record = self.base_record(&child_meta, Status::Failed);
+                record.converter_id = Some(convert::image_metadata::IMAGE_METADATA_ID.to_string());
+                record.converter_version =
+                    Some(convert::image_metadata::IMAGE_METADATA_VERSION.to_string());
+                record.error = Some(reason);
+                record.duration_ms = Some(elapsed_ms(started));
+                remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
+                self.emit(record)
+            }
+        }
+    }
+
     /// Writes a parent container artifact and records the parent as
     /// converted. Shared by both container families.
     fn write_parent(
@@ -894,6 +1218,11 @@ impl Expander<'_> {
                 let mut record = self.base_record(meta, Status::Converted);
                 record.text_path = Some(text_relative);
                 record.text_hash = Some(hash::hash_bytes(outcome.text.as_bytes()));
+                // By design a container parent is a text manifest of its
+                // members, not a recognized or transcribed artifact, so
+                // it is always `Text` regardless of any member's kind. A
+                // leaf converter's own kind flows through the single
+                // source branch above instead.
                 record.artifact_kind = Some(ArtifactKind::Text);
                 record.converter_id = Some(outcome.converter_id.clone());
                 record.converter_version = Some(outcome.converter_version.clone());
@@ -1203,6 +1532,7 @@ impl Expander<'_> {
                     text: listing,
                     warnings: Vec::new(),
                     segments,
+                    artifact_kind: manifest::ArtifactKind::Text,
                 };
                 if let Err(reason) = validate_output(&outcome) {
                     return self.fail(&meta, reason, started);
@@ -1601,7 +1931,132 @@ mod tests {
     #[test]
     fn builtin_rules_agree_on_a_version() {
         let rules = Rules::builtin().unwrap();
-        assert_eq!(rules.version(), "7");
+        assert_eq!(rules.version(), "9");
+    }
+
+    /// Drives `Expander::process` directly with an over-ceiling image
+    /// carrier whose hash has a current-rules canonical in the dedup
+    /// index, past the run-level walker gate that would otherwise refuse
+    /// the file before a unit exists. The ceiling precedes the dedup
+    /// borrow, so the source falls through to the leaf path: one failed
+    /// record with the resource-limit reason, no dedup record, no
+    /// metadata child, and the body never loaded for the borrow.
+    #[cfg(all(unix, feature = "image-metadata"))]
+    #[test]
+    fn an_over_ceiling_image_with_a_dedup_seed_is_refused_before_the_borrow() {
+        use std::collections::HashSet;
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        fs::create_dir_all(&root).unwrap();
+        let mirror_root = dir.path().join("mirror");
+        let manifest_dir = dir.path().join("manifest");
+        let division = "unit";
+        let rules = Rules::builtin().unwrap();
+        assert!(
+            rules.registry.image_metadata_converter().is_some(),
+            "the metadata leg must be present for this path"
+        );
+
+        // A sparse over-ceiling png-magic source.
+        let huge = root.join("huge.png");
+        let mut file = fs::File::create(&huge).unwrap();
+        file.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+        file.set_len(convert::MAX_SOURCE_BYTES + 1).unwrap();
+        drop(file);
+        let source_size = fs::metadata(&huge).unwrap().len();
+        let source_hash = hash::hash_bytes(&fs::read(&huge).unwrap());
+
+        // An intact canonical artifact for that hash, under the current
+        // primary converter, so the dedup borrow would otherwise fire.
+        let converter = rules.registry.converter_for("png").unwrap();
+        let canon_text = "recognized line\n";
+        let canon_text_path = mirror::mirror_path(&mirror_root, division, Path::new("canon.png"));
+        let canon_segments =
+            segments::segments_path(&mirror_root, division, Path::new("canon.png"));
+        let lines = segments::to_jsonl(&[Segment::span(0, canon_text.len(), "ocr")]).unwrap();
+        mirror::write_atomic(&canon_text_path, canon_text).unwrap();
+        mirror::write_atomic(&canon_segments, &lines).unwrap();
+        let mut dedup = DedupIndex::default();
+        dedup.insert(
+            &source_hash,
+            CanonicalArtifact {
+                source_path: "canon.png".to_string(),
+                text_path: mirror::recorded_text_path(division, "canon.png"),
+                text_hash: hash::hash_bytes(canon_text.as_bytes()),
+                converter_id: converter.id().to_string(),
+                converter_version: converter.version().to_string(),
+                artifact_kind: Some(ArtifactKind::Ocr),
+                warnings: Vec::new(),
+            },
+        );
+
+        let shard = manifest_dir.join("unit.jsonl");
+        let mut writer = ManifestWriter::open(&shard).unwrap();
+        let mut terminal = HashMap::new();
+        let mut counts = StatusCounts::default();
+        let walked = HashSet::new();
+        let unit = Unit {
+            meta: Meta {
+                source_path: "huge.png".to_string(),
+                parent_source: None,
+                source_hash,
+                source_size,
+                detection: Detection {
+                    declared: Some("png".to_string()),
+                    detected: "png".to_string(),
+                    mismatch: false,
+                },
+                detect_warnings: Vec::new(),
+            },
+            bytes: UnitBytes::Disk(huge),
+            depth: 0,
+            ancestors: Vec::new(),
+        };
+        let mut expander = Expander {
+            rules: &rules,
+            mirror_root: &mirror_root,
+            division,
+            walked: &walked,
+            limits: rules.registry.container_limits(),
+            writer: &mut writer,
+            terminal: &mut terminal,
+            counts: &mut counts,
+            dedup: &mut dedup,
+            claim: None,
+        };
+        let mut expanded = 0u64;
+        expander
+            .process(unit, Instant::now(), &mut expanded)
+            .unwrap();
+        drop(writer);
+
+        let records = manifest::read_shard(&shard).unwrap().records;
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record.source_path, "huge.png");
+        assert_eq!(record.status, Status::Failed);
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("resource_limit")),
+            "{:?}",
+            record.error
+        );
+        assert!(record.dedup_of.is_none());
+        assert_eq!(counts.dedup, 0);
+        assert_eq!(counts.failed, 1);
+        assert!(!terminal.contains_key("huge.png.d/#image-metadata"));
+        assert!(
+            !mirror::mirror_path(
+                &mirror_root,
+                division,
+                Path::new("huge.png.d/#image-metadata")
+            )
+            .exists()
+        );
     }
 
     #[test]
@@ -1658,6 +2113,38 @@ mod tests {
                 text: "ok".to_string(),
                 warnings: Vec::new(),
                 segments: vec![Segment::span(0, 999, "document")],
+                artifact_kind: manifest::ArtifactKind::Text,
+            })
+        }
+    }
+
+    /// A converter that returns a valid outcome stamped
+    /// [`manifest::ArtifactKind::Ocr`], so the pipeline's kind
+    /// propagation through the single-source, dedup, and checkpoint paths
+    /// can be exercised without a jailed engine.
+    struct OcrKindConverter;
+
+    impl Converter for OcrKindConverter {
+        fn id(&self) -> &'static str {
+            "ocr-kind-test"
+        }
+        fn version(&self) -> &'static str {
+            "1.0.0"
+        }
+        fn convert(
+            &self,
+            _source: &[u8],
+            detected_format: &str,
+        ) -> std::result::Result<Outcome, ConvertError> {
+            let text = "recognized text\n".to_string();
+            Ok(Outcome {
+                converter_id: self.id().to_string(),
+                converter_version: self.version().to_string(),
+                detected_format: detected_format.to_string(),
+                segments: vec![Segment::span(0, text.len(), "document")],
+                text,
+                warnings: Vec::new(),
+                artifact_kind: manifest::ArtifactKind::Ocr,
             })
         }
     }
@@ -1681,6 +2168,11 @@ extensions = ["panicfmt"]
 id = "badseg"
 name = "Bad segments trigger"
 extensions = ["badseg"]
+
+[[formats]]
+id = "ocrfmt"
+name = "OCR kind trigger"
+extensions = ["ocrfmt"]
 "#,
             "formats.toml",
         )
@@ -1691,6 +2183,7 @@ extensions = ["badseg"]
                 (Box::new(PlainTextPassthrough), vec!["text"]),
                 (Box::new(PanicConverter), vec!["panicfmt"]),
                 (Box::new(BadSegmentsConverter), vec!["badseg"]),
+                (Box::new(OcrKindConverter), vec!["ocrfmt"]),
             ],
         );
         Rules { table, registry }
@@ -1771,6 +2264,70 @@ extensions = ["badseg"]
                 .join("mirror/unit/bad.badseg.segments.jsonl")
                 .exists()
         );
+    }
+
+    #[test]
+    fn the_ocr_artifact_kind_propagates_through_dedup_and_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        let mirror = dir.path().join("mirror");
+        let manifest_dir = dir.path().join("manifest");
+        fs::create_dir_all(&root).unwrap();
+        // Two identical-content OCR sources: the first converts, the
+        // second dedups off it within the same run.
+        fs::write(root.join("a.ocrfmt"), "same pixels\n").unwrap();
+        fs::write(root.join("b.ocrfmt"), "same pixels\n").unwrap();
+
+        let rules = injected_rules();
+        let options = RunOptions {
+            root: &root,
+            mirror_root: &mirror,
+            manifest_dir: &manifest_dir,
+            division: "unit",
+            walk: WalkOptions::default(),
+        };
+        run(&rules, &options).unwrap();
+
+        let shard = manifest_dir.join("unit.jsonl");
+        let latest = |path: &str| {
+            manifest::read_shard(&shard)
+                .unwrap()
+                .records
+                .into_iter()
+                .rev()
+                .find(|r| r.source_path == path)
+                .unwrap()
+        };
+
+        // Same-run: one Converted, one Dedup, both carry the OCR kind.
+        let a = latest("a.ocrfmt");
+        let b = latest("b.ocrfmt");
+        let (converted, deduped) = if a.status == Status::Converted {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        assert_eq!(converted.status, Status::Converted);
+        assert_eq!(deduped.status, Status::Dedup);
+        assert_eq!(converted.artifact_kind, Some(ArtifactKind::Ocr));
+        assert_eq!(deduped.artifact_kind, Some(ArtifactKind::Ocr));
+
+        // Second run with the prior manifest present. The unchanged
+        // sources skip and keep their OCR kind (checkpoint-skip clones
+        // the prior record); a new identical source dedups off the
+        // seeded prior canonical and is also OCR (seeded dedup).
+        fs::write(root.join("c.ocrfmt"), "same pixels\n").unwrap();
+        run(&rules, &options).unwrap();
+
+        let a2 = latest("a.ocrfmt");
+        let b2 = latest("b.ocrfmt");
+        let c = latest("c.ocrfmt");
+        assert_eq!(a2.status, Status::SkippedUnchanged);
+        assert_eq!(b2.status, Status::SkippedUnchanged);
+        assert_eq!(a2.artifact_kind, Some(ArtifactKind::Ocr));
+        assert_eq!(b2.artifact_kind, Some(ArtifactKind::Ocr));
+        assert_eq!(c.status, Status::Dedup);
+        assert_eq!(c.artifact_kind, Some(ArtifactKind::Ocr));
     }
 
     #[test]

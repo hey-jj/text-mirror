@@ -66,6 +66,88 @@ impl Default for RecordsLimits {
     }
 }
 
+/// The image-OCR jail limit profile, held as rules data beside the
+/// records ceilings so a deployment raises it in a visible versioned
+/// bump. The default runner limits are tuned for the pure-Rust
+/// document worker; the pinned vision runtime maps a far larger
+/// working set, so the image-OCR converter carries its own envelope.
+/// The registry reads this into the converter, which maps it into the
+/// runner limits its jailed worker enforces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageOcrLimits {
+    /// Wall-clock ceiling for one image, in seconds.
+    pub wall_timeout_secs: u64,
+    /// Ceiling on the response frame payload, in bytes.
+    pub max_response_bytes: u32,
+    /// Ceiling on stderr bytes.
+    pub max_stderr_bytes: u64,
+    /// RLIMIT_AS for the child, in bytes. Linux only.
+    pub address_space_bytes: u64,
+    /// RLIMIT_CPU for the child, in seconds.
+    pub cpu_seconds: u64,
+    /// RLIMIT_FSIZE for the child, in bytes.
+    pub file_size_bytes: u64,
+    /// RLIMIT_NPROC for the child.
+    pub max_processes: u64,
+}
+
+impl Default for ImageOcrLimits {
+    fn default() -> ImageOcrLimits {
+        ImageOcrLimits {
+            wall_timeout_secs: 300,
+            max_response_bytes: 8 * 1024 * 1024,
+            max_stderr_bytes: 4 * 1024 * 1024,
+            address_space_bytes: 64 * 1024 * 1024 * 1024,
+            cpu_seconds: 600,
+            file_size_bytes: 64 * 1024 * 1024,
+            max_processes: 64,
+        }
+    }
+}
+
+/// The image-metadata parser ceilings, held as rules data beside the
+/// records ceilings so a deployment raises them in a visible versioned
+/// bump. The parent reads them from the registry and passes them into
+/// the jailed worker, which enforces them and fails a source over any
+/// ceiling with a stable `image-metadata-*` reason. The metadata worker
+/// runs behind the shared platform-default jail, so these are the
+/// parser-surface ceilings only, not the wall-clock and address-space
+/// envelope the runner already imposes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageMetadataLimits {
+    /// Inflated-size ceiling for any single compressed text block, the
+    /// png `zTXt` and compressed `iTXt` streams above all. Checked
+    /// incrementally during inflation so a decompression bomb is stopped
+    /// before it lands.
+    pub max_decompressed_bytes: u64,
+    /// Nesting-depth ceiling for an xmp parse.
+    pub max_xml_depth: u32,
+    /// Event-count ceiling for an xmp parse.
+    pub max_xml_events: u64,
+    /// Box-count ceiling for an iso base media file format carrier.
+    pub max_boxes: u64,
+    /// Ceiling on emitted metadata rows across all surfaces.
+    pub max_rows: u64,
+    /// Ceiling on the rendered value bytes, under the runner response
+    /// cap.
+    pub max_output_bytes: u64,
+}
+
+impl Default for ImageMetadataLimits {
+    fn default() -> ImageMetadataLimits {
+        ImageMetadataLimits {
+            max_decompressed_bytes: 16 * 1024 * 1024,
+            max_xml_depth: 100,
+            max_xml_events: 1_000_000,
+            max_boxes: 10_000,
+            max_rows: 4096,
+            max_output_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
 use std::collections::HashMap;
 use std::fmt;
 
@@ -90,6 +172,18 @@ pub mod pdf;
 // crate path.
 #[cfg(all(unix, feature = "records-worker"))]
 pub(crate) mod records;
+// The in-jail raster decode and recognize path. Crate-private for the
+// same reason records is: a library consumer must not run the decode
+// and engine path in process and bypass the jail. The worker dispatch
+// reaches it through a crate path.
+#[cfg(all(unix, feature = "image-ocr"))]
+pub(crate) mod image_ocr;
+// The image-metadata derived-child leg. The id, version, and the
+// applies predicate are always compiled so the registry and pipeline can
+// name the leg; the parsers and the parent rendering compile only under
+// the feature, crate-private for the same reason records is: a library
+// consumer must not run the parsers in process and bypass the jail.
+pub mod image_metadata;
 pub mod subprocess;
 mod visibility;
 mod workbook;
@@ -123,6 +217,11 @@ pub struct Outcome {
     pub warnings: Vec<String>,
     /// Structure spans over `text` for the segments file.
     pub segments: Vec<Segment>,
+    /// How the text was derived. Every text and structured converter
+    /// sets [`ArtifactKind::Text`]; the pixel-OCR converter sets
+    /// [`ArtifactKind::Ocr`], so the manifest records recognized text
+    /// as OCR rather than extraction.
+    pub artifact_kind: crate::manifest::ArtifactKind,
 }
 
 /// A conversion failure with a machine-readable reason.
@@ -181,6 +280,33 @@ pub fn normalize_text(input: &str) -> String {
     unified.nfc().collect()
 }
 
+/// Invisible format characters: code points that render nothing yet are
+/// neither whitespace nor control characters, so a bare emptiness check
+/// would let them through. The set is the soft hyphen, the zero-width
+/// and bidi marks (`U+200B`–`U+200F`), the bidi overrides and embeddings
+/// (`U+202A`–`U+202E`), the word joiner and invisible-operator block
+/// (`U+2060`–`U+2064`), and the byte-order mark (`U+FEFF`). Text whose
+/// only characters are these carries nothing a reader would see. The set
+/// is a documented minimum and is not narrowed; whitespace and control
+/// characters are handled separately by [`is_meaningful`], so the two
+/// together cover the empty-render cases.
+pub(crate) fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0xFEFF
+    )
+}
+
+/// Whether a character is meaningful content: something a reader would
+/// see on the page. Whitespace, control characters, and invisible format
+/// characters are not. This is the shared meaningful-text floor: the PDF
+/// recovery path and the image-OCR converter both gate on the presence
+/// of at least one such character, so a well-formed but content-free
+/// result fails closed rather than passing as a blank success.
+pub(crate) fn is_meaningful(c: char) -> bool {
+    !c.is_whitespace() && !c.is_control() && !is_invisible_format(c)
+}
+
 /// Passthrough for text-native formats.
 ///
 /// Reads the source as plain text and applies [`normalize_text`]. It
@@ -207,6 +333,15 @@ pub const NO_CONVERTER_REASON: &str = "no-converter";
 /// to it, but this binary's worker has no records mode, so the format
 /// is a deliberate capability gap rather than a converter error.
 pub const RECORDS_NOT_BUILT_REASON: &str = "records-worker-not-built";
+
+/// The reason raster-image formats record on a build without the
+/// `image-ocr` feature, or on a platform with no jail backend. The
+/// converter exists and the rules route to it, but this binary has no
+/// in-jail decode-plus-recognize path, so the format is a deliberate
+/// capability gap rather than a converter error. The checkpoint key
+/// includes `rules_version`, so a later feature-carrying build
+/// reconverts every such record.
+pub const IMAGE_OCR_NOT_BUILT_REASON: &str = "image-ocr-not-built";
 
 /// Registry id of the passthrough converter.
 pub const PASSTHROUGH_ID: &str = "text-passthrough";
@@ -330,6 +465,7 @@ impl Converter for PlainTextPassthrough {
             text,
             warnings,
             segments,
+            artifact_kind: crate::manifest::ArtifactKind::Text,
         })
     }
 }
@@ -345,6 +481,10 @@ struct RawRegistry {
     containers: Option<ContainerLimits>,
     #[serde(default)]
     records: Option<RecordsLimits>,
+    #[serde(default)]
+    image_ocr: Option<ImageOcrLimits>,
+    #[serde(default)]
+    image_metadata: Option<ImageMetadataLimits>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +514,13 @@ pub struct Registry {
     unsupported_reasons: HashMap<String, String>,
     container_limits: ContainerLimits,
     records_limits: RecordsLimits,
+    image_ocr_limits: ImageOcrLimits,
+    image_metadata_limits: ImageMetadataLimits,
+    /// Index into `converters` of the auxiliary image-metadata converter,
+    /// which never enters `by_format`. The pipeline reaches it by this
+    /// index to run the derived-child leg. `None` when the feature is
+    /// absent, so the leg simply does not run.
+    image_metadata_index: Option<usize>,
 }
 
 impl Registry {
@@ -392,9 +539,15 @@ impl Registry {
             message: e.to_string(),
         })?;
         let records_limits = raw.records.clone().unwrap_or_default();
+        let image_ocr_limits = raw.image_ocr.clone().unwrap_or_default();
+        let image_metadata_limits = raw.image_metadata.clone().unwrap_or_default();
         let mut converters: Vec<Box<dyn Converter>> = Vec::new();
         let mut by_format = HashMap::new();
         let mut unsupported_reasons = HashMap::new();
+        // Reassigned only under the feature; without it the auxiliary
+        // converter is never constructed and the index stays absent.
+        #[allow(unused_mut)]
+        let mut image_metadata_index: Option<usize> = None;
         for entry in &raw.converters {
             // A build without the records-worker feature has no records
             // mode in its worker, so route the records formats to a
@@ -424,6 +577,45 @@ impl Registry {
                 }
                 continue;
             }
+            // A build without the in-jail image decode path, or a
+            // platform with no jail backend, has no way to decode and
+            // recognize a raster, so route the image formats to a
+            // deliberate unsupported reason instead of a converter that
+            // cannot serve them. The rules stay one shared file: the
+            // routing decision is made here at construction.
+            #[cfg(not(all(unix, feature = "image-ocr")))]
+            if entry.id == subprocess::IMAGE_PIXEL_OCR_ID {
+                for format in &entry.formats {
+                    if RESERVED_FORMAT_IDS.contains(&format.as_str()) {
+                        return Err(Error::Rules {
+                            name: name.to_string(),
+                            message: format!("format id {format:?} is reserved"),
+                        });
+                    }
+                    if by_format.contains_key(format)
+                        || unsupported_reasons
+                            .insert(format.clone(), IMAGE_OCR_NOT_BUILT_REASON.to_string())
+                            .is_some()
+                    {
+                        return Err(Error::Rules {
+                            name: name.to_string(),
+                            message: format!("format {format:?} claimed twice"),
+                        });
+                    }
+                }
+                continue;
+            }
+            // The image-metadata converter is auxiliary and claims no
+            // formats. Without the in-jail metadata reader, or on a
+            // platform with no jail backend, the derived-child leg cannot
+            // run; there are no formats to route to a not-built reason, so
+            // the entry is simply skipped. The pipeline reads
+            // `image_metadata_converter()` as absent and never runs the
+            // leg.
+            #[cfg(not(all(unix, feature = "image-metadata")))]
+            if entry.id == image_metadata::IMAGE_METADATA_ID {
+                continue;
+            }
             let converter: Box<dyn Converter> = match entry.id.as_str() {
                 PASSTHROUGH_ID => Box::new(PlainTextPassthrough),
                 html::HTML_STRIP_ID => Box::new(HtmlStrip),
@@ -434,6 +626,14 @@ impl Registry {
                 subprocess::RECORDS_SUBPROCESS_ID => {
                     Box::new(RecordsSubprocess::new(records_limits.clone()))
                 }
+                #[cfg(all(unix, feature = "image-ocr"))]
+                subprocess::IMAGE_PIXEL_OCR_ID => {
+                    Box::new(subprocess::ImagePixelOcr::new(image_ocr_limits.clone()))
+                }
+                #[cfg(all(unix, feature = "image-metadata"))]
+                image_metadata::IMAGE_METADATA_ID => Box::new(subprocess::ImageMetadata::new(
+                    image_metadata_limits.clone(),
+                )),
                 other => {
                     return Err(Error::Rules {
                         name: name.to_string(),
@@ -453,6 +653,10 @@ impl Registry {
                 });
             }
             let index = converters.len();
+            #[cfg(all(unix, feature = "image-metadata"))]
+            if entry.id == image_metadata::IMAGE_METADATA_ID {
+                image_metadata_index = Some(index);
+            }
             converters.push(converter);
             for format in &entry.formats {
                 if RESERVED_FORMAT_IDS.contains(&format.as_str()) {
@@ -496,6 +700,9 @@ impl Registry {
             unsupported_reasons,
             container_limits: raw.containers.unwrap_or_default(),
             records_limits,
+            image_ocr_limits,
+            image_metadata_limits,
+            image_metadata_index,
         })
     }
 
@@ -519,6 +726,43 @@ impl Registry {
     /// The records worker ceilings from the rules.
     pub fn records_limits(&self) -> &RecordsLimits {
         &self.records_limits
+    }
+
+    /// The image-OCR jail limit profile from the rules.
+    pub fn image_ocr_limits(&self) -> &ImageOcrLimits {
+        &self.image_ocr_limits
+    }
+
+    /// The image-metadata parser ceilings from the rules.
+    pub fn image_metadata_limits(&self) -> &ImageMetadataLimits {
+        &self.image_metadata_limits
+    }
+
+    /// Test-only: drives the image formats through the fake-engine
+    /// image-OCR adapter instead of the pinned-runtime one, so a pipeline
+    /// test can compose a succeeding primary leg with the metadata leg.
+    /// The shared decode, area guards, and outcome mapping are the
+    /// production ones; only the recognition stage is the fake. A release
+    /// build has no such hook.
+    #[cfg(all(unix, feature = "image-ocr", feature = "test-adapters"))]
+    pub fn use_fake_image_ocr(&mut self) {
+        if let Some(index) = self
+            .converters
+            .iter()
+            .position(|c| c.id() == subprocess::IMAGE_PIXEL_OCR_ID)
+        {
+            self.converters[index] = Box::new(subprocess::ImagePixelOcr::new_fake(
+                self.image_ocr_limits.clone(),
+            ));
+        }
+    }
+
+    /// The auxiliary image-metadata converter, if the feature built one.
+    /// It never enters `by_format`, so the pipeline reaches it here to
+    /// run the derived-child leg. `None` means the leg does not run.
+    pub fn image_metadata_converter(&self) -> Option<&dyn Converter> {
+        self.image_metadata_index
+            .map(|index| self.converters[index].as_ref())
     }
 
     /// The reason a format is unsupported.
@@ -564,6 +808,9 @@ impl Registry {
             unsupported_reasons: HashMap::new(),
             container_limits: ContainerLimits::default(),
             records_limits: RecordsLimits::default(),
+            image_ocr_limits: ImageOcrLimits::default(),
+            image_metadata_limits: ImageMetadataLimits::default(),
+            image_metadata_index: None,
         }
     }
 }
@@ -711,7 +958,7 @@ mod tests {
     #[test]
     fn builtin_registry_claims_the_text_family() {
         let registry = Registry::builtin().unwrap();
-        assert_eq!(registry.version(), "7");
+        assert_eq!(registry.version(), "9");
         assert!(registry.converter_for("json").is_some());
         assert!(registry.converter_for("yaml").is_some());
         assert!(registry.converter_for("svg").is_some());
@@ -746,7 +993,32 @@ mod tests {
             registry.unsupported_reason("pickle"),
             Some("pickle-deserialization-unsafe")
         );
-        assert_eq!(registry.unsupported_reason("webp"), Some("engine-unpinned"));
+        // png, jpeg, and webp are claimed by the image-pixel-ocr
+        // converter now (the image-ocr feature is on under test), so
+        // they carry no unsupported reason. tiff stays engine-unpinned:
+        // the in-jail decoder deliberately excludes it.
+        for format in ["png", "jpeg", "webp"] {
+            assert_eq!(
+                registry.converter_for(format).map(|c| c.id()),
+                Some("image-pixel-ocr"),
+                "{format}"
+            );
+            assert_eq!(registry.unsupported_reason(format), None, "{format}");
+        }
+        assert_eq!(registry.unsupported_reason("tiff"), Some("engine-unpinned"));
+        // heic cannot be decoded by the pure-Rust jail path and fails
+        // closed until the opt-in external provider is built.
+        assert_eq!(
+            registry.unsupported_reason("heic"),
+            Some("no-jailed-rasterizer")
+        );
+        // ai routes to the pdf path: a PDF-backed .ai keeps its text
+        // layer, and a legacy PostScript-backed .ai fails closed with a
+        // pdf-family reason rather than as an unknown format.
+        assert_eq!(
+            registry.converter_for("ai").map(|c| c.id()),
+            Some("pdf-subprocess")
+        );
         // Parquet, avro, and sqlite are claimed by the records worker
         // now, so they carry no unsupported reason. arrow and the rest
         // stay deferred.
@@ -777,7 +1049,6 @@ mod tests {
         );
         // A claimed format has no unsupported reason.
         assert_eq!(registry.unsupported_reason("text"), None);
-        assert_eq!(registry.unsupported_reason("png"), Some("engine-unpinned"));
         assert_eq!(registry.unsupported_reason("mp4"), Some("engine-unpinned"));
         // html is claimed now, and msg stays on the floor: it is a
         // compound file, not an RFC 822 message.
@@ -786,6 +1057,43 @@ mod tests {
             registry.unsupported_reason("msg"),
             Some(NO_CONVERTER_REASON)
         );
+    }
+
+    // The raster family routes to a live converter when the `image-ocr`
+    // feature is built with a jail backend, and to a deliberate
+    // `image-ocr-not-built` capability gap otherwise. Both arms are
+    // asserted here through a runtime branch, so both compile in every
+    // configuration and neither rots. The self dev-dependency turns the
+    // feature on for the normal suite, so `cargo test` runs the feature-
+    // present arm; the feature-absent arm runs whenever the crate is
+    // built without the feature, which is a documented CI step:
+    //
+    //   cargo test --no-default-features -p text-mirror   # crate built
+    //   without the self dev-dependency, so the feature is genuinely off
+    //
+    // The unsupported reason itself is asserted directly regardless of
+    // configuration so the not-built plumbing never goes untested.
+    #[test]
+    fn the_raster_family_routes_by_the_image_ocr_feature() {
+        let registry = Registry::builtin().unwrap();
+        let feature_present = cfg!(all(unix, feature = "image-ocr"));
+        for format in ["png", "jpeg", "webp"] {
+            if feature_present {
+                // A live converter claims the format, so it carries no
+                // unsupported reason.
+                assert!(registry.converter_for(format).is_some(), "{format}");
+                assert_eq!(registry.unsupported_reason(format), None, "{format}");
+            } else {
+                // A deliberate capability gap: no converter, and the
+                // not-built reason rather than a converter error.
+                assert!(registry.converter_for(format).is_none(), "{format}");
+                assert_eq!(
+                    registry.unsupported_reason(format),
+                    Some(IMAGE_OCR_NOT_BUILT_REASON),
+                    "{format}"
+                );
+            }
+        }
     }
 
     #[test]

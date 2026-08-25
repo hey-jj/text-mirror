@@ -1,6 +1,6 @@
 # text-mirror operator skill
 
-Orchestrates conversion runs with the `text-mirror` CLI. The agent sequences and reports. It makes no content judgments and never edits converted text.
+Drives conversion runs with the `text-mirror` CLI. The agent sequences and reports. It makes no content judgments and never edits converted text.
 
 ## Loop, per division
 

@@ -84,7 +84,7 @@ fn text_native_formats_convert_through_the_passthrough() {
         assert_eq!(record.status, Status::Converted, "{path}");
         assert_eq!(record.detected_format, format, "{path}");
         assert_eq!(record.converter_id.as_deref(), Some("text-passthrough"));
-        assert_eq!(record.rules_version, "7");
+        assert_eq!(record.rules_version, "9");
     }
 
     // svg passes through as raw markup and ipynb as the raw notebook
@@ -139,11 +139,10 @@ fn unsupported_reasons_name_every_deliberate_exclusion() {
     )
     .unwrap();
     fs::write(setup.root.join("mock.psd"), b"8BPS\x00\x01\x00\x00\x00\x00").unwrap();
-    fs::write(
-        setup.root.join("photo.webp"),
-        b"RIFF\x24\x00\x00\x00WEBPVP8 ",
-    )
-    .unwrap();
+    // tiff stays engine-unpinned: the in-jail decoder excludes it. png,
+    // jpeg, and webp moved to the image-pixel-ocr converter and are
+    // exercised in the image-OCR suite.
+    fs::write(setup.root.join("scan.tiff"), b"II*\x00\x08\x00\x00\x00").unwrap();
     fs::write(setup.root.join("opaque.blob"), b"\x00\xfe\xedopaque bytes").unwrap();
 
     let report = run(&setup);
@@ -155,7 +154,7 @@ fn unsupported_reasons_name_every_deliberate_exclusion() {
         ("table.arrow", "arrow", "converter-deferred"),
         ("backup.tar", "tar", "container-deferred"),
         ("mock.psd", "psd", "proprietary-binary"),
-        ("photo.webp", "webp", "engine-unpinned"),
+        ("scan.tiff", "tiff", "engine-unpinned"),
         ("opaque.blob", "unknown", "no-converter"),
     ] {
         let record = terminal(&setup, path);
@@ -252,7 +251,7 @@ fn a_prior_unsupported_record_reconverts_under_the_new_rules() {
     let record = terminal(&setup, "data.json");
     assert_eq!(record.status, Status::Converted);
     assert_eq!(record.detected_format, "json");
-    assert_eq!(record.rules_version, "7");
+    assert_eq!(record.rules_version, "9");
     assert_eq!(
         fs::read_to_string(setup.mirror.join("alpha/data.json.txt")).unwrap(),
         String::from_utf8_lossy(bytes)
@@ -372,7 +371,7 @@ fn a_prior_invalid_utf8_failure_reconverts_under_the_new_rules() {
 
     let record = terminal(&setup, "legacy.csv");
     assert_eq!(record.status, Status::Converted);
-    assert_eq!(record.rules_version, "7");
+    assert_eq!(record.rules_version, "9");
     assert_eq!(record.converter_version.as_deref(), Some("1.2.0"));
     assert!(record.error.is_none());
     assert_eq!(

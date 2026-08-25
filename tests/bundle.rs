@@ -602,7 +602,7 @@ fn ascii_case_fold_collision_is_refused() {
     let shard_bytes = fs::read(&shard).unwrap();
     let shard_digest = hash::hash_bytes(&shard_bytes);
 
-    // Rebuild checksums by hand so both case variants are listed even
+    // Recompute the checksums by hand so both case variants are listed even
     // where the filesystem stores only one of them.
     let mut lines: Vec<String> = fs::read_to_string(out.join("checksums.b3"))
         .unwrap()
@@ -794,14 +794,16 @@ fn rules_snapshot_binds_to_the_records() {
     let setup = setup();
     run_division(&setup, "emea", &[("a.txt", "content\n")]);
 
-    // Receiving side: a forged effective record from rules 9.
+    // Receiving side: a forged effective record from the next rules
+    // generation, whatever the current one is.
     let current = Rules::builtin().unwrap().version().to_string();
+    let next = current.parse::<u32>().unwrap() + 1;
     let out = bundle_division(&setup, "emea", "case-rules-version");
     let shard = out.join("manifest/emea.jsonl");
     let line = fs::read_to_string(&shard).unwrap();
     let forged = line.replace(
         &format!("\"rules_version\":\"{current}\""),
-        "\"rules_version\":\"9\"",
+        &format!("\"rules_version\":\"{next}\""),
     );
     assert_ne!(line, forged);
     fs::write(&shard, &forged).unwrap();
@@ -817,7 +819,10 @@ fn rules_snapshot_binds_to_the_records() {
     // Receiving side: the two snapshot files disagree.
     let out = bundle_division(&setup, "emea", "case-rules-disagree");
     let formats = fs::read_to_string(out.join("rules/formats.toml")).unwrap();
-    let bumped = formats.replace(&format!("version = \"{current}\""), "version = \"9\"");
+    let bumped = formats.replace(
+        &format!("version = \"{current}\""),
+        &format!("version = \"{next}\""),
+    );
     assert_ne!(formats, bumped);
     fs::write(out.join("rules/formats.toml"), &bumped).unwrap();
     refresh_checksums(&out);
@@ -835,7 +840,7 @@ fn rules_snapshot_binds_to_the_records() {
     let line = fs::read_to_string(&prep_shard).unwrap();
     let forged = line.replace(
         &format!("\"rules_version\":\"{current}\""),
-        "\"rules_version\":\"9\"",
+        &format!("\"rules_version\":\"{next}\""),
     );
     fs::write(&prep_shard, &forged).unwrap();
     let result = bundle::bundle(&BundleOptions {

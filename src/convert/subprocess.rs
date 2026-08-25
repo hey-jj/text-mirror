@@ -58,6 +58,11 @@ pub const RECORDS_SUBPROCESS_ID: &str = "records-worker";
 /// Version of the jailed records worker adapter.
 pub const RECORDS_SUBPROCESS_VERSION: &str = "1.0.0";
 
+/// Registry id of the in-jail pixel-OCR converter for raster images.
+pub const IMAGE_PIXEL_OCR_ID: &str = "image-pixel-ocr";
+/// Version of the in-jail pixel-OCR converter.
+pub const IMAGE_PIXEL_OCR_VERSION: &str = "1.0.0";
+
 /// Registry id of the OCR adapter.
 pub const OCR_ADAPTER_ID: &str = "ocr-adapter";
 /// Version of the OCR adapter.
@@ -101,6 +106,7 @@ mod imp {
 
     use super::*;
     use crate::convert::RecordsLimits;
+    use crate::manifest::ArtifactKind;
     use crate::runner::protocol::bodies::{
         AsrOk, AsrRequest, OcrInput, OcrOk, OcrRequest, PdfOk, PdfRequest, RecordsOk,
         RecordsRequest, VideoOk, VideoRequest,
@@ -128,6 +134,23 @@ mod imp {
             "record-limit-exceeded",
             "records_read_error",
             "not_sqlite",
+            // Image-OCR worker reasons. Each must survive the wire-to-
+            // static mapping so the manifest keeps the specific reason
+            // rather than collapsing it to adapter_error.
+            "image-ocr-decode-failed",
+            "image-ocr-area-exceeded",
+            "image-ocr-runtime-missing",
+            "image-ocr-runtime-mismatch",
+            "image-ocr-no-accelerator",
+            "ocr-protocol-error",
+            // Image-metadata worker reasons. Each must survive the wire-
+            // to-static mapping so the manifest keeps the specific reason
+            // rather than collapsing it to adapter_error.
+            "image-metadata-malformed",
+            "image-metadata-decompress-exceeded",
+            "image-metadata-xml-exceeded",
+            "image-metadata-limit-exceeded",
+            "image-metadata-unsupported",
         ];
         KNOWN
             .iter()
@@ -197,7 +220,12 @@ mod imp {
             source: &[u8],
             detected_format: &str,
         ) -> std::result::Result<Outcome, ConvertError> {
-            if detected_format != "pdf" {
+            // ai routes here too: a modern .ai is a PDF-compatible
+            // container, so the same worker path extracts its text
+            // layer with the pdf-family warnings and recovery route. A
+            // legacy PostScript-backed .ai has no PDF text layer and
+            // fails closed with a pdf-family reason.
+            if !matches!(detected_format, "pdf" | "ai") {
                 return Err(ConvertError {
                     code: "unclaimed_format",
                     message: format!(
@@ -215,6 +243,7 @@ mod imp {
             )?;
             let (converter_id, converter_version) = pdf_converter_identity(body.recovered);
             Ok(Outcome {
+                artifact_kind: ArtifactKind::Text,
                 converter_id: converter_id.to_string(),
                 converter_version: converter_version.to_string(),
                 detected_format: detected_format.to_string(),
@@ -280,12 +309,240 @@ mod imp {
                 &[(&input, source)],
             )?;
             Ok(Outcome {
+                artifact_kind: ArtifactKind::Text,
                 converter_id: RECORDS_SUBPROCESS_ID.to_string(),
                 converter_version: RECORDS_SUBPROCESS_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
                 text: body.text,
                 warnings: body.warnings,
                 segments: body.segments,
+            })
+        }
+    }
+
+    /// The in-jail image-metadata converter: the derived-child leg that
+    /// lifts textual metadata out of a raster behind the same jail as the
+    /// records worker.
+    ///
+    /// The carrier and surface parsers pull decompression and expansion
+    /// surfaces a hostile image can flood, so they never run in this
+    /// process. Each source stages into the jail and the parsers run in
+    /// the worker, where a bomb or a flood times out or crashes the child
+    /// and records a failed child without touching the pipeline. The
+    /// ceilings come from the rules and travel in the request. The parent
+    /// holds no parser code: it renders the returned rows to the tabular
+    /// artifact and builds one hidden segment per row, so the output
+    /// contract and the hidden marking stay in the crate. Zero rows is
+    /// the not-applicable outcome, mapped to a distinct reason the
+    /// pipeline reads as write-nothing rather than a failure.
+    #[cfg(feature = "image-metadata")]
+    pub struct ImageMetadata {
+        limits: crate::convert::ImageMetadataLimits,
+    }
+
+    #[cfg(feature = "image-metadata")]
+    impl ImageMetadata {
+        /// An adapter over the rules-supplied metadata ceilings.
+        pub fn new(limits: crate::convert::ImageMetadataLimits) -> ImageMetadata {
+            ImageMetadata { limits }
+        }
+    }
+
+    #[cfg(feature = "image-metadata")]
+    impl Converter for ImageMetadata {
+        fn id(&self) -> &'static str {
+            crate::convert::image_metadata::IMAGE_METADATA_ID
+        }
+
+        fn version(&self) -> &'static str {
+            crate::convert::image_metadata::IMAGE_METADATA_VERSION
+        }
+
+        fn convert(
+            &self,
+            source: &[u8],
+            detected_format: &str,
+        ) -> std::result::Result<Outcome, ConvertError> {
+            use crate::runner::protocol::bodies::{ImageMetadataOk, ImageMetadataRequest};
+            if !crate::convert::image_metadata::image_metadata_applies(detected_format) {
+                return Err(ConvertError {
+                    code: "unclaimed_format",
+                    message: format!("the image-metadata worker does not read {detected_format}"),
+                });
+            }
+            let input = format!("input.{detected_format}");
+            let body: ImageMetadataOk = call(
+                shared_runner()?,
+                "image-metadata",
+                &ImageMetadataRequest {
+                    input: input.clone(),
+                    format: detected_format.to_string(),
+                    max_decompressed_bytes: self.limits.max_decompressed_bytes,
+                    max_xml_depth: self.limits.max_xml_depth,
+                    max_xml_events: self.limits.max_xml_events,
+                    max_boxes: self.limits.max_boxes,
+                    max_rows: self.limits.max_rows,
+                    max_output_bytes: self.limits.max_output_bytes,
+                },
+                &[(&input, source)],
+            )?;
+            // Zero rows is not-applicable: the image carries no textual
+            // metadata, so the parent writes nothing for this leg.
+            if body.rows.is_empty() {
+                return Err(ConvertError {
+                    code: crate::convert::image_metadata::IMAGE_METADATA_NOT_APPLICABLE,
+                    message: "the image carries no textual metadata".to_string(),
+                });
+            }
+            let (text, segments) = crate::convert::image_metadata::render_rows(&body.rows);
+            // A positive row count that renders to nothing is a fault, not
+            // a blank success, matching the other adapters' floor.
+            if text.is_empty() {
+                return Err(empty_output(source.len()));
+            }
+            Ok(Outcome {
+                artifact_kind: ArtifactKind::Text,
+                converter_id: crate::convert::image_metadata::IMAGE_METADATA_ID.to_string(),
+                converter_version: crate::convert::image_metadata::IMAGE_METADATA_VERSION
+                    .to_string(),
+                detected_format: detected_format.to_string(),
+                text,
+                warnings: Vec::new(),
+                segments,
+            })
+        }
+    }
+
+    /// The in-jail pixel-OCR converter for raster images.
+    ///
+    /// png, jpeg, and webp stage into the jail by bare name and the
+    /// worker decodes them with the pure-Rust image crate, asserts the
+    /// encoder-input area cap, re-encodes a canonical raster, and hands
+    /// it to the pinned vision engine as a hash-verified jailed child.
+    /// The parent does no image parsing: it selects the worker mode,
+    /// stages the bytes, and maps the fenced recognition to the outcome
+    /// shape with [`ArtifactKind::Ocr`]. The engine is machine-class
+    /// scoped, so the recognized text carries no cross-platform
+    /// byte-equality claim; only the pure-Rust decode does.
+    #[cfg(feature = "image-ocr")]
+    pub struct ImagePixelOcr {
+        /// The worker mode this converter drives. Production always uses
+        /// the pinned-runtime `image-ocr` mode; the test-only fake
+        /// constructor selects the harness `image-ocr-fake` mode.
+        mode: &'static str,
+        /// This instance's own runner, built from its own limits at
+        /// construction. Security ceilings are per-registry rules data,
+        /// so each converter owns its runner rather than sharing a
+        /// process-global cache whose ceilings the first caller would
+        /// fix for every later one.
+        runner: Result<Runner, RunnerError>,
+    }
+
+    #[cfg(feature = "image-ocr")]
+    impl ImagePixelOcr {
+        /// An adapter over the rules-supplied image-OCR jail profile. It
+        /// drives the production `image-ocr` worker mode, which fails
+        /// closed with `image-ocr-runtime-missing` until a deployment
+        /// wires the pinned runtime.
+        pub fn new(limits: crate::convert::ImageOcrLimits) -> ImagePixelOcr {
+            ImagePixelOcr {
+                mode: "image-ocr",
+                runner: build_image_runner(image_runner_limits(&limits)),
+            }
+        }
+
+        /// A test-only converter that drives the harness `image-ocr-fake`
+        /// worker mode instead of the pinned-runtime mode. It shares the
+        /// identical decode, area guards, and outcome mapping; only stage
+        /// 3 is the deterministic fake. The registry never constructs
+        /// this, so a release build's image converter always drives the
+        /// production mode and never ships fake recognition.
+        #[cfg(feature = "test-adapters")]
+        pub fn new_fake(limits: crate::convert::ImageOcrLimits) -> ImagePixelOcr {
+            ImagePixelOcr {
+                mode: "image-ocr-fake",
+                runner: build_image_runner(image_runner_limits(&limits)),
+            }
+        }
+    }
+
+    /// Maps the rules-supplied image-OCR profile onto the runner limits.
+    #[cfg(feature = "image-ocr")]
+    fn image_runner_limits(limits: &crate::convert::ImageOcrLimits) -> crate::runner::Limits {
+        crate::runner::Limits {
+            wall_timeout: std::time::Duration::from_secs(limits.wall_timeout_secs),
+            max_response_bytes: limits.max_response_bytes,
+            max_stderr_bytes: limits.max_stderr_bytes,
+            address_space_bytes: limits.address_space_bytes,
+            cpu_seconds: limits.cpu_seconds,
+            file_size_bytes: limits.file_size_bytes,
+            max_processes: limits.max_processes,
+        }
+    }
+
+    /// Builds one runner for the image-OCR jail profile. Called once per
+    /// converter instance, so the ceilings that travel are exactly this
+    /// registry's, never a leftover from an earlier caller.
+    #[cfg(feature = "image-ocr")]
+    fn build_image_runner(limits: crate::runner::Limits) -> Result<Runner, RunnerError> {
+        Ok(Runner::new(
+            crate::runner::jail::platform_backend()?,
+            crate::runner::locate_worker()?,
+            limits,
+        ))
+    }
+
+    #[cfg(feature = "image-ocr")]
+    impl Converter for ImagePixelOcr {
+        fn id(&self) -> &'static str {
+            IMAGE_PIXEL_OCR_ID
+        }
+
+        fn version(&self) -> &'static str {
+            IMAGE_PIXEL_OCR_VERSION
+        }
+
+        fn convert(
+            &self,
+            source: &[u8],
+            detected_format: &str,
+        ) -> std::result::Result<Outcome, ConvertError> {
+            if !matches!(detected_format, "png" | "jpeg" | "webp") {
+                return Err(ConvertError {
+                    code: "unclaimed_format",
+                    message: format!(
+                        "the image-pixel-ocr converter does not handle {detected_format}"
+                    ),
+                });
+            }
+            let runner = self
+                .runner
+                .as_ref()
+                .map_err(|e| runner_failure(e.clone()))?;
+            let input = format!("input.{detected_format}");
+            let body: OcrOk = call(
+                runner,
+                self.mode,
+                &OcrRequest {
+                    input: input.clone(),
+                    kind: OcrInput::Image,
+                },
+                &[(&input, source)],
+            )?;
+            // The worker's own notes (such as the long-edge validation
+            // note) propagate; the span mapping appends any low-confidence
+            // ones and applies the meaningful-text floor.
+            let mut warnings = body.warnings;
+            let (text, low_confidence) = render_ocr_spans(&body.spans, source.len())?;
+            warnings.extend(low_confidence);
+            Ok(Outcome {
+                converter_id: IMAGE_PIXEL_OCR_ID.to_string(),
+                converter_version: IMAGE_PIXEL_OCR_VERSION.to_string(),
+                detected_format: detected_format.to_string(),
+                artifact_kind: ArtifactKind::Ocr,
+                segments: vec![Segment::span(0, text.len(), "document")],
+                text,
+                warnings,
             })
         }
     }
@@ -333,7 +590,9 @@ mod imp {
                 },
                 &[(&input, source)],
             )?;
-            let mut warnings = Vec::new();
+            // Propagate the worker's own notes rather than starting a
+            // fresh vec, then append the low-confidence ones.
+            let mut warnings = body.warnings;
             let mut lines = Vec::new();
             for (index, span) in body.spans.iter().enumerate() {
                 if !(0.0..=1.0).contains(&span.confidence) {
@@ -358,6 +617,8 @@ mod imp {
                 return Err(empty_output(source.len()));
             }
             Ok(Outcome {
+                // Recognized text is OCR, not extraction.
+                artifact_kind: ArtifactKind::Ocr,
                 converter_id: OCR_ADAPTER_ID.to_string(),
                 converter_version: OCR_ADAPTER_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
@@ -420,6 +681,8 @@ mod imp {
                 return Err(empty_output(source.len()));
             }
             Ok(Outcome {
+                // A speech transcript, not extracted text.
+                artifact_kind: ArtifactKind::Transcript,
                 converter_id: ASR_ADAPTER_ID.to_string(),
                 converter_version: ASR_ADAPTER_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
@@ -483,6 +746,7 @@ mod imp {
                 return Err(empty_output(source.len()));
             }
             Ok(Outcome {
+                artifact_kind: ArtifactKind::Text,
                 converter_id: VIDEO_ADAPTER_ID.to_string(),
                 converter_version: VIDEO_ADAPTER_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
@@ -501,6 +765,10 @@ mod imp {
     }
 }
 
+#[cfg(all(unix, feature = "image-metadata"))]
+pub use imp::ImageMetadata;
+#[cfg(all(unix, feature = "image-ocr"))]
+pub use imp::ImagePixelOcr;
 #[cfg(unix)]
 pub use imp::{AsrAdapter, OcrAdapter, PdfSubprocess, RecordsSubprocess, VideoAdapter};
 
@@ -639,6 +907,55 @@ fn finish_lines(lines: Vec<String>) -> String {
         text.push('\n');
         text
     }
+}
+
+/// Renders recognized spans to normalized text plus the low-confidence
+/// warnings, applying two floors so a well-formed but content-free
+/// recognition cannot pass as a blank success.
+///
+/// A span confidence outside 0 to 1 is a protocol error. A span under
+/// [`OCR_CONFIDENCE_WARNING`] adds one low-confidence warning. After the
+/// lines are joined and normalized, the meaningful-text floor applies:
+/// on a non-empty source, text with no meaningful character (only
+/// whitespace, control, or invisible-format code points, exactly the
+/// class the PDF recovery path gates on) fails closed with
+/// `empty_output` rather than emitting a blank artifact. This is where a
+/// well-formed but empty recognition envelope is caught: the envelope
+/// grammar keeps `ocr-protocol-error` for malformed stdout, and an
+/// empty-but-well-formed recognition lands here as `empty_output`.
+#[cfg(all(unix, feature = "image-ocr"))]
+pub(crate) fn render_ocr_spans(
+    spans: &[crate::runner::protocol::bodies::OcrSpan],
+    source_len: usize,
+) -> Result<(String, Vec<String>), ConvertError> {
+    let mut warnings = Vec::new();
+    let mut lines = Vec::new();
+    for (index, span) in spans.iter().enumerate() {
+        if !(0.0..=1.0).contains(&span.confidence) {
+            return Err(ConvertError {
+                code: "ocr-protocol-error",
+                message: format!(
+                    "span {index} confidence {} is outside 0 to 1",
+                    span.confidence
+                ),
+            });
+        }
+        if span.confidence < OCR_CONFIDENCE_WARNING {
+            warnings.push(format!(
+                "ocr_low_confidence: span {index} at {:.2}",
+                span.confidence
+            ));
+        }
+        lines.push(single_line(&span.text));
+    }
+    let text = normalize_text(&finish_lines(lines));
+    if source_len > 0 && !text.chars().any(crate::convert::is_meaningful) {
+        return Err(ConvertError {
+            code: "empty_output",
+            message: format!("source is {source_len} bytes but conversion produced no text"),
+        });
+    }
+    Ok((text, warnings))
 }
 
 #[cfg(test)]

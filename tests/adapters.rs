@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use text_mirror::convert::Converter;
 use text_mirror::convert::subprocess::{AsrAdapter, OcrAdapter, VideoAdapter};
+use text_mirror::manifest::ArtifactKind;
 use text_mirror::runner::jail::platform_backend;
 use text_mirror::runner::{Limits, Runner, locate_worker};
 
@@ -35,6 +36,8 @@ fn the_ocr_adapter_renders_spans_and_flags_low_confidence() {
         .convert(b"fake png bytes", "png")
         .expect("the OCR adapter converts");
     assert_eq!(outcome.converter_id, "ocr-adapter");
+    // Recognized text is stamped as OCR, not extraction.
+    assert_eq!(outcome.artifact_kind, ArtifactKind::Ocr);
     assert!(outcome.text.contains("recognized from image"));
     assert!(outcome.text.contains("faint line"));
     // The fake engine returns one span below the confidence floor.
@@ -61,6 +64,8 @@ fn the_asr_adapter_renders_the_transcript_format() {
         .convert(b"fake mp3 bytes", "mp3")
         .expect("the ASR adapter converts");
     assert_eq!(outcome.converter_id, "asr-adapter");
+    // A speech transcript, not extracted text.
+    assert_eq!(outcome.artifact_kind, ArtifactKind::Transcript);
     assert_eq!(
         outcome.text,
         "[00:00:00 -> 00:00:04] Speaker 1: welcome to the recording\n\

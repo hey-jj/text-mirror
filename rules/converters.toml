@@ -7,7 +7,7 @@
 # must match the version in formats.toml and is recorded in every
 # manifest record as rules_version.
 
-version = "7"
+version = "9"
 
 # The passthrough validates UTF-8 and fails closed on anything else,
 # so a binary wearing one of these extensions records failed with
@@ -64,10 +64,41 @@ formats = ["xls", "xlsx", "xlsm", "ods"]
 # so hostile PDF bytes crash a jailed child and never the pipeline.
 # The outcome, warnings, and failure reasons match the earlier
 # in-process path, so records differ only in this converter id.
+#
+# ai routes here too: a modern .ai is a PDF-compatible container, so
+# extracting its text layer through this same path keeps the pdf-family
+# warnings and the recovery route. A legacy PostScript-backed .ai has
+# no PDF text layer and fails closed with a pdf-family reason.
 [[converters]]
 id = "pdf-subprocess"
 version = "1.0.0"
-formats = ["pdf"]
+formats = ["pdf", "ai"]
+
+# Raster images run pixel-only OCR behind the subprocess jail. The
+# image bytes are decoded in-jail by the pure-Rust image crate, the
+# encoder-input area cap is asserted, and the pinned vision engine
+# reads the pixels. Gated behind the image-ocr feature; without it
+# these formats route to image-ocr-not-built at registry construction.
+# The limits live in the [image_ocr] section below.
+[[converters]]
+id = "image-pixel-ocr"
+version = "1.0.0"
+formats = ["png", "jpeg", "webp"]
+
+# Image-metadata is an auxiliary converter: one image source yields the
+# pixel-OCR text as its primary artifact and the textual metadata as a
+# hidden derived child at <source>.d/#image-metadata. It claims no
+# formats, so it never enters the format routing table and never competes
+# for a claim; the pipeline runs it as a derived-child leg for the image
+# carriers. The exif, png text-chunk, xmp, iptc, and iso base media file
+# format parsers all run behind the same subprocess jail as the records
+# worker. Gated behind the image-metadata feature; without it, and with
+# no formats to route, the entry is skipped at registry construction. The
+# ceilings live in the [image_metadata] section below.
+[[converters]]
+id = "image-metadata"
+version = "1.0.0"
+formats = []
 
 # Parquet, avro, and sqlite run behind the same subprocess jail as the
 # PDF path. These parsers pull large native trees with CVE history, so
@@ -91,13 +122,24 @@ formats = ["xlsb", "xla", "xlam"]
 # pinned yet. Until a rules bump pins an engine version and model
 # hash, each records unsupported with this reason and no artifact.
 # The checkpoint key includes rules_version, so the bump that pins an
-# engine re-runs every such record automatically.
+# engine re-runs every such record automatically. png, jpeg, and webp
+# moved to the image-pixel-ocr converter above; tiff stays here because
+# the in-jail decoder deliberately excludes it.
 [[unsupported]]
 reason = "engine-unpinned"
 formats = [
-  "png", "jpeg", "tiff", "webp", "heic",
+  "tiff",
   "mp3", "wav", "m4a", "mp4", "mov",
 ]
+
+# Formats whose pixels require an external rasterizer that parses
+# untrusted bytes outside the pure-Rust jail decode: HEVC-coded heic
+# cannot be decoded by the in-jail image crate. Fail closed by default;
+# reachable only through the opt-in external-provider config, which is
+# not built in this core release.
+[[unsupported]]
+reason = "no-jailed-rasterizer"
+formats = ["heic"]
 
 # Deserializing a pickle stream executes arbitrary code, so no
 # pickle deserializer exists in this tree. Never add one. Bytes that
@@ -161,3 +203,60 @@ max_records = 100000
 max_tables = 256
 # Rendered output bytes, under the runner's response cap. 64 MiB.
 max_output_bytes = 67108864
+
+# Image-OCR jail limit profile, versioned with the rest of the rules.
+# The default runner limits are tuned for the pure-Rust document
+# worker; the pinned vision runtime maps a far larger working set, so
+# the image-OCR converter carries its own ceilings. They are a
+# containment envelope, not a working-set target, and a deployment
+# raises them only in a visible versioned bump. RLIMIT_AS is applied on
+# Linux only; on macOS the dyld shared cache reserves a large virtual
+# range, so the macOS helper does not set it and the wall clock, output
+# caps, cpu, file-size, and process caps plus the sandbox are the bound.
+[image_ocr]
+# Single image: decode plus a bounded greedy decode on the pinned
+# compute shape, no batching. 300 s.
+wall_timeout_secs = 300
+# Clears the worst-case escaped response with over 5x margin, far below
+# the 192 MiB default so a runaway frame is still refused. 8 MiB.
+max_response_bytes = 8388608
+# Engine diagnostics land on stderr; 4 MiB avoids a false overflow from
+# ordinary logging while still bounding a flood. 4 MiB.
+max_stderr_bytes = 4194304
+# A containment ceiling that must exceed the mapped runtime and host
+# reservations, which are machine-class bound. 64 GiB.
+address_space_bytes = 68719476736
+# A GPU runtime spends little CPU; generous so the cpu limit does not
+# fire before the wall clock, which is the intended bound. 600 s.
+cpu_seconds = 600
+# Bounds the in-jail re-encoded raster the engine reads. A 2.36 MP RGB
+# raster is under 10 MiB uncompressed and smaller as PNG. 64 MiB.
+file_size_bytes = 67108864
+# The GPU driver spins its own threads; 64 gives headroom over the
+# default 16. A per-uid ceiling, not a per-invocation one.
+max_processes = 64
+
+# Image-metadata parser ceilings, versioned with the rest of the rules.
+# The metadata worker runs behind the shared platform-default jail, so
+# these are the parser-surface ceilings only, not the wall-clock and
+# address-space envelope the runner already imposes. The parent reads
+# them and passes them into the jailed worker, which enforces them and
+# fails a source over any ceiling with a stable image-metadata reason and
+# no artifact. A deployment that needs more raises them in a visible
+# versioned bump.
+[image_metadata]
+# Inflated-size ceiling for one compressed text block, the png zTXt and
+# compressed iTXt streams above all. Checked incrementally during
+# inflation so a decompression bomb is stopped before it lands. 16 MiB.
+max_decompressed_bytes = 16777216
+# Nesting-depth ceiling for an xmp parse.
+max_xml_depth = 100
+# Event-count ceiling for an xmp parse.
+max_xml_events = 1000000
+# Box-count ceiling for an iso base media file format carrier.
+max_boxes = 10000
+# Ceiling on emitted metadata rows across all surfaces.
+max_rows = 4096
+# Ceiling on the rendered value bytes, under the runner response cap.
+# 16 MiB.
+max_output_bytes = 16777216

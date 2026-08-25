@@ -187,10 +187,14 @@ fn a_normal_zip_expands_to_a_listing_and_children() {
     let rules = Rules::builtin().unwrap();
 
     let report = run_with(&setup, &rules);
-    // Parent listing, the docx, and the txt convert. The png is
-    // unsupported. Four records touched, three converted.
+    // Parent listing, the docx, and the txt convert. The png is claimed
+    // by the image converter now, so its truncated bytes fail closed in
+    // the jailed decoder, and its metadata leg fails closed too on the
+    // same malformed carrier, so the png member touches two failed
+    // records. Three converted, two failed.
     assert_eq!(report.counts.converted, 3);
-    assert_eq!(report.counts.unsupported, 1);
+    assert_eq!(report.counts.unsupported, 0);
+    assert_eq!(report.counts.failed, 2);
 
     let parent = terminal(&setup, "update.zip").unwrap();
     assert_eq!(parent.status, Status::Converted);
@@ -215,9 +219,25 @@ fn a_normal_zip_expands_to_a_listing_and_children() {
     );
 
     let png = terminal(&setup, "update.zip.d/pic.png").unwrap();
-    assert_eq!(png.status, Status::Unsupported);
+    assert_eq!(png.status, Status::Failed);
     assert_eq!(png.parent_source.as_deref(), Some("update.zip"));
-    assert_eq!(png.error.as_deref(), Some("engine-unpinned"));
+    assert!(
+        png.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("image-ocr-decode-failed")),
+        "{:?}",
+        png.error
+    );
+
+    // The member image's metadata leg is a separate derived child that
+    // fails closed on the same malformed carrier, linked to the member.
+    let png_meta = terminal(&setup, "update.zip.d/pic.png.d/#image-metadata").unwrap();
+    assert_eq!(png_meta.status, Status::Failed);
+    assert_eq!(
+        png_meta.parent_source.as_deref(),
+        Some("update.zip.d/pic.png")
+    );
+    assert_eq!(png_meta.converter_id.as_deref(), Some("image-metadata"));
 }
 
 // Nested zips expand recursively down to the depth cap.

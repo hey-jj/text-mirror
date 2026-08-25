@@ -201,6 +201,7 @@ impl Converter for AnydocDocument {
 
         let segments = vec![Segment::span(0, text.len(), "document")];
         Ok(Outcome {
+            artifact_kind: crate::manifest::ArtifactKind::Text,
             converter_id: ANYDOC_ID.to_string(),
             converter_version: ANYDOC_VERSION.to_string(),
             detected_format: detected_format.to_string(),
