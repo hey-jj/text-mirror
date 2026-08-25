@@ -8,6 +8,16 @@ Versioning.
 
 ### Added
 
+- A default noise policy on the directory walk. `WalkOptions` gained an
+  `ignore_suffixes` list, matched against a bare entry name at any depth
+  the way `ignore_names` already matched by exact equality, and a
+  skipped directory still hides its whole subtree. `WalkOptions::default()`
+  now carries the shipped policy: the `.DS_Store` sidecar by name, and
+  the `-wal`, `-shm`, and `.tmp` suffixes. The `scan` and `run` commands
+  build their options that way, so the excludes are on for both.
+  Data-bearing dotfiles stay in scope: `.env`, ssh keys, `.gitconfig`,
+  and `.config`-style files are classification targets, and a `.d`
+  config directory is walked as a source.
 - An in-jail image-metadata converter that lifts the textual metadata a
   raster image carries and records it as a hidden derived child. One
   image source yields two independent artifacts: the pixel text from
@@ -54,6 +64,10 @@ Versioning.
   metadata-bearing image likewise adds one converted child. Run failure
   and record counts over a corpus rise by those children. A clean image
   with no metadata adds nothing.
+- The public `WalkOptions` struct gained an `ignore_suffixes` field.
+  The struct is exhaustive, so external code that builds it with a
+  struct literal must add the field. A caller that wants the previous
+  behaviour passes an empty list.
 - The public `Outcome` struct gained an `artifact_kind` field and the
   `OcrOk` struct gained a `warnings` field. Both structs are exhaustive,
   so external code that constructs them or destructures them by listing
