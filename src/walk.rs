@@ -7,10 +7,48 @@ use walkdir::WalkDir;
 use crate::{Error, Result};
 
 /// Traversal options for a division root.
-#[derive(Debug, Clone, Default)]
+///
+/// Two exclusion lists, both matched against a bare entry name at any
+/// depth: [`ignore_names`](Self::ignore_names) by exact equality and
+/// [`ignore_suffixes`](Self::ignore_suffixes) by a plain name suffix.
+/// The suffix list is a small fixed set, not a glob or regex engine, so
+/// the policy stays explicit and cheap to read. A skipped directory
+/// hides its whole subtree under either list.
+///
+/// [`Default`] ships the noise policy, so the excludes are on at every
+/// call site that builds options this way rather than opt-in.
+#[derive(Debug, Clone)]
 pub struct WalkOptions {
     /// Exact file and directory names to skip at any depth.
     pub ignore_names: Vec<String>,
+    /// Name suffixes to skip at any depth. An entry is skipped when its
+    /// bare name ends with any listed suffix.
+    pub ignore_suffixes: Vec<String>,
+}
+
+impl Default for WalkOptions {
+    /// The shipped noise policy: the macOS `.DS_Store` sidecar by exact
+    /// name, and the SQLite write-ahead sidecars plus generic temp
+    /// files by suffix.
+    ///
+    /// Data-bearing dotfiles are deliberately absent: `.env`, ssh keys,
+    /// `.gitconfig`, and `.config`-style files are primary
+    /// classification targets, so nothing here excludes them.
+    ///
+    /// The crate's own mirror work directories need no exclusion here.
+    /// A container expands its members under a `<source>.d/` namespace
+    /// in the mirror tree, and `check_layout` (pipeline.rs) forces the
+    /// mirror root and the division root to be mutually disjoint, so
+    /// those directories never fall under a source walk. Their absence
+    /// from this list is a decision, not an oversight, and the
+    /// `walks_config_dot_d_directories` test blocks any bare `.d`
+    /// suffix from being added back.
+    fn default() -> Self {
+        WalkOptions {
+            ignore_names: vec![".DS_Store".to_string()],
+            ignore_suffixes: vec!["-wal".to_string(), "-shm".to_string(), ".tmp".to_string()],
+        }
+    }
 }
 
 /// How the walk classified a directory entry.
@@ -38,9 +76,10 @@ pub struct WalkedEntry {
 /// Entries are sorted by file name at each directory, so two walks of
 /// the same tree return the same list in the same order. Symlinks are
 /// never followed, and a root that is itself a symlink is rejected
-/// before any traversal. Names listed in
-/// [`WalkOptions::ignore_names`] are skipped, and a skipped directory
-/// hides its whole subtree.
+/// before any traversal. Entries whose name matches
+/// [`WalkOptions::ignore_names`] exactly or ends with any
+/// [`WalkOptions::ignore_suffixes`] entry are skipped, and a skipped
+/// directory hides its whole subtree.
 pub fn walk_division(root: &Path, options: &WalkOptions) -> Result<Vec<WalkedEntry>> {
     let root_meta = std::fs::symlink_metadata(root).map_err(|e| Error::io("walk", root, e))?;
     if root_meta.file_type().is_symlink() {
@@ -66,7 +105,13 @@ pub fn walk_division(root: &Path, options: &WalkOptions) -> Result<Vec<WalkedEnt
                 return true;
             }
             let name = entry.file_name().to_string_lossy();
-            !options.ignore_names.iter().any(|ignored| ignored == &name)
+            if options.ignore_names.iter().any(|ignored| ignored == &name) {
+                return false;
+            }
+            !options
+                .ignore_suffixes
+                .iter()
+                .any(|suffix| name.ends_with(suffix.as_str()))
         });
     for entry in walker {
         let entry = entry.map_err(|e| {
@@ -150,9 +195,78 @@ mod tests {
 
         let options = WalkOptions {
             ignore_names: vec![".cache".to_string(), "thumbs.db".to_string()],
+            ignore_suffixes: Vec::new(),
         };
         let entries = walk_division(root, &options).unwrap();
         assert_eq!(paths(&entries), [Path::new("keep.txt")]);
+    }
+
+    // The default noise policy is locked below. These tests exercise
+    // `WalkOptions::default()`, the exact value built at the real call
+    // sites (main.rs scan and run), so they assert the shipped policy,
+    // not a test-only construction.
+
+    #[test]
+    fn walks_sensitive_dotfiles_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join(".env"));
+        touch(&root.join(".ssh/id_rsa"));
+        touch(&root.join(".config"));
+        touch(&root.join(".gitconfig"));
+
+        let entries = walk_division(root, &WalkOptions::default()).unwrap();
+        let found = paths(&entries);
+        for expected in [
+            Path::new(".config"),
+            Path::new(".env"),
+            Path::new(".gitconfig"),
+            Path::new(".ssh/id_rsa"),
+        ] {
+            assert!(found.contains(&expected), "{expected:?} must be walked");
+        }
+    }
+
+    #[test]
+    fn walks_config_dot_d_directories() {
+        // A `.d` config directory is a first-class source, not noise.
+        // This locks the config crawl and blocks anyone reintroducing a
+        // bare `.d` suffix exclude.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("conf.d/app.conf"));
+        touch(&root.join("init.d/service"));
+
+        let entries = walk_division(root, &WalkOptions::default()).unwrap();
+        let found = paths(&entries);
+        assert!(found.contains(&Path::new("conf.d/app.conf")));
+        assert!(found.contains(&Path::new("init.d/service")));
+    }
+
+    #[test]
+    fn excludes_the_default_noise_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("keep.txt"));
+        touch(&root.join(".DS_Store"));
+        touch(&root.join("foo-wal"));
+        touch(&root.join("foo-shm"));
+        touch(&root.join("bar.tmp"));
+
+        let entries = walk_division(root, &WalkOptions::default()).unwrap();
+        assert_eq!(paths(&entries), [Path::new("keep.txt")]);
+    }
+
+    #[test]
+    fn default_options_carry_the_noise_policy() {
+        // The policy is on by default: the exact set below is what the
+        // real call sites apply. Nothing more is excluded.
+        let options = WalkOptions::default();
+        assert_eq!(options.ignore_names, vec![".DS_Store".to_string()]);
+        assert_eq!(
+            options.ignore_suffixes,
+            vec!["-wal".to_string(), "-shm".to_string(), ".tmp".to_string()]
+        );
     }
 
     #[cfg(unix)]
