@@ -1125,12 +1125,12 @@ pub(crate) mod extract {
             // to be rendered at all, so the smaller of the two bounds the
             // extents an addressing table may repeat or overlap.
             let budget = (data.len() as u64).min(ceilings.max_output_bytes);
-            for (item_id, item_type) in &types {
-                let Some(location) = locations.iter().find(|l| l.item_id == *item_id) else {
+            for entry in &types {
+                let Some(location) = locations.iter().find(|l| l.item_id == entry.item_id) else {
                     continue;
                 };
                 let item = resolve_item(data, location, idat, budget)?;
-                match item_type.as_slice() {
+                match entry.item_type.as_slice() {
                     b"Exif" => {
                         // The exif item payload begins with a four-byte
                         // offset to the tiff header.
@@ -1146,15 +1146,17 @@ pub(crate) mod extract {
                             collect_exif(&item[body_start..], collector)?;
                         }
                     }
-                    b"mime" => {
-                        // A mime item is an xmp packet only when it is
-                        // text holding markup; any other mime payload is
-                        // not a scored surface and is left alone.
-                        if let Ok(text) = std::str::from_utf8(&item)
-                            && text.contains('<')
-                        {
-                            super::xmp::collect(text, "heic-mime", collector, ceilings)?;
+                    // The item's declared content type, read from its
+                    // infe entry, decides the surface. An xmp packet is
+                    // read strictly; a `mime` item of any other declared
+                    // type is not a scored surface and is skipped by its
+                    // type, never by inspecting its bytes.
+                    b"mime" if entry.content_type.as_deref() == Some(XMP_CONTENT_TYPE) => {
+                        let text = utf8_or_malformed(&item, "heic xmp item")?;
+                        if !text.contains('<') {
+                            return Err(MetadataError::malformed("xmp item holds no markup"));
                         }
+                        super::xmp::collect(text, "heic-mime", collector, ceilings)?;
                     }
                     _ => {}
                 }
@@ -1170,7 +1172,7 @@ pub(crate) mod extract {
             end: usize,
             count: &mut u64,
             ceilings: &Ceilings,
-        ) -> Result<Vec<(u32, Vec<u8>)>, MetadataError> {
+        ) -> Result<Vec<ItemInfo>, MetadataError> {
             // version(1) flags(3) then the entry count, whose width
             // depends on the version. Every read is checked against the
             // box end, so a short payload fails closed instead of
@@ -1186,37 +1188,61 @@ pub(crate) mod extract {
             let pos = cursor.pos;
             let mut types = Vec::new();
             walk(data, pos, end, count, ceilings, &mut |header| {
-                if &header.kind == b"infe"
-                    && let Some(entry) = parse_infe(data, header.payload.0, header.payload.1)?
-                {
-                    types.push(entry);
+                if &header.kind == b"infe" {
+                    types.push(parse_infe(data, header.payload.0, header.payload.1)?);
                 }
                 Ok(())
             })?;
             Ok(types)
         }
 
-        /// Parses one `infe` entry to its item id and item type. Only the
-        /// version-2 and version-3 shapes are modeled; an older shape
-        /// yields nothing rather than a misread. A truncated entry of a
-        /// modeled shape is malformed and fails the child, never dropped.
-        fn parse_infe(
-            data: &[u8],
-            start: usize,
-            end: usize,
-        ) -> Result<Option<(u32, Vec<u8>)>, MetadataError> {
+        /// The declared content type of an xmp packet carried as a
+        /// `mime` item.
+        const XMP_CONTENT_TYPE: &str = "application/rdf+xml";
+
+        /// One `infe` entry: the item id, its four-byte type, and, for a
+        /// `mime` item, its declared content type.
+        struct ItemInfo {
+            item_id: u32,
+            item_type: Vec<u8>,
+            content_type: Option<String>,
+        }
+
+        /// Parses one `infe` entry. Only the version-2 and version-3
+        /// shapes, the ones the image file format requires, are modeled;
+        /// any other version is an unmodeled shape and fails the child as
+        /// unsupported, never dropped. A truncated entry is malformed. A
+        /// `mime` item's name and content type are read as checked
+        /// null-terminated strings, so the declared type is known before
+        /// the item's bytes are touched.
+        fn parse_infe(data: &[u8], start: usize, end: usize) -> Result<ItemInfo, MetadataError> {
             let mut cursor = Cur::new(data, start, end);
             let version = cursor.u8()?;
             cursor.skip(3)?; // flags
             let item_id = match version {
                 2 => cursor.u16()? as u32,
                 3 => cursor.u32()?,
-                _ => return Ok(None),
+                other => {
+                    return Err(MetadataError::new(
+                        "image-metadata-unsupported",
+                        format!("item info entry version {other} not modeled"),
+                    ));
+                }
             };
             // protection index (2), then the four-byte item type.
             cursor.skip(2)?;
-            let item_type = cursor.take(4)?;
-            Ok(Some((item_id, item_type.to_vec())))
+            let item_type = cursor.take(4)?.to_vec();
+            let content_type = if item_type == b"mime" {
+                let _item_name = cursor.cstr()?;
+                Some(cursor.cstr()?)
+            } else {
+                None
+            };
+            Ok(ItemInfo {
+                item_id,
+                item_type,
+                content_type,
+            })
         }
 
         /// One item's storage: its construction method and byte extents.
@@ -1366,6 +1392,22 @@ pub(crate) mod extract {
 
             fn skip(&mut self, n: usize) -> Result<(), MetadataError> {
                 self.take(n).map(|_| ())
+            }
+
+            /// Reads a null-terminated string, consuming the terminator.
+            /// A string that runs to the end of the range without one is
+            /// truncated, and a string that is not UTF-8 is malformed.
+            fn cstr(&mut self) -> Result<String, MetadataError> {
+                let rest = &self.data[self.pos..self.end];
+                let len = rest
+                    .iter()
+                    .position(|&b| b == 0)
+                    .ok_or_else(|| MetadataError::malformed("unterminated string in a box"))?;
+                let text = std::str::from_utf8(&rest[..len])
+                    .map_err(|e| MetadataError::malformed(format!("box string is not utf-8: {e}")))?
+                    .to_string();
+                self.pos += len + 1;
+                Ok(text)
             }
 
             fn u8(&mut self) -> Result<u8, MetadataError> {
@@ -1934,6 +1976,89 @@ pub(crate) mod extract {
             push_box(&mut bytes, b"ftyp", b"heic\x00\x00\x00\x00heic");
             push_box(&mut bytes, b"meta", &meta_body);
             bytes
+        }
+
+        /// An `infe` payload for a `mime` item: version 2, item id 1,
+        /// protection 0, type "mime", empty item name, the given content
+        /// type.
+        fn mime_infe(content_type: &str) -> Vec<u8> {
+            let mut infe = vec![2u8, 0, 0, 0];
+            infe.extend_from_slice(&1u16.to_be_bytes());
+            infe.extend_from_slice(&0u16.to_be_bytes());
+            infe.extend_from_slice(b"mime");
+            infe.push(0);
+            infe.extend_from_slice(content_type.as_bytes());
+            infe.push(0);
+            infe
+        }
+
+        #[test]
+        fn a_declared_xmp_mime_item_is_scored() {
+            let xmp = br#"<rdf:RDF xmlns:rdf="rdf" xmlns:dc="dc"><rdf:Description dc:title="mime title"/></rdf:RDF>"#;
+            let bytes = heic_with_item(
+                &mime_infe("application/rdf+xml"),
+                &[(0, xmp.len() as u32)],
+                xmp,
+            );
+            let mut collector = Collector::new(&ceilings());
+            heic::collect(&bytes, &mut collector, &ceilings()).unwrap();
+            let rows = collector.into_rows();
+            let row = row_for(&rows, "xmp-dc-title").expect("heic mime xmp row");
+            assert_eq!(row.carrier, "heic-mime");
+            assert_eq!(row.value, "mime title");
+        }
+
+        #[test]
+        fn a_declared_xmp_mime_item_that_is_not_utf8_fails_closed() {
+            let mut xmp =
+                br#"<rdf:RDF xmlns:rdf="rdf" xmlns:dc="dc"><rdf:Description dc:title=""#.to_vec();
+            xmp.extend_from_slice(&[0xFF, 0xFE, b'x']);
+            xmp.extend_from_slice(br#""/></rdf:RDF>"#);
+            let bytes = heic_with_item(
+                &mime_infe("application/rdf+xml"),
+                &[(0, xmp.len() as u32)],
+                &xmp,
+            );
+            let mut collector = Collector::new(&ceilings());
+            let error = heic::collect(&bytes, &mut collector, &ceilings()).unwrap_err();
+            assert_eq!(error.code, "image-metadata-malformed");
+        }
+
+        #[test]
+        fn a_mime_item_of_another_declared_type_is_skipped_by_type() {
+            // Arbitrary bytes, including markup-looking ones, under a
+            // declared type that is not an xmp packet: no row and no
+            // failure, decided by the declaration alone.
+            let body = b"<not xmp>\xff\xfe plain payload";
+            let bytes = heic_with_item(&mime_infe("text/plain"), &[(0, body.len() as u32)], body);
+            let mut collector = Collector::new(&ceilings());
+            heic::collect(&bytes, &mut collector, &ceilings()).unwrap();
+            assert!(collector.into_rows().is_empty());
+        }
+
+        #[test]
+        fn an_unmodeled_infe_version_fails_as_unsupported() {
+            // A version-1 entry: item id, protection index, type.
+            let mut infe = vec![1u8, 0, 0, 0];
+            infe.extend_from_slice(&1u16.to_be_bytes());
+            infe.extend_from_slice(&0u16.to_be_bytes());
+            infe.extend_from_slice(b"Exif");
+            let item = exif_item("unreachable");
+            let bytes = heic_with_item(&infe, &[(0, item.len() as u32)], &item);
+            let mut collector = Collector::new(&ceilings());
+            let error = heic::collect(&bytes, &mut collector, &ceilings()).unwrap_err();
+            assert_eq!(error.code, "image-metadata-unsupported");
+        }
+
+        #[test]
+        fn a_truncated_infe_header_fails_closed() {
+            // Fewer than the four header bytes: malformed before the
+            // version can even be judged.
+            let item = exif_item("unreachable");
+            let bytes = heic_with_item(&[1u8, 0, 0], &[(0, item.len() as u32)], &item);
+            let mut collector = Collector::new(&ceilings());
+            let error = heic::collect(&bytes, &mut collector, &ceilings()).unwrap_err();
+            assert_eq!(error.code, "image-metadata-malformed");
         }
 
         #[test]

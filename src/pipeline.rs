@@ -666,10 +666,18 @@ impl Expander<'_> {
             }
         }
 
+        // The source ceiling precedes every parent-side load. An image
+        // whose metadata leg would load its bytes for the dedup borrow
+        // is over the ceiling here, so it skips the borrow and falls
+        // through to the leaf path, which records the resource-limit
+        // failure with no child, exactly as an unborrowed image would.
+        let over_ceiling = meta.source_size > convert::MAX_SOURCE_BYTES;
+
         // Dedup borrow, non-containers only. A container never dedups,
         // because borrowing its artifact would skip re-expanding its
         // members under their own paths.
         if kind.is_none()
+            && !(metadata_leg && over_ceiling)
             && let Some(canonical) = self.dedup.get(&meta.source_hash)
             && canonical.source_path != meta.source_path
             && converter.is_some_and(|c| {

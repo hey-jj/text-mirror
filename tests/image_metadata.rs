@@ -720,3 +720,64 @@ fn a_prior_record_from_a_build_without_the_converter_is_not_skipped() {
     let child = terminal(&setup, "later.png.d/#image-metadata").expect("minted child");
     assert_eq!(child.status, Status::Converted);
 }
+
+#[test]
+fn a_dedup_seeded_over_ceiling_image_is_refused_before_any_load() {
+    // A prior current-rules converted record whose source hash equals a
+    // sparse over-ceiling png-magic file, so the dedup index would
+    // borrow for it. The ceiling precedes the borrow: one resource-limit
+    // failure, no dedup record, no child.
+    let setup = setup();
+    let rules = fake_ocr_rules();
+    fs::write(
+        setup.root.join("canon.png"),
+        png_with_xmp(&xmp_description("canonical")),
+    )
+    .unwrap();
+    run_with(&setup, &rules);
+    assert_eq!(
+        terminal(&setup, "canon.png").unwrap().status,
+        Status::Converted
+    );
+
+    let huge = setup.root.join("huge.png");
+    let mut file = fs::File::create(&huge).unwrap();
+    file.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+    file.set_len(text_mirror::convert::MAX_SOURCE_BYTES + 1)
+        .unwrap();
+    drop(file);
+    let huge_hash = text_mirror::hash::hash_bytes(&fs::read(&huge).unwrap());
+    rewrite_shard(&setup, |records| {
+        records
+            .into_iter()
+            .map(|mut r| {
+                if r.source_path == "canon.png" {
+                    r.source_hash = huge_hash.clone();
+                }
+                r
+            })
+            .collect()
+    });
+
+    let report = run_with(&setup, &rules);
+
+    assert_eq!(report.counts.dedup, 0);
+    let primary = terminal(&setup, "huge.png").expect("primary record");
+    assert_eq!(primary.status, Status::Failed);
+    assert!(
+        primary
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("resource_limit")),
+        "{:?}",
+        primary.error
+    );
+    assert!(primary.dedup_of.is_none());
+    assert!(terminal(&setup, "huge.png.d/#image-metadata").is_none());
+    assert!(
+        !setup
+            .mirror
+            .join("alpha/huge.png.d/#image-metadata.txt")
+            .exists()
+    );
+}
