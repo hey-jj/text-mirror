@@ -48,7 +48,7 @@ A default build records a png, jpeg, or webp source as `unsupported` with reason
 
 ## The audio feature
 
-Speech transcription for wav, mp3, flac, and m4a is gated behind the `audio-asr` feature, off by default. The audio bytes are decoded inside the subprocess jail by the pure-Rust symphonia crate into a wav at the decoder-reported sample rate and channel count, and the pinned speech engine reads that wav. The engine, its weights, and its backend probe are deployment artifacts named by generic role labels and bound by BLAKE3 in the rules; a run supplies their paths with `--runtime-inventory`, and the jailed worker re-hashes every file before use. Without a wired runtime a featured build decodes the audio and fails closed with `asr-runtime-missing`.
+Speech transcription for wav, mp3, flac, and m4a is gated behind the `audio-asr` feature, off by default. The audio bytes are decoded inside the subprocess jail by the pure-Rust symphonia crate into a wav at the decoder-reported sample rate and channel count, and the pinned speech engine reads that wav. The engine and its weights are deployment artifacts named by generic role labels and bound by BLAKE3 in the rules, and the backend-probe role gains its pin in a later rules release. A run supplies the role paths with `--runtime-inventory`, and the jailed worker re-hashes every file before use. Until a deployment wires a complete pinned runtime, a featured build decodes the audio and fails closed with `asr-runtime-missing`.
 
 ```
 cargo build --release --features audio-asr
@@ -58,7 +58,7 @@ text-mirror run <root> --mirror <mirror> --manifest <manifest> --division <name>
 
 A default build records a wav, mp3, flac, or m4a source as `unsupported` with reason `audio-asr-not-built`. The pinned engine identity exists for one machine class, so on any other platform a featured build records the same formats as `unsupported` with reason `engine-unpinned` until that platform gains its own pin.
 
-Ceilings worth knowing: decoded duration is capped at one hour, and the crate-wide 128 MiB source ceiling applies before conversion, so an hour-long uncompressed wav at 44.1 or 48 kHz fails with `resource_limit` before it is decoded. Hour-long mp3, m4a, and flac sources fit. A transcript record carries a `media` block naming the decoded duration, the language, and the pinned engine identity by role label and hash. m4a is admitted for the low-complexity AAC profile only; other codec shapes fail closed with `asr-codec-unsupported`.
+Ceilings worth knowing: decoded duration is capped at one hour, and the crate-wide 128 MiB source ceiling applies before conversion, so an hour-long uncompressed wav at 44.1 or 48 kHz fails with `resource_limit` before it is decoded. Hour-long mp3, m4a, and flac sources fit. A transcript record carries a `media` block naming the decoded duration, the language, and the pinned engine identity by role label and hash. m4a is admitted for the low-complexity AAC profile only, and other codec shapes fail closed with `asr-codec-unsupported`.
 
 ## License
 

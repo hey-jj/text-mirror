@@ -165,9 +165,11 @@ pub struct AsrProfile {
     /// pins `en`, and rules parsing refuses any other value.
     pub language: String,
     /// Expected BLAKE3 per pinned runtime role, keyed by the generic
-    /// role label: `asr-cli`, `asr-weights`, `asr-decode-policy`, and
-    /// `asr-probe`. Exactly those four roles must be present. The
-    /// deployment supplies the file paths through the runtime
+    /// role label. `asr-cli`, `asr-weights`, and `asr-decode-policy`
+    /// must be present; `asr-probe` is accepted and gains its pinned
+    /// value in a later rules release, and until that row lands the
+    /// worker fails the engine path closed on the absent probe pin.
+    /// The deployment supplies the file paths through the runtime
     /// inventory config; the cold worker re-hashes every file against
     /// these values immediately before preflight and execution.
     pub inventory: std::collections::BTreeMap<String, String>,
@@ -181,10 +183,14 @@ fn is_lower_hex_256(value: &str) -> bool {
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
-/// Validates the `[asr]` rules section: the pinned language, exactly
-/// the four known roles, lowercase hex hashes, and an
-/// `asr-decode-policy` value that matches the serialization built into
-/// the adapter, so the rules cannot silently disagree with the code.
+/// Validates the `[asr]` rules section: the pinned language, the
+/// known roles only with the three pinned ones present, lowercase hex
+/// hashes, and an `asr-decode-policy` value that matches the
+/// serialization built into the adapter, so the rules cannot silently
+/// disagree with the code. The probe role is allowed but not
+/// required: its pin lands in a later rules release, and a required
+/// runtime role with no pinned hash fails closed in the worker as
+/// runtime-missing rather than parsing as an invented identity here.
 fn validate_asr_profile(profile: &AsrProfile, name: &str) -> Result<()> {
     let rules_error = |message: String| Error::Rules {
         name: name.to_string(),
@@ -196,13 +202,18 @@ fn validate_asr_profile(profile: &AsrProfile, name: &str) -> Result<()> {
             profile.language
         )));
     }
-    let expected_roles = [
+    let required_roles = [
+        subprocess::ASR_ROLE_CLI,
+        subprocess::ASR_ROLE_WEIGHTS,
+        subprocess::ASR_ROLE_DECODE_POLICY,
+    ];
+    let allowed_roles = [
         subprocess::ASR_ROLE_CLI,
         subprocess::ASR_ROLE_WEIGHTS,
         subprocess::ASR_ROLE_DECODE_POLICY,
         subprocess::ASR_ROLE_PROBE,
     ];
-    for role in expected_roles {
+    for role in required_roles {
         if !profile.inventory.contains_key(role) {
             return Err(rules_error(format!(
                 "[asr.inventory] is missing role {role:?}"
@@ -210,7 +221,7 @@ fn validate_asr_profile(profile: &AsrProfile, name: &str) -> Result<()> {
         }
     }
     for (role, hash) in &profile.inventory {
-        if !expected_roles.contains(&role.as_str()) {
+        if !allowed_roles.contains(&role.as_str()) {
             return Err(rules_error(format!(
                 "[asr.inventory] names unknown role {role:?}"
             )));
@@ -1548,7 +1559,10 @@ mod tests {
         assert_eq!(profile.file_size_bytes, 1_207_959_552);
         assert_eq!(profile.max_processes, 64);
         assert_eq!(profile.language, "en");
-        assert_eq!(profile.inventory.len(), 4);
+        // Three pinned roles ship; the probe row lands in a later
+        // rules release.
+        assert_eq!(profile.inventory.len(), 3);
+        assert!(!profile.inventory.contains_key("asr-probe"));
     }
 
     // The [asr] section is validated at parse: a wrong language, a
@@ -1558,7 +1572,8 @@ mod tests {
     #[test]
     fn the_asr_profile_is_validated_at_parse() {
         let policy_hash = crate::hash::hash_bytes(subprocess::ASR_DECODE_POLICY.as_bytes());
-        let base = |language: &str, probe_role: &str, policy: &str| {
+        let zeros = "0".repeat(64);
+        let base = |language: &str, extra_row: &str, policy: &str| {
             format!(
                 r#"version = "1"
 converters = []
@@ -1578,33 +1593,46 @@ language = "{language}"
 asr-cli = "{zeros}"
 asr-weights = "{zeros}"
 asr-decode-policy = "{policy}"
-{probe_role} = "{zeros}"
-"#,
-                zeros = "0".repeat(64),
+{extra_row}"#,
+                zeros = zeros.as_str(),
             )
         };
-        // A well-formed section parses.
-        let good = base("en", "asr-probe", &policy_hash);
+        // The shipped shape parses: three pinned roles, no probe row.
+        let good = base("en", "", &policy_hash);
         assert!(Registry::parse(&good, "converters.toml").is_ok());
+        // A probe row with a value also parses: the shape a later
+        // rules release lands.
+        let with_probe = base("en", &format!("asr-probe = \"{zeros}\"\n"), &policy_hash);
+        assert!(Registry::parse(&with_probe, "converters.toml").is_ok());
         // A non-pinned language is refused.
-        let err = Registry::parse(&base("fr", "asr-probe", &policy_hash), "converters.toml")
+        let err = Registry::parse(&base("fr", "", &policy_hash), "converters.toml")
             .err()
             .expect("a non-pinned language must be refused");
         assert!(err.to_string().contains("language"), "{err}");
-        // An unknown role is refused, which also leaves a known role
-        // missing.
-        let err = Registry::parse(&base("en", "asr-extra", &policy_hash), "converters.toml")
+        // An unknown role is refused.
+        let unknown = base("en", &format!("asr-extra = \"{zeros}\"\n"), &policy_hash);
+        let err = Registry::parse(&unknown, "converters.toml")
             .err()
             .expect("an unknown role must be refused");
         assert!(err.to_string().contains("role"), "{err}");
+        // A missing pinned role is refused.
+        let missing: String = good
+            .lines()
+            .filter(|line| !line.starts_with("asr-weights"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let err = Registry::parse(&missing, "converters.toml")
+            .err()
+            .expect("a missing pinned role must be refused");
+        assert!(err.to_string().contains("missing"), "{err}");
         // A decode-policy hash that disagrees with the built-in
         // serialization is refused.
-        let err = Registry::parse(&base("en", "asr-probe", &"a".repeat(64)), "converters.toml")
+        let err = Registry::parse(&base("en", "", &"a".repeat(64)), "converters.toml")
             .err()
             .expect("a divergent decode-policy hash must be refused");
         assert!(err.to_string().contains("decode"), "{err}");
         // A malformed hash is refused.
-        let err = Registry::parse(&base("en", "asr-probe", "SHOUTING"), "converters.toml")
+        let err = Registry::parse(&base("en", "", "SHOUTING"), "converters.toml")
             .err()
             .expect("a malformed hash must be refused");
         assert!(err.to_string().contains("hex"), "{err}");
