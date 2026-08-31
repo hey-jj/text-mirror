@@ -77,6 +77,16 @@ fn profile(
     // becomes readable.
     let mut grant_lines = String::new();
     for path in exec_grants {
+        // Measured need: the pinned engine lists its own directory at
+        // startup and aborts when the listing is denied. The
+        // allowance is the narrowest form that passed measurement,
+        // directory-entry listing on the literal parent only: sibling
+        // FILES stay unreadable under the default denial, so nothing
+        // beside names leaks from the deployment directory.
+        if let Some(parent) = path.parent() {
+            let parent = literal(parent)?;
+            grant_lines.push_str(&format!("(allow file-read-data (literal \"{parent}\"))\n"));
+        }
         let path = literal(path)?;
         grant_lines.push_str(&format!(
             "(allow process-exec* file-read* file-map-executable (literal \"{path}\"))\n"
@@ -85,6 +95,24 @@ fn profile(
     for path in read_grants {
         let path = literal(path)?;
         grant_lines.push_str(&format!("(allow file-read* (literal \"{path}\"))\n"));
+    }
+    // The accelerator runtime allowances, present only when the spec
+    // carries executable grants, which is exactly the shape of a
+    // wired pinned engine: a grant-free jail keeps the narrower
+    // profile unchanged. Measured minimum, each line justified by an
+    // observed failure without it:
+    // - iokit-get-properties: the accelerator device's property reads
+    //   during initialization.
+    // - iokit-open, scoped to the accelerator device user-client
+    //   class: without it the device still enumerates by TYPE but
+    //   never initializes (empty device name, no compute library), so
+    //   a backend check could pass over an unusable device and the
+    //   engine would fail at first use. The scoped class was
+    //   sufficient in measurement; nothing wider is granted.
+    if !exec_grants.is_empty() {
+        grant_lines.push_str("(allow iokit-get-properties)\n");
+        grant_lines
+            .push_str("(allow iokit-open (iokit-user-client-class \"AGXDeviceUserClient\"))\n");
     }
     // Deny by default. Grant only the mach, sysctl, and loader
     // allowances a process needs to reach main, execute and read the

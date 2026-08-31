@@ -368,6 +368,46 @@ fn a_non_literal_grant_refuses_the_run_at_spawn() {
 }
 
 #[test]
+fn a_granted_jail_keeps_the_negative_controls() {
+    // A runner carrying literal grants is the engine-shaped jail, and
+    // its profile may carry extra runtime allowances. The controls
+    // must hold there too: run() gates on the capability probe for
+    // this policy digest, so a completing call IS the proof that the
+    // network is still denied under the granted profile, and the
+    // escape probes then prove reads and writes outside the jail
+    // still fail.
+    let dir = tempfile::tempdir().unwrap();
+    let engine_stub = dir.path().join("engine-stub");
+    std::fs::write(&engine_stub, b"#!/bin/sh\nexit 0\n").unwrap();
+    let weights_stub = dir.path().join("weights-stub");
+    std::fs::write(&weights_stub, b"stub bytes").unwrap();
+    let backend = platform_backend().unwrap();
+    let runner = Runner::with_grants(
+        backend,
+        worker_path(),
+        brisk_limits(),
+        vec![engine_stub.canonicalize().unwrap()],
+        vec![weights_stub.canonicalize().unwrap()],
+    );
+    let host_file = existing_host_file();
+    let response = runner
+        .run(
+            "harness-escape",
+            serde_json::json!({ "read_path": host_file }),
+            &[],
+        )
+        .expect("the granted jail still probes clean and runs");
+    let ok = response.ok.expect("harness-escape succeeds");
+    let read = ok.get("read").and_then(|v| v.as_str()).unwrap_or("");
+    let write = ok.get("write").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(read.contains("denied"), "granted-jail read escaped: {read}");
+    assert!(
+        write.contains("denied"),
+        "granted-jail write escaped: {write}"
+    );
+}
+
+#[test]
 fn a_ballooned_descendant_cannot_hide_behind_a_fast_leader_exit() {
     // The leader spawns a ballooning descendant, answers cleanly, and
     // exits at once, usually inside the first polling interval. The

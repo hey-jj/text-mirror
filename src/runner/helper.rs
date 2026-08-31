@@ -188,9 +188,68 @@ fn apply_rlimits(config: &HelperConfig) -> Result<(), String> {
     }
     apply(Resource::CPU, "RLIMIT_CPU", config.cpu_seconds)?;
     apply(Resource::FSIZE, "RLIMIT_FSIZE", config.file_size_bytes)?;
-    apply(Resource::NPROC, "RLIMIT_NPROC", config.max_processes)?;
+    apply(
+        Resource::NPROC,
+        "RLIMIT_NPROC",
+        nproc_limit(config.max_processes)?,
+    )?;
     apply(Resource::CORE, "RLIMIT_CORE", 0)?;
     Ok(())
+}
+
+/// The applied process-count limit: the configured value as headroom
+/// above the real user id's pre-existing process count, clamped to
+/// the hard limit.
+///
+/// `RLIMIT_NPROC` counts every process of the real user id, not this
+/// invocation's descendants. Measured on a desktop-class host: the
+/// user already ran several hundred processes, so an absolute cap of
+/// 64 made every fork fail with EAGAIN before the adapter could spawn
+/// its engine child. The configured number's intent is the
+/// invocation's spawn budget, so it is applied on top of the load
+/// that already exists: this invocation may add at most that many
+/// processes, and the fork-bomb bound is preserved. A failed count
+/// falls back to the absolute value, which only ever narrows.
+fn nproc_limit(configured: u64) -> Result<u64, String> {
+    use rlimit::{Resource, getrlimit};
+    let (_, hard) =
+        getrlimit(Resource::NPROC).map_err(|e| format!("getrlimit RLIMIT_NPROC failed: {e}"))?;
+    let base = current_uid_process_count().unwrap_or(0);
+    Ok(base.saturating_add(configured).min(hard))
+}
+
+/// The real user id's current process count, from the platform's
+/// process listing.
+#[cfg(target_os = "macos")]
+fn current_uid_process_count() -> Option<u64> {
+    use libproc::processes::{ProcFilter, pids_by_type};
+    let uid = nix::unistd::getuid().as_raw();
+    let pids = pids_by_type(ProcFilter::ByUID { uid }).ok()?;
+    Some(pids.len() as u64)
+}
+
+/// The real user id's current process count, from the `/proc` view.
+#[cfg(target_os = "linux")]
+fn current_uid_process_count() -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = u32::from(nix::unistd::getuid().as_raw());
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut count: u64 = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_str().is_none_or(|n| n.parse::<u32>().is_err()) {
+            continue;
+        }
+        if entry.metadata().is_ok_and(|m| m.uid() == uid) {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn current_uid_process_count() -> Option<u64> {
+    None
 }
 
 /// Closes every descriptor above stderr, with no fixed ceiling. The

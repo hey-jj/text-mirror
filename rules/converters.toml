@@ -305,7 +305,7 @@ language = "en"
 asr-cli = "abc021406ad1eda085da1cbcb899bccc89b1da04ce7cc26f083082d0ed252f7d"
 asr-weights = "a25408281ffced74ee45c743d59deb11689c918fe4fa0d22e6f1924e365ac4ab"
 asr-decode-policy = "f5f5ff161c4fea33411cfd2e51a52cfe5ed953c209eda24b395d8574c4d32871"
-asr-probe = "7d7d267ca6bf6cb33af282b744143bd04625b613f3d953fef270b05bf6ad404b"
+asr-probe = "f8c177dc84bc968b22d67b127d665a33bfc31bbd8aadcd003c4ab9fab4003ebc"
 
 # Image-metadata parser ceilings, versioned with the rest of the rules.
 # The metadata worker runs behind the shared platform-default jail, so

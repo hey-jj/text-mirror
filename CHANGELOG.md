@@ -74,10 +74,20 @@ Versioning.
   wire entry, and the worker reports that role missing. The jail
   grants each qualifying file as a literal path, never a directory:
   directories and symlinks are refused when the inventory is
-  configured and again right before every spawn. The cold worker
-  re-hashes every file against its pinned hash right before
-  preflight and execution, so a swap after parent-side validation
-  still fails closed. Failures name role labels only.
+  configured and again right before every spawn. A jail carrying
+  executable grants additionally receives the measured accelerator
+  allowances one real in-jail transcription required: device
+  property reads, device access scoped to the accelerator
+  user-client class, and a listing-only allowance on each granted
+  binary's own directory, whose sibling files stay unreadable. A
+  grant-free jail keeps the narrower profile. The engine child's
+  output streams land in jail-owned files, its home and temp
+  directories point into the jail, and the process ceiling is
+  applied as headroom above the user's pre-existing process count,
+  so the spawn budget the rules bound stays enforceable on a busy
+  host. The cold worker re-hashes every file against its pinned hash
+  right before preflight and execution, so a swap after parent-side
+  validation still fails closed. Failures name role labels only.
 - A flac row in the format table, so flac detects as its own format
   instead of falling to `unknown`.
 

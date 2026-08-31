@@ -662,8 +662,12 @@ fn run_probe(probe: &Path) -> Result<(), AsrError> {
     let status = Command::new(probe)
         .env_clear()
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(discard_file("probe.out").map_err(|_| {
+            AsrError::new("asr-backend-unavailable", "the backend probe cannot run")
+        })?)
+        .stderr(discard_file("probe.err").map_err(|_| {
+            AsrError::new("asr-backend-unavailable", "the backend probe cannot run")
+        })?)
         .status()
         .map_err(|_| AsrError::new("asr-backend-unavailable", "the backend probe cannot run"))?;
     if !status.success() {
@@ -673,6 +677,15 @@ fn run_probe(probe: &Path) -> Result<(), AsrError> {
         ));
     }
     Ok(())
+}
+
+/// A jail-owned sink for a child's output stream. The jail profile
+/// grants writes inside the jail only, so `/dev/null` needs no write
+/// allowance the deny-first profile would otherwise have to carry:
+/// the bytes land in a jail file that is never read and dies with the
+/// jail, and the file-size rlimit bounds it like any other jail file.
+fn discard_file(name: &str) -> std::io::Result<Stdio> {
+    Ok(Stdio::from(File::create(name)?))
 }
 
 /// The fixed engine argument tuple: the weights, the decoded wav, the
@@ -708,9 +721,15 @@ fn run_engine(cli: &Path, weights: &str) -> Result<Vec<u8>, AsrError> {
     let status = Command::new(cli)
         .args(&argv)
         .env_clear()
+        // The engine sees only jail paths: a home and temp dir under
+        // the jail keep any cache or scratch write inside it, where
+        // the profile already allows writes and the cleanup removes
+        // them.
+        .env("HOME", "engine-home")
+        .env("TMPDIR", "engine-home")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(discard_file("engine.out").map_err(|_| engine_failed())?)
+        .stderr(discard_file("engine.err").map_err(|_| engine_failed())?)
         .status()
         .map_err(|_| engine_failed())?;
     if !status.success() {

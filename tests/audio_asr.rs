@@ -346,6 +346,79 @@ fn silence_and_an_empty_engine_response_split_into_their_two_reasons() {
     assert!(!setup.mirror.join("alpha/hollow.wav.txt").exists());
 }
 
+// --- the real pinned engine, when a deployment supplies it ------------
+
+/// Runs only where the environment names a runtime inventory file
+/// (`TEXT_MIRROR_ASR_RUNTIME_INVENTORY`). Everywhere else it reports
+/// itself skipped and passes, honestly named. With the runtime
+/// present it drives one real transcription through the whole jailed
+/// path: decode, inventory re-hash, backend probe, engine exec, and
+/// the media block, so fake-engine coverage can never again hide a
+/// jail that refuses the real runtime.
+#[test]
+fn the_real_engine_transcribes_in_jail_when_the_runtime_is_supplied() {
+    let Ok(inventory_path) = std::env::var("TEXT_MIRROR_ASR_RUNTIME_INVENTORY") else {
+        eprintln!(
+            "skipped: TEXT_MIRROR_ASR_RUNTIME_INVENTORY is not set, no pinned runtime on this host"
+        );
+        return;
+    };
+    let inventory = RuntimeInventory::load(std::path::Path::new(&inventory_path))
+        .expect("the runtime inventory file loads");
+    let rules = Rules::builtin_with_inventory(&inventory).unwrap();
+    let setup = setup();
+    fs::write(setup.root.join("spoken.wav"), synthesized_speech_wav()).unwrap();
+
+    let report = run_with(&setup, &rules);
+    let record = terminal(&setup, "spoken.wav");
+    assert_eq!(
+        record.status,
+        Status::Converted,
+        "error: {:?}, report: {report:?}",
+        record.error
+    );
+    assert_eq!(record.artifact_kind, Some(ArtifactKind::Transcript));
+    let text = fs::read_to_string(setup.mirror.join("alpha/spoken.wav.txt")).unwrap();
+    assert!(text.contains("] Speaker 1: "), "{text}");
+    assert!(
+        text.to_ascii_lowercase().contains("quarterly"),
+        "the engine transcribes the synthesized sentence: {text}"
+    );
+    let media = record.media.expect("a real transcript carries media");
+    assert_eq!(
+        media.model_hash.as_deref(),
+        Some("a25408281ffced74ee45c743d59deb11689c918fe4fa0d22e6f1924e365ac4ab")
+    );
+    assert!(media.duration_seconds.unwrap() > 1.0);
+}
+
+/// Synthesized speech through the host speech synthesizer, converted
+/// to a plain 16 kHz wav. Only the runtime-gated test above uses it,
+/// so the host-tool dependency travels with the same gate.
+fn synthesized_speech_wav() -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let aiff = dir.path().join("speech.aiff");
+    let wav = dir.path().join("speech.wav");
+    let synth = std::process::Command::new("/usr/bin/say")
+        .arg("-o")
+        .arg(&aiff)
+        .arg("the quarterly numbers are ready for review")
+        .status()
+        .expect("the host speech synthesizer runs");
+    assert!(synth.success());
+    let convert = std::process::Command::new("/usr/bin/afconvert")
+        .arg("-f")
+        .arg("WAVE")
+        .arg("-d")
+        .arg("LEI16@16000")
+        .arg(&aiff)
+        .arg(&wav)
+        .status()
+        .expect("the host audio converter runs");
+    assert!(convert.success());
+    fs::read(wav).unwrap()
+}
+
 // --- media through dedup and the checkpoint ---------------------------
 
 #[test]
