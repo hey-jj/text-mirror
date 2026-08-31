@@ -6,11 +6,13 @@
 //! emits. The PDF adapter is the production occupant: it carries the
 //! same outcome, warnings, and failure reasons as the in-process PDF
 //! path did, so its manifest records differ only in converter id. The
-//! OCR, ASR, and video adapters are the protocol half of their
-//! conversions. Their engines are not pinned yet, so the registry
-//! routes their formats to `unsupported` with reason `engine-unpinned`
-//! until a rules bump pins an engine, and the adapters are exercised
-//! against fake engines under test.
+//! image and audio converters decode in-jail and drive their pinned
+//! engines behind hash-verified inventories. The OCR and video
+//! adapters are the protocol half of their conversions: their engines
+//! are not pinned yet, so the registry routes their formats to
+//! `unsupported` with reason `engine-unpinned` until a rules bump pins
+//! an engine, and the adapters are exercised against fake engines
+//! under test.
 
 use serde::de::DeserializeOwned;
 
@@ -70,8 +72,35 @@ pub const OCR_ADAPTER_VERSION: &str = "1.0.0";
 
 /// Registry id of the speech transcription adapter.
 pub const ASR_ADAPTER_ID: &str = "asr-adapter";
-/// Version of the speech transcription adapter.
-pub const ASR_ADAPTER_VERSION: &str = "1.0.0";
+/// Version of the speech transcription adapter. 2.0.0 because the
+/// pinned in-jail decode-and-transcribe path replaced the
+/// engine-unpinned protocol scaffold: a total behavior change under
+/// the shared id, so every prior record under it reconverts.
+pub const ASR_ADAPTER_VERSION: &str = "2.0.0";
+
+/// The pinned decode policy, serialized exactly as the engine child
+/// receives it: one line, single spaces, no trailing newline. The
+/// engine argv embeds these tokens verbatim between the input
+/// selection and the output selection, and the rules pin this
+/// serialization's BLAKE3 under the `asr-decode-policy` role, so the
+/// rules, the code, and the child invocation cannot drift apart.
+pub const ASR_DECODE_POLICY: &str = "-l en -t 1 -p 1 -bo 1 -bs 1 -nf -tp 0 -tpi 0 -nfa -mc 0";
+
+/// The pinned speech runtime roles. Generic labels only: the
+/// identities behind them are deployment data bound by hash.
+pub const ASR_ROLE_CLI: &str = "asr-cli";
+/// The transcription weights role.
+pub const ASR_ROLE_WEIGHTS: &str = "asr-weights";
+/// The serialized decode policy role. Not a file: it pins
+/// [`ASR_DECODE_POLICY`] itself.
+pub const ASR_ROLE_DECODE_POLICY: &str = "asr-decode-policy";
+/// The backend probe role: the pinned executable whose clean exit
+/// proves an accelerator-class device is enumerable by type.
+pub const ASR_ROLE_PROBE: &str = "asr-probe";
+
+/// The speech runtime roles that are files a deployment supplies and
+/// the cold worker re-hashes: everything except the decode policy.
+pub const ASR_FILE_ROLE_LABELS: [&str; 3] = [ASR_ROLE_CLI, ASR_ROLE_WEIGHTS, ASR_ROLE_PROBE];
 
 /// Registry id of the video adapter.
 pub const VIDEO_ADAPTER_ID: &str = "video-adapter";
@@ -108,8 +137,8 @@ mod imp {
     use crate::convert::RecordsLimits;
     use crate::manifest::ArtifactKind;
     use crate::runner::protocol::bodies::{
-        AsrOk, AsrRequest, OcrInput, OcrOk, OcrRequest, PdfOk, PdfRequest, RecordsOk,
-        RecordsRequest, VideoOk, VideoRequest,
+        OcrInput, OcrOk, OcrRequest, PdfOk, PdfRequest, RecordsOk, RecordsRequest, VideoOk,
+        VideoRequest,
     };
     use crate::runner::{Runner, RunnerError};
 
@@ -151,6 +180,18 @@ mod imp {
             "image-metadata-xml-exceeded",
             "image-metadata-limit-exceeded",
             "image-metadata-unsupported",
+            // Audio worker reasons. Each must survive the wire-to-
+            // static mapping so the manifest keeps the specific reason
+            // rather than collapsing it to adapter_error.
+            "asr-decode-failed",
+            "asr-codec-unsupported",
+            "asr-duration-exceeded",
+            "asr-decoded-too-large",
+            "asr-no-speech",
+            "asr-runtime-missing",
+            "asr-runtime-mismatch",
+            "asr-backend-unavailable",
+            "asr-protocol-error",
         ];
         KNOWN
             .iter()
@@ -250,6 +291,7 @@ mod imp {
                 text: body.text,
                 warnings: body.warnings,
                 segments: body.segments,
+                media: None,
             })
         }
     }
@@ -316,6 +358,7 @@ mod imp {
                 text: body.text,
                 warnings: body.warnings,
                 segments: body.segments,
+                media: None,
             })
         }
     }
@@ -409,6 +452,7 @@ mod imp {
                 text,
                 warnings: Vec::new(),
                 segments,
+                media: None,
             })
         }
     }
@@ -430,6 +474,10 @@ mod imp {
         /// the pinned-runtime `image-ocr` mode; the test-only fake
         /// constructor selects the harness `image-ocr-fake` mode.
         mode: &'static str,
+        /// The runtime files the deployment wired in, as wire entries
+        /// pairing each role's path with its rules-pinned hash. The
+        /// cold worker re-hashes each file itself before recognition.
+        inventory: Vec<crate::runner::protocol::bodies::InventoryEntry>,
         /// This instance's own runner, built from its own limits at
         /// construction. Security ceilings are per-registry rules data,
         /// so each converter owns its runner rather than sharing a
@@ -440,28 +488,63 @@ mod imp {
 
     #[cfg(feature = "image-ocr")]
     impl ImagePixelOcr {
-        /// An adapter over the rules-supplied image-OCR jail profile. It
-        /// drives the production `image-ocr` worker mode, which fails
-        /// closed with `image-ocr-runtime-missing` until a deployment
-        /// wires the pinned runtime.
-        pub fn new(limits: crate::convert::ImageOcrLimits) -> ImagePixelOcr {
+        /// An adapter over the rules-supplied image-OCR jail profile and
+        /// the deployment's runtime inventory. It drives the production
+        /// `image-ocr` worker mode, which fails closed with
+        /// `image-ocr-runtime-missing` until a deployment wires every
+        /// pinned runtime role.
+        pub fn new(
+            limits: crate::convert::ImageOcrLimits,
+            inventory: &crate::convert::RuntimeInventory,
+        ) -> ImagePixelOcr {
+            // A role travels only when the deployment supplied its path
+            // AND the rules pin its hash; anything less leaves the role
+            // unfilled and the worker fails closed on it. A path that is
+            // not valid UTF-8 cannot cross the wire and is treated as
+            // unsupplied for the same fail-closed outcome.
+            let entries: Vec<crate::runner::protocol::bodies::InventoryEntry> =
+                crate::convert::IMAGE_OCR_ROLE_LABELS
+                    .iter()
+                    .filter_map(|role| {
+                        let path = inventory.path(role)?.to_str()?.to_string();
+                        let expected = limits.inventory.get(*role)?.clone();
+                        Some(crate::runner::protocol::bodies::InventoryEntry {
+                            role: (*role).to_string(),
+                            path,
+                            expected_blake3: expected,
+                        })
+                    })
+                    .collect();
+            let mut exec_grants = Vec::new();
+            let mut read_grants = Vec::new();
+            for entry in &entries {
+                let path = std::path::PathBuf::from(&entry.path);
+                if entry.role == "engine-cli" {
+                    exec_grants.push(path);
+                } else {
+                    read_grants.push(path);
+                }
+            }
             ImagePixelOcr {
                 mode: "image-ocr",
-                runner: build_image_runner(image_runner_limits(&limits)),
+                inventory: entries,
+                runner: build_image_runner(image_runner_limits(&limits), exec_grants, read_grants),
             }
         }
 
         /// A test-only converter that drives the harness `image-ocr-fake`
         /// worker mode instead of the pinned-runtime mode. It shares the
         /// identical decode, area guards, and outcome mapping; only stage
-        /// 3 is the deterministic fake. The registry never constructs
-        /// this, so a release build's image converter always drives the
-        /// production mode and never ships fake recognition.
+        /// 3 is the deterministic fake, which needs no runtime files. The
+        /// registry never constructs this, so a release build's image
+        /// converter always drives the production mode and never ships
+        /// fake recognition.
         #[cfg(feature = "test-adapters")]
         pub fn new_fake(limits: crate::convert::ImageOcrLimits) -> ImagePixelOcr {
             ImagePixelOcr {
                 mode: "image-ocr-fake",
-                runner: build_image_runner(image_runner_limits(&limits)),
+                inventory: Vec::new(),
+                runner: build_image_runner(image_runner_limits(&limits), Vec::new(), Vec::new()),
             }
         }
     }
@@ -473,10 +556,11 @@ mod imp {
             wall_timeout: std::time::Duration::from_secs(limits.wall_timeout_secs),
             max_response_bytes: limits.max_response_bytes,
             max_stderr_bytes: limits.max_stderr_bytes,
-            address_space_bytes: limits.address_space_bytes,
+            address_space_bytes: Some(limits.address_space_bytes),
             cpu_seconds: limits.cpu_seconds,
             file_size_bytes: limits.file_size_bytes,
             max_processes: limits.max_processes,
+            max_resident_bytes: None,
         }
     }
 
@@ -484,11 +568,17 @@ mod imp {
     /// converter instance, so the ceilings that travel are exactly this
     /// registry's, never a leftover from an earlier caller.
     #[cfg(feature = "image-ocr")]
-    fn build_image_runner(limits: crate::runner::Limits) -> Result<Runner, RunnerError> {
-        Ok(Runner::new(
+    fn build_image_runner(
+        limits: crate::runner::Limits,
+        exec_grants: Vec<std::path::PathBuf>,
+        read_grants: Vec<std::path::PathBuf>,
+    ) -> Result<Runner, RunnerError> {
+        Ok(Runner::with_grants(
             crate::runner::jail::platform_backend()?,
             crate::runner::locate_worker()?,
             limits,
+            exec_grants,
+            read_grants,
         ))
     }
 
@@ -526,6 +616,7 @@ mod imp {
                 &OcrRequest {
                     input: input.clone(),
                     kind: OcrInput::Image,
+                    inventory: self.inventory.clone(),
                 },
                 &[(&input, source)],
             )?;
@@ -543,6 +634,7 @@ mod imp {
                 segments: vec![Segment::span(0, text.len(), "document")],
                 text,
                 warnings,
+                media: None,
             })
         }
     }
@@ -587,6 +679,7 @@ mod imp {
                 &OcrRequest {
                     input: input.clone(),
                     kind: OcrInput::Image,
+                    inventory: Vec::new(),
                 },
                 &[(&input, source)],
             )?;
@@ -625,22 +718,130 @@ mod imp {
                 segments: vec![Segment::span(0, text.len(), "document")],
                 text,
                 warnings,
+                media: None,
             })
         }
     }
 
-    /// The speech transcription protocol adapter. Engine-unpinned.
+    /// The speech transcription adapter: audio decoded in-jail to a
+    /// native-rate wav the pinned engine transcribes, behind the `[asr]`
+    /// jail profile.
+    ///
+    /// wav, mp3, flac, and m4a stage into the jail by bare name. The
+    /// worker decodes them with the pure-Rust symphonia crate, asserts
+    /// the decoded-duration and decoded-size preflights and the silence
+    /// bound, re-hashes the pinned runtime files, requires the backend
+    /// probe's accelerator verdict, and execs the engine over the
+    /// decoded wav. The parent does no audio parsing: it selects the
+    /// worker mode, stages the bytes, and maps the fenced transcription
+    /// to the outcome shape with [`ArtifactKind::Transcript`] and the
+    /// media provenance block. The engine is machine-class scoped, so
+    /// the transcript carries no cross-platform byte-equality claim;
+    /// only the pure-Rust decode does.
+    #[cfg(feature = "audio-asr")]
     pub struct AsrAdapter {
-        runner: Runner,
+        /// The worker mode this converter drives. Production always
+        /// uses the pinned-runtime `asr` mode; the test-only fake
+        /// constructor selects the harness `asr-fake` mode.
+        mode: &'static str,
+        /// The parsed `[asr]` rules profile: the jail ceilings, the
+        /// pinned language, and the expected runtime hashes.
+        profile: crate::convert::AsrProfile,
+        /// The runtime files the deployment wired in, role by role.
+        inventory: Vec<(String, std::path::PathBuf)>,
+        /// This instance's own runner over the `[asr]` jail profile,
+        /// with literal-file grants for the wired runtime.
+        runner: Result<Runner, RunnerError>,
     }
 
+    #[cfg(feature = "audio-asr")]
     impl AsrAdapter {
-        /// An adapter over an explicit runner.
-        pub fn new(runner: Runner) -> AsrAdapter {
-            AsrAdapter { runner }
+        /// An adapter over the rules-supplied `[asr]` profile and the
+        /// deployment's runtime inventory. It drives the production
+        /// `asr` worker mode, which fails closed with
+        /// `asr-runtime-missing` until a deployment wires every pinned
+        /// runtime role.
+        pub fn new(
+            profile: crate::convert::AsrProfile,
+            inventory: &crate::convert::RuntimeInventory,
+        ) -> AsrAdapter {
+            let mut files = Vec::new();
+            for role in ASR_FILE_ROLE_LABELS {
+                if let Some(path) = inventory.path(role) {
+                    files.push((role.to_string(), path.to_path_buf()));
+                }
+            }
+            let mut exec_grants = Vec::new();
+            let mut read_grants = Vec::new();
+            for (role, path) in &files {
+                if role == ASR_ROLE_WEIGHTS {
+                    read_grants.push(path.clone());
+                } else {
+                    exec_grants.push(path.clone());
+                }
+            }
+            AsrAdapter {
+                mode: "asr",
+                runner: build_asr_runner(&profile, exec_grants, read_grants),
+                profile,
+                inventory: files,
+            }
+        }
+
+        /// A test-only converter that drives the harness `asr-fake`
+        /// worker mode instead of the pinned-runtime mode. It shares
+        /// the identical decode, preflight, silence, and outcome
+        /// layers; only the engine stage is the deterministic fake,
+        /// which needs no runtime files. The registry never constructs
+        /// this, so a release build's audio converter always drives the
+        /// production mode and never ships fake transcription.
+        #[cfg(feature = "test-adapters")]
+        pub fn new_fake(profile: crate::convert::AsrProfile) -> AsrAdapter {
+            AsrAdapter {
+                mode: "asr-fake",
+                runner: build_asr_runner(&profile, Vec::new(), Vec::new()),
+                profile,
+                inventory: Vec::new(),
+            }
         }
     }
 
+    /// Maps the `[asr]` rules profile onto the runner limits. The
+    /// address space stays unset, because the pinned accelerator
+    /// runtime reserves a virtual range no sane cap sits above, and
+    /// the parent-side resident-memory guard is the memory bound.
+    #[cfg(feature = "audio-asr")]
+    fn asr_runner_limits(profile: &crate::convert::AsrProfile) -> crate::runner::Limits {
+        crate::runner::Limits {
+            wall_timeout: std::time::Duration::from_secs(profile.wall_timeout_secs),
+            max_response_bytes: profile.max_response_bytes,
+            max_stderr_bytes: profile.max_stderr_bytes,
+            address_space_bytes: None,
+            cpu_seconds: profile.cpu_seconds,
+            file_size_bytes: profile.file_size_bytes,
+            max_processes: profile.max_processes,
+            max_resident_bytes: Some(profile.max_resident_bytes),
+        }
+    }
+
+    /// Builds one runner for the `[asr]` jail profile with the
+    /// literal-file runtime grants.
+    #[cfg(feature = "audio-asr")]
+    fn build_asr_runner(
+        profile: &crate::convert::AsrProfile,
+        exec_grants: Vec<std::path::PathBuf>,
+        read_grants: Vec<std::path::PathBuf>,
+    ) -> Result<Runner, RunnerError> {
+        Ok(Runner::with_grants(
+            crate::runner::jail::platform_backend()?,
+            crate::runner::locate_worker()?,
+            asr_runner_limits(profile),
+            exec_grants,
+            read_grants,
+        ))
+    }
+
+    #[cfg(feature = "audio-asr")]
     impl Converter for AsrAdapter {
         fn id(&self) -> &'static str {
             ASR_ADAPTER_ID
@@ -655,22 +856,56 @@ mod imp {
             source: &[u8],
             detected_format: &str,
         ) -> std::result::Result<Outcome, ConvertError> {
-            if !matches!(detected_format, "mp3" | "wav" | "m4a") {
+            use crate::runner::protocol::bodies::{AsrOk, AsrRequest, InventoryEntry};
+            if !matches!(detected_format, "wav" | "mp3" | "flac" | "m4a") {
                 return Err(ConvertError {
                     code: "unclaimed_format",
                     message: format!("the ASR adapter does not handle {detected_format}"),
                 });
             }
+            let runner = self
+                .runner
+                .as_ref()
+                .map_err(|e| runner_failure(e.clone()))?;
             let input = format!("input.{detected_format}");
+            // A role travels only when the deployment supplied its path
+            // and the rules pin its hash. A path that is not valid
+            // UTF-8 cannot cross the wire and is treated as unsupplied,
+            // so the worker fails closed on the missing role.
+            let mut wire_inventory = Vec::new();
+            for (role, path) in &self.inventory {
+                let (Some(path), Some(expected)) =
+                    (path.to_str(), self.profile.inventory.get(role))
+                else {
+                    continue;
+                };
+                wire_inventory.push(InventoryEntry {
+                    role: role.clone(),
+                    path: path.to_string(),
+                    expected_blake3: expected.clone(),
+                });
+            }
             let body: AsrOk = call(
-                &self.runner,
-                "asr",
+                runner,
+                self.mode,
                 &AsrRequest {
                     input: input.clone(),
-                    language: None,
+                    language: Some(self.profile.language.clone()),
+                    max_duration_seconds: self.profile.max_duration_seconds,
+                    inventory: wire_inventory,
                 },
                 &[(&input, source)],
             )?;
+            // The equality class fixes the speaker label at 1 on every
+            // segment: no diarizer runs, so any other value is a
+            // protocol violation, not information.
+            if body.segments.iter().any(|segment| segment.speaker != 1) {
+                return Err(ConvertError {
+                    code: "asr-protocol-error",
+                    message: "a transcription segment carries an unexpected speaker label"
+                        .to_string(),
+                });
+            }
             let text = normalize_text(&render_transcript(&body.segments).map_err(|detail| {
                 ConvertError {
                     code: "adapter_error",
@@ -680,6 +915,22 @@ mod imp {
             if !source.is_empty() && text.is_empty() {
                 return Err(empty_output(source.len()));
             }
+            // The media provenance: decoded duration, the pinned
+            // language, and the engine identity by role label and the
+            // rules-pinned hashes. speaker_count stays absent: no
+            // diarizer ran, so no speaker count is known, and the
+            // fixed display label is not a claim of one.
+            let media = crate::manifest::Media {
+                duration_seconds: body.duration_seconds,
+                language: body
+                    .language
+                    .clone()
+                    .or_else(|| Some(self.profile.language.clone())),
+                model_id: Some(ASR_ROLE_WEIGHTS.to_string()),
+                model_hash: self.profile.inventory.get(ASR_ROLE_WEIGHTS).cloned(),
+                decode_options_hash: self.profile.inventory.get(ASR_ROLE_DECODE_POLICY).cloned(),
+                speaker_count: None,
+            };
             Ok(Outcome {
                 // A speech transcript, not extracted text.
                 artifact_kind: ArtifactKind::Transcript,
@@ -689,6 +940,7 @@ mod imp {
                 segments: vec![Segment::span(0, text.len(), "document")],
                 text,
                 warnings: Vec::new(),
+                media: Some(media),
             })
         }
     }
@@ -753,6 +1005,7 @@ mod imp {
                 segments: vec![Segment::span(0, text.len(), "document")],
                 text,
                 warnings: Vec::new(),
+                media: None,
             })
         }
     }
@@ -765,12 +1018,14 @@ mod imp {
     }
 }
 
+#[cfg(all(unix, feature = "audio-asr"))]
+pub use imp::AsrAdapter;
 #[cfg(all(unix, feature = "image-metadata"))]
 pub use imp::ImageMetadata;
 #[cfg(all(unix, feature = "image-ocr"))]
 pub use imp::ImagePixelOcr;
 #[cfg(unix)]
-pub use imp::{AsrAdapter, OcrAdapter, PdfSubprocess, RecordsSubprocess, VideoAdapter};
+pub use imp::{OcrAdapter, PdfSubprocess, RecordsSubprocess, VideoAdapter};
 
 #[cfg(not(unix))]
 mod imp {

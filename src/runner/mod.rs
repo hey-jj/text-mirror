@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 pub mod helper;
 pub mod jail;
+mod memory;
 pub mod protocol;
 pub mod worker;
 
@@ -54,8 +55,11 @@ pub struct Limits {
     pub max_response_bytes: u32,
     /// Ceiling on stderr bytes, drained and counted concurrently.
     pub max_stderr_bytes: u64,
-    /// RLIMIT_AS for the child, in bytes.
-    pub address_space_bytes: u64,
+    /// RLIMIT_AS for the child, in bytes. `None` leaves the limit
+    /// unset, the shape a profile takes on a platform where the mapped
+    /// accelerator runtime reserves a virtual range no sane cap sits
+    /// above; the resident-memory guard below is the bound there.
+    pub address_space_bytes: Option<u64>,
     /// RLIMIT_CPU for the child, in seconds.
     pub cpu_seconds: u64,
     /// RLIMIT_FSIZE for the child, in bytes. Caps regular-file growth
@@ -69,6 +73,15 @@ pub struct Limits {
     /// host where the user already runs more tasks than the cap,
     /// every fork from the adapter fails, which is the intent.
     pub max_processes: u64,
+    /// Parent-side ceiling on the aggregate resident bytes of the
+    /// child's whole process group, engine descendants included. The
+    /// parent polls the group while the child runs, kills the group
+    /// when the sum crosses the ceiling, and fails closed with
+    /// `worker-memory-exceeded`. A failed measurement is itself a
+    /// failure, `memory-monitor-failed`, never a silent pass. `None`
+    /// disables the monitor, the shape of every profile whose worker
+    /// spawns no engine child.
+    pub max_resident_bytes: Option<u64>,
 }
 
 impl Default for Limits {
@@ -77,10 +90,11 @@ impl Default for Limits {
             wall_timeout: Duration::from_secs(120),
             max_response_bytes: 192 * 1024 * 1024,
             max_stderr_bytes: 1024 * 1024,
-            address_space_bytes: 4 * 1024 * 1024 * 1024,
+            address_space_bytes: Some(4 * 1024 * 1024 * 1024),
             cpu_seconds: 300,
             file_size_bytes: 512 * 1024 * 1024,
             max_processes: 16,
+            max_resident_bytes: None,
         }
     }
 }
@@ -90,8 +104,9 @@ impl Default for Limits {
 /// The codes are stable: `sandbox_unavailable`, `sandbox_probe_failed`,
 /// `worker_not_found`, `adapter_spawn_error`, `adapter_timeout`,
 /// `adapter_frame_oversized`, `adapter_output_overflow`,
-/// `adapter_protocol_error`, `adapter_drain_timeout`, and
-/// `adapter_crash`.
+/// `adapter_protocol_error`, `adapter_drain_timeout`,
+/// `adapter_crash`, `worker-memory-exceeded`, and
+/// `memory-monitor-failed`.
 #[derive(Debug, Clone)]
 pub struct RunnerError {
     /// Stable reason code.
@@ -151,15 +166,35 @@ pub struct Runner {
     backend: Box<dyn JailBackend>,
     worker: PathBuf,
     limits: Limits,
+    exec_grants: Vec<PathBuf>,
+    read_grants: Vec<PathBuf>,
 }
 
 impl Runner {
-    /// A runner over an explicit backend, worker, and limits.
+    /// A runner over an explicit backend, worker, and limits, with no
+    /// grants beyond the worker and the jail.
     pub fn new(backend: Box<dyn JailBackend>, worker: PathBuf, limits: Limits) -> Runner {
+        Runner::with_grants(backend, worker, limits, Vec::new(), Vec::new())
+    }
+
+    /// A runner whose jail additionally grants literal files: read and
+    /// execute for `exec_grants`, read only for `read_grants`. This is
+    /// how the pinned engine binaries and weights reach a jailed
+    /// worker: literal files only, never a directory, and the worker
+    /// still re-hashes each one against its pinned BLAKE3 before use.
+    pub fn with_grants(
+        backend: Box<dyn JailBackend>,
+        worker: PathBuf,
+        limits: Limits,
+        exec_grants: Vec<PathBuf>,
+        read_grants: Vec<PathBuf>,
+    ) -> Runner {
         Runner {
             backend,
             worker,
             limits,
+            exec_grants,
+            read_grants,
         }
     }
 
@@ -185,7 +220,12 @@ impl Runner {
 
     /// The policy digest that keys this runner's probe cache entry.
     pub fn policy_digest(&self) -> Result<String, RunnerError> {
-        jail::policy_digest(self.backend.as_ref(), &self.worker)
+        jail::policy_digest(
+            self.backend.as_ref(),
+            &self.worker,
+            &self.exec_grants,
+            &self.read_grants,
+        )
     }
 
     /// Runs one adapter mode inside the jail and returns its response.
@@ -241,6 +281,8 @@ impl Runner {
             mode,
             limits: &self.limits,
             seccomp,
+            exec_grants: &self.exec_grants,
+            read_grants: &self.read_grants,
         };
         let mut command = self.backend.command(&spec)?;
         command
@@ -371,6 +413,15 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
 
     let deadline = Instant::now() + limits.wall_timeout;
     let mut timed_out = false;
+    // The resident-memory guard: while the child runs, the parent
+    // periodically sums resident bytes over the whole process group,
+    // so the engine child and any other descendant are counted, not
+    // just the worker. A crossing kills the group; a failed
+    // measurement also kills the group and fails closed. The drains
+    // above keep running through the termination either way.
+    const MEMORY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    let mut next_memory_check = Instant::now() + MEMORY_POLL_INTERVAL;
+    let mut memory_failure: Option<RunnerError> = None;
     let status = loop {
         if let Some(status) = child.try_wait().ok().flatten() {
             break status;
@@ -383,6 +434,16 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         if kill_now.load(Ordering::SeqCst) {
             kill_group(child);
             break wait_after_kill(child);
+        }
+        if let Some(ceiling) = limits.max_resident_bytes
+            && Instant::now() >= next_memory_check
+        {
+            next_memory_check = Instant::now() + MEMORY_POLL_INTERVAL;
+            memory_failure = memory_verdict(memory::group_resident_bytes(child.id()), ceiling);
+            if memory_failure.is_some() {
+                kill_group(child);
+                break wait_after_kill(child);
+            }
         }
         std::thread::sleep(Duration::from_millis(2));
     };
@@ -413,6 +474,9 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         });
     };
 
+    if let Some(failure) = memory_failure {
+        return Err(failure);
+    }
     if timed_out {
         return Err(RunnerError {
             code: "adapter_timeout",
@@ -503,6 +567,26 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
     Ok(response)
 }
 
+/// Interprets one resident-memory measurement against the ceiling.
+/// Over the ceiling is `worker-memory-exceeded`; a failed measurement
+/// is `memory-monitor-failed`, because a guard that cannot see is a
+/// guard that must fail closed.
+fn memory_verdict(measurement: Result<u64, String>, ceiling: u64) -> Option<RunnerError> {
+    match measurement {
+        Ok(total) if total > ceiling => Some(RunnerError {
+            code: "worker-memory-exceeded",
+            message: format!(
+                "the worker process group holds {total} resident bytes over the {ceiling} byte ceiling, killed"
+            ),
+        }),
+        Ok(_) => None,
+        Err(detail) => Some(RunnerError {
+            code: "memory-monitor-failed",
+            message: format!("the resident-memory measurement failed, failing closed: {detail}"),
+        }),
+    }
+}
+
 /// Kills the child's whole process group with SIGKILL.
 fn kill_group(child: &mut Child) {
     #[cfg(unix)]
@@ -544,5 +628,27 @@ fn exit_detail(status: &std::process::ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("exited with code {code}"),
         None => "exited without a status".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_memory_verdict_kills_over_the_ceiling_and_fails_closed_on_a_query_error() {
+        // Under the ceiling: no verdict.
+        assert!(memory_verdict(Ok(100), 200).is_none());
+        // Exactly at the ceiling: still inside it.
+        assert!(memory_verdict(Ok(200), 200).is_none());
+        // Over the ceiling: the group is killed with the stable code.
+        let over = memory_verdict(Ok(201), 200).expect("over the ceiling is a verdict");
+        assert_eq!(over.code, "worker-memory-exceeded");
+        // A failed measurement is a failure of its own, never a pass:
+        // a guard that cannot see must fail closed.
+        let failed = memory_verdict(Err("query broke".to_string()), 200)
+            .expect("a failed measurement is a verdict");
+        assert_eq!(failed.code, "memory-monitor-failed");
+        assert!(failed.message.contains("query broke"));
     }
 }

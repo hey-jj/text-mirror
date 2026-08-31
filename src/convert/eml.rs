@@ -345,6 +345,7 @@ pub fn expand_eml(source: &[u8], detected_format: &str) -> Result<EmlExpansion, 
             text,
             warnings: state.warnings,
             segments,
+            media: None,
         },
         members: state.members,
     })

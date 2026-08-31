@@ -40,6 +40,12 @@ pub struct SpawnSpec<'a> {
     /// observe namespace denial directly, and a second probe stage
     /// proves the filter kills socket creation.
     pub seccomp: bool,
+    /// Literal files the jail additionally grants read and execute
+    /// on: the pinned engine and probe binaries. Never a directory.
+    pub exec_grants: &'a [std::path::PathBuf],
+    /// Literal files the jail additionally grants read on: the pinned
+    /// weights and other read-only runtime files. Never a directory.
+    pub read_grants: &'a [std::path::PathBuf],
 }
 
 /// A platform jail backend.
@@ -92,21 +98,33 @@ fn probe_cache() -> &'static Mutex<HashSet<String>> {
 }
 
 /// The digest a cached probe pass is keyed by: the backend policy,
-/// the worker path, and the worker binary hash.
+/// the worker path, the worker binary hash, and the literal grant
+/// paths, so a grant change invalidates every cached probe pass.
 pub(super) fn policy_digest(
     backend: &dyn JailBackend,
     worker: &Path,
+    exec_grants: &[std::path::PathBuf],
+    read_grants: &[std::path::PathBuf],
 ) -> Result<String, RunnerError> {
     let worker_hash = hash::hash_file(worker).map_err(|e| RunnerError {
         code: "worker_not_found",
         message: format!("cannot hash worker binary {}: {e}", worker.display()),
     })?;
+    let grant_lines = |label: &str, grants: &[std::path::PathBuf]| {
+        grants
+            .iter()
+            .map(|path| format!("{label}={}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let material = format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
         backend.name(),
         backend.policy_material(),
         worker.display(),
-        worker_hash
+        worker_hash,
+        grant_lines("exec", exec_grants),
+        grant_lines("read", read_grants),
     );
     Ok(hash::hash_bytes(material.as_bytes()))
 }

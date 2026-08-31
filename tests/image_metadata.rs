@@ -586,7 +586,7 @@ fn a_prior_record_from_the_previous_rules_generation_is_not_skipped() {
     assert_eq!(report.counts.skipped_unchanged, 0);
     let primary = terminal(&setup, "old.png").unwrap();
     assert_eq!(primary.status, Status::Converted);
-    assert_eq!(primary.rules_version, "9");
+    assert_eq!(primary.rules_version, "10");
     let child = terminal(&setup, "old.png.d/#image-metadata").expect("minted child");
     assert_eq!(child.status, Status::Converted);
     assert!(artifact(&setup, "old.png.d/#image-metadata").contains("minted on upgrade"));

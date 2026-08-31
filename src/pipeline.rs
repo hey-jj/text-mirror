@@ -53,8 +53,19 @@ pub struct Rules {
 impl Rules {
     /// The rules compiled into the binary.
     pub fn builtin() -> Result<Self> {
+        Self::from_registry(Registry::builtin()?)
+    }
+
+    /// The rules compiled into the binary, with the deployment's
+    /// runtime-inventory paths wired into the pinned-engine
+    /// converters. The expected hashes stay in the rules; the
+    /// inventory supplies only paths.
+    pub fn builtin_with_inventory(inventory: &convert::RuntimeInventory) -> Result<Self> {
+        Self::from_registry(Registry::builtin_with_inventory(inventory)?)
+    }
+
+    fn from_registry(registry: Registry) -> Result<Self> {
         let table = FormatTable::builtin()?;
-        let registry = Registry::builtin()?;
         if table.version() != registry.version() {
             return Err(Error::Rules {
                 name: "rules".to_string(),
@@ -324,6 +335,7 @@ fn seed_dedup(terminal: &HashMap<String, Record>, rules: &Rules, dedup: &mut Ded
                 converter_id: converter_id.clone(),
                 converter_version: converter_version.clone(),
                 artifact_kind: record.artifact_kind,
+                media: record.media.clone(),
                 warnings: record.warnings.clone(),
             },
         );
@@ -734,6 +746,7 @@ impl Expander<'_> {
                         record.text_path = Some(text_relative);
                         record.text_hash = Some(hash::hash_bytes(text.as_bytes()));
                         record.artifact_kind = canonical.artifact_kind;
+                        record.media = canonical.media.clone();
                         record.converter_id = Some(canonical.converter_id.clone());
                         record.converter_version = Some(canonical.converter_version.clone());
                         record.dedup_of = Some(canonical.source_path.clone());
@@ -908,6 +921,7 @@ impl Expander<'_> {
                     record.text_path = Some(text_relative.clone());
                     record.text_hash = Some(text_hash.clone());
                     record.artifact_kind = Some(outcome.artifact_kind);
+                    record.media.clone_from(&outcome.media);
                     record.converter_id = Some(outcome.converter_id.clone());
                     record.converter_version = Some(outcome.converter_version.clone());
                     record.warnings.extend(outcome.warnings.iter().cloned());
@@ -920,6 +934,7 @@ impl Expander<'_> {
                             converter_id: outcome.converter_id,
                             converter_version: outcome.converter_version,
                             artifact_kind: record.artifact_kind,
+                            media: outcome.media,
                             warnings: outcome.warnings,
                         },
                     );
@@ -1533,6 +1548,7 @@ impl Expander<'_> {
                     warnings: Vec::new(),
                     segments,
                     artifact_kind: manifest::ArtifactKind::Text,
+                    media: None,
                 };
                 if let Err(reason) = validate_output(&outcome) {
                     return self.fail(&meta, reason, started);
@@ -1931,7 +1947,7 @@ mod tests {
     #[test]
     fn builtin_rules_agree_on_a_version() {
         let rules = Rules::builtin().unwrap();
-        assert_eq!(rules.version(), "9");
+        assert_eq!(rules.version(), "10");
     }
 
     /// Drives `Expander::process` directly with an over-ceiling image
@@ -1988,6 +2004,7 @@ mod tests {
                 converter_id: converter.id().to_string(),
                 converter_version: converter.version().to_string(),
                 artifact_kind: Some(ArtifactKind::Ocr),
+                media: None,
                 warnings: Vec::new(),
             },
         );
@@ -2114,6 +2131,7 @@ mod tests {
                 warnings: Vec::new(),
                 segments: vec![Segment::span(0, 999, "document")],
                 artifact_kind: manifest::ArtifactKind::Text,
+                media: None,
             })
         }
     }
@@ -2145,6 +2163,7 @@ mod tests {
                 text,
                 warnings: Vec::new(),
                 artifact_kind: manifest::ArtifactKind::Ocr,
+                media: None,
             })
         }
     }

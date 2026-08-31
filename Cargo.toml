@@ -1,6 +1,6 @@
 [package]
 name = "text-mirror"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Converts binary and rich files into text and builds a replica text-mirror tree beside a manifest recording the source, hash, and converter behind every artifact"
@@ -42,6 +42,14 @@ records-worker = ["dep:parquet", "dep:apache-avro", "dep:rusqlite"]
 # image-ocr-not-built capability gap. The self dev-dependency below
 # turns it on so `cargo test` exercises the decode path.
 image-ocr = ["dep:image"]
+# Compiles the in-jail audio decode path: wav, mp3, flac, and AAC-LC
+# m4a are decoded by the pure-Rust symphonia crate inside the
+# subprocess sandbox to a native-rate, native-channel s16 wav the
+# pinned speech engine reads. Off by default, so a build without it
+# routes those formats to a deliberate audio-asr-not-built capability
+# gap. The self dev-dependency below turns it on so `cargo test`
+# exercises the decode path against the fake engine.
+audio-asr = ["dep:symphonia"]
 # Compiles the in-jail image-metadata reader: the exif, png text-chunk,
 # container packet, xmp, iptc, and iso base media file format parsers
 # that lift textual metadata out of a raster and render it as a hidden
@@ -100,6 +108,15 @@ rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled
 # Gated behind the image-ocr feature, so a default build pulls none of it.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"], optional = true }
 
+# Pure-Rust audio decoder for the in-jail speech path. default-features
+# = false is load-bearing: the explicit features select exactly the
+# wav, mp3, flac, and isomp4/aac paths plus pcm sample conversion, all
+# pure Rust. alac is deliberately excluded so an ALAC track stays a
+# named codec rejection and never becomes silently decodable through
+# this dependency. Gated behind the audio-asr feature, so a default
+# build pulls none of it.
+symphonia = { version = "=0.5.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "pcm", "wav"], optional = true }
+
 # In-jail image-metadata readers. Optional and gated behind the
 # image-metadata feature, so a default build pulls none of them. All
 # three are pure Rust and add no native build dependency: kamadak-exif
@@ -118,9 +135,16 @@ img-parts = { version = "=0.4.0", optional = true }
 rlimit = "=0.11.0"
 nix = { version = "=0.31.3", default-features = false, features = ["process", "sched", "signal"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Safe wrappers over the process-information calls the parent-side
+# resident-memory monitor needs: enumerate a process group and read
+# each member's resident footprint. The unsafe FFI stays inside this
+# dependency, so the crate keeps forbid(unsafe_code).
+libproc = "=0.14.10"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "=0.4.7"
 seccompiler = "=0.5.0"
 
 [dev-dependencies]
-text-mirror = { path = ".", features = ["test-adapters", "records-worker", "image-ocr", "image-metadata"] }
+text-mirror = { path = ".", features = ["test-adapters", "records-worker", "image-ocr", "image-metadata", "audio-asr"] }

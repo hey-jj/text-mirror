@@ -38,6 +38,7 @@ struct Forbidden {
 fn forbidden() -> Vec<Forbidden> {
     let reversed: &[(&str, bool)] = &[
         ("e3m", false),
+        ("repsihw", false),
         ("laudiser", false),
         ("tnemdnema", false),
         ("kcehc dliub", false),

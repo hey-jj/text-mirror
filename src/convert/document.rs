@@ -208,6 +208,7 @@ impl Converter for AnydocDocument {
             text,
             warnings,
             segments,
+            media: None,
         })
     }
 }

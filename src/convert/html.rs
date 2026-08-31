@@ -323,6 +323,7 @@ impl Converter for HtmlStrip {
             text,
             warnings,
             segments,
+            media: None,
         })
     }
 }

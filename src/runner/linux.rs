@@ -66,7 +66,10 @@ impl JailBackend for NamespaceJail {
             .arg("--adapter")
             .arg(spec.mode)
             .arg("--rlimit-as")
-            .arg(spec.limits.address_space_bytes.to_string())
+            .arg(match spec.limits.address_space_bytes {
+                Some(bytes) => bytes.to_string(),
+                None => "none".to_string(),
+            })
             .arg("--rlimit-cpu")
             .arg(spec.limits.cpu_seconds.to_string())
             .arg("--rlimit-fsize")
@@ -75,6 +78,12 @@ impl JailBackend for NamespaceJail {
             .arg(spec.limits.max_processes.to_string())
             .arg("--seccomp")
             .arg(if spec.seccomp { "kill" } else { "off" });
+        for path in spec.exec_grants {
+            command.arg("--grant-exec").arg(path);
+        }
+        for path in spec.read_grants {
+            command.arg("--grant-read").arg(path);
+        }
         Ok(command)
     }
 
@@ -133,8 +142,16 @@ pub(super) fn unshare_namespaces() -> Result<(), String> {
 
 /// Applies the Landlock filesystem policy and requires it fully
 /// enforced. Best-effort is only acceptable in nothing: a partial
-/// policy refuses the run.
-pub(super) fn apply_landlock(jail: &Path, worker: &Path) -> Result<(), String> {
+/// policy refuses the run. Literal grant files, when supplied, gain
+/// execute-and-read or read-only access; a grant that cannot be
+/// opened refuses the run, because a missing pinned artifact must
+/// fail loudly rather than silently narrow the policy.
+pub(super) fn apply_landlock(
+    jail: &Path,
+    worker: &Path,
+    exec_grants: &[std::path::PathBuf],
+    read_grants: &[std::path::PathBuf],
+) -> Result<(), String> {
     let fail = |stage: &str, e: &dyn std::fmt::Display| format!("landlock {stage}: {e}");
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
@@ -154,6 +171,22 @@ pub(super) fn apply_landlock(jail: &Path, worker: &Path) -> Result<(), String> {
             AccessFs::Execute | AccessFs::ReadFile,
         ))
         .map_err(|e| fail("worker rule", &e))?;
+    for path in exec_grants {
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(
+                PathFd::new(path).map_err(|e| fail("open exec grant", &e))?,
+                AccessFs::Execute | AccessFs::ReadFile,
+            ))
+            .map_err(|e| fail("exec grant rule", &e))?;
+    }
+    for path in read_grants {
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(
+                PathFd::new(path).map_err(|e| fail("open read grant", &e))?,
+                AccessFs::ReadFile.into(),
+            ))
+            .map_err(|e| fail("read grant rule", &e))?;
+    }
     for path in RUNTIME_READ_PATHS {
         if !Path::new(path).exists() {
             continue;

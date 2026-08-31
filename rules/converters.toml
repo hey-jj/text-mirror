@@ -7,7 +7,7 @@
 # must match the version in formats.toml and is recorded in every
 # manifest record as rules_version.
 
-version = "9"
+version = "10"
 
 # The passthrough validates UTF-8 and fails closed on anything else,
 # so a binary wearing one of these extensions records failed with
@@ -111,6 +111,20 @@ id = "records-worker"
 version = "1.0.0"
 formats = ["parquet", "avro", "sqlite"]
 
+# Audio runs speech transcription behind the subprocess jail. The
+# audio bytes are decoded in-jail by the pure-Rust symphonia crate to a
+# native-rate, native-channel s16 wav, the decoded-duration and
+# decoded-size preflights are asserted, and the pinned speech engine
+# reads the wav. Gated behind the audio-asr feature; without it these
+# formats route to audio-asr-not-built at registry construction, and on
+# a platform outside the pinned machine class they route back to
+# engine-unpinned. The limits and the pinned runtime hashes live in the
+# [asr] section below.
+[[converters]]
+id = "asr-adapter"
+version = "2.0.0"
+formats = ["wav", "mp3", "flac", "m4a"]
+
 # Spreadsheet formats with no row and column visibility reader yet.
 # They record unsupported with this reason until a reader lands, and
 # the rules bump that lands one re-runs every such record.
@@ -124,12 +138,16 @@ formats = ["xlsb", "xla", "xlam"]
 # The checkpoint key includes rules_version, so the bump that pins an
 # engine re-runs every such record automatically. png, jpeg, and webp
 # moved to the image-pixel-ocr converter above; tiff stays here because
-# the in-jail decoder deliberately excludes it.
+# the in-jail decoder deliberately excludes it. mp3, wav, m4a, and flac
+# moved to the asr-adapter above on the pinned platform; everywhere
+# else the registry routes them back to this reason at construction,
+# because the pinned speech engine identity exists for one machine
+# class only and a second class needs its own measured pin.
 [[unsupported]]
 reason = "engine-unpinned"
 formats = [
   "tiff",
-  "mp3", "wav", "m4a", "mp4", "mov",
+  "mp4", "mov",
 ]
 
 # Formats whose pixels require an external rasterizer that parses
@@ -235,6 +253,60 @@ file_size_bytes = 67108864
 # The GPU driver spins its own threads; 64 gives headroom over the
 # default 16. A per-uid ceiling, not a per-invocation one.
 max_processes = 64
+
+# Speech-transcription jail limit profile, versioned with the rest of
+# the rules. Every number is a containment ceiling measured for the
+# pinned engine on the pinned machine class, not a working-set target,
+# and a deployment changes one only in a visible versioned bump.
+# RLIMIT_AS stays unset on this profile: the pinned accelerator runtime
+# reserves a virtual range far above any sane cap, the same reason the
+# macOS image_ocr profile leaves it unset, and the parent-side resident
+# memory guard is the memory bound instead.
+[asr]
+# Decoded duration cap, asserted in-jail from the decoded frame count
+# with a 16-frame priming allowance. Over the cap fails closed with
+# asr-duration-exceeded and never truncates.
+max_duration_seconds = 3600
+# Worst measured 60-minute decode is under 200 s on the pinned class,
+# so 900 s is about a 5x margin and still kills a runtime that fell
+# off the accelerator hours before it would finish.
+wall_timeout_secs = 900
+# A legitimate accelerator run spends well under a minute of CPU on an
+# hour of audio; a CPU fallback burns through this long before the
+# wall clock, so it is the second backstop behind the backend check.
+cpu_seconds = 600
+# Parent-side aggregate resident-memory ceiling over the worker's
+# whole process group, engine child included. 6 GiB.
+max_resident_bytes = 6442450944
+# An hour of transcript is around 200 KB of engine output, so 4 MiB
+# refuses a runaway response with a wide margin. 4 MiB.
+max_response_bytes = 4194304
+# Engine diagnostics land on stderr; 4 MiB bounds a flood. 4 MiB.
+max_stderr_bytes = 4194304
+# Sits above the 1 GiB decoded-size preflight, so the preflight is
+# the arbiter and RLIMIT_FSIZE only backstops it. 1.125 GiB.
+file_size_bytes = 1207959552
+# The accelerator driver spins its own threads; a per-uid ceiling.
+max_processes = 64
+# The pinned transcription language. The adapter sends it on every
+# request and honors a request language only when equal to it.
+language = "en"
+
+# The pinned speech runtime, named by generic role label only and
+# bound by BLAKE3. The deployment supplies the paths through the
+# runtime-inventory config; the cold worker re-hashes every file
+# against these values immediately before preflight and execution.
+# asr-decode-policy is not a file: it pins the exact serialized decode
+# options built into the adapter, and the build refuses a rules file
+# whose value disagrees with the built-in serialization.
+[asr.inventory]
+asr-cli = "abc021406ad1eda085da1cbcb899bccc89b1da04ce7cc26f083082d0ed252f7d"
+asr-weights = "a25408281ffced74ee45c743d59deb11689c918fe4fa0d22e6f1924e365ac4ab"
+asr-decode-policy = "f5f5ff161c4fea33411cfd2e51a52cfe5ed953c209eda24b395d8574c4d32871"
+# The backend probe binary is not pinned yet; its hash lands in a
+# later versioned rules update. Until then this placeholder cannot
+# match any file, so the engine path fails closed on the probe role.
+asr-probe = "0000000000000000000000000000000000000000000000000000000000000000"
 
 # Image-metadata parser ceilings, versioned with the rest of the rules.
 # The metadata worker runs behind the shared platform-default jail, so

@@ -55,6 +55,13 @@ enum Command {
         /// The division name, also the shard file stem
         #[arg(long)]
         division: String,
+        /// A TOML file mapping pinned runtime role labels to the
+        /// absolute paths of the files that fill them, wiring the
+        /// deployment's engine artifacts into the jailed converters.
+        /// The expected hashes stay in the versioned rules, and the
+        /// jailed worker re-hashes every file before use.
+        #[arg(long)]
+        runtime_inventory: Option<PathBuf>,
     },
     /// Coverage per division over terminal manifest records
     Status {
@@ -101,9 +108,9 @@ enum Command {
 }
 
 fn execute(command: Command) -> Result<String, text_mirror::Error> {
-    let rules = Rules::builtin()?;
     let json = match command {
         Command::Scan { root } => {
+            let rules = Rules::builtin()?;
             let report = pipeline::scan(&root, &rules, &WalkOptions::default())?;
             serde_json::to_string_pretty(&report)
         }
@@ -112,7 +119,14 @@ fn execute(command: Command) -> Result<String, text_mirror::Error> {
             mirror,
             manifest,
             division,
+            runtime_inventory,
         } => {
+            let rules = match &runtime_inventory {
+                Some(path) => Rules::builtin_with_inventory(
+                    &text_mirror::convert::RuntimeInventory::load(path)?,
+                )?,
+                None => Rules::builtin()?,
+            };
             let report = pipeline::run(
                 &rules,
                 &RunOptions {

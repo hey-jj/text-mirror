@@ -329,6 +329,30 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 #[test]
+fn the_resident_memory_guard_kills_an_overshooting_worker() {
+    // The balloon harness writes far more resident pages than this
+    // ceiling and then holds without responding, so the parent's
+    // process-group memory poll is what must end the invocation, well
+    // before the wall clock. The drains stay attached through the
+    // termination, which is why the error is the guard's own code and
+    // never a drain timeout.
+    let runner = runner_with(Limits {
+        max_resident_bytes: Some(64 * 1024 * 1024),
+        wall_timeout: Duration::from_secs(20),
+        ..brisk_limits()
+    });
+    let started = std::time::Instant::now();
+    let error = runner
+        .run("harness-balloon", serde_json::json!({}), &[])
+        .unwrap_err();
+    assert_eq!(error.code, "worker-memory-exceeded", "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the guard, not the wall clock, must end the balloon"
+    );
+}
+
+#[test]
 fn a_valid_request_and_response_round_trip_through_the_jail() {
     let response = runner()
         .run("harness-echo", serde_json::json!({"token": "abc"}), &[])

@@ -39,7 +39,12 @@ const RUNTIME_READ_DEVICES: &[&str] = &["/dev/urandom", "/dev/random", "/dev/nul
 /// The Seatbelt jail.
 pub struct SeatbeltJail;
 
-fn profile(jail: &Path, worker: &Path) -> Result<String, RunnerError> {
+fn profile(
+    jail: &Path,
+    worker: &Path,
+    exec_grants: &[std::path::PathBuf],
+    read_grants: &[std::path::PathBuf],
+) -> Result<String, RunnerError> {
     let literal = |path: &Path| -> Result<String, RunnerError> {
         let text = path.to_str().ok_or_else(|| RunnerError {
             code: "sandbox_unavailable",
@@ -65,6 +70,22 @@ fn profile(jail: &Path, worker: &Path) -> Result<String, RunnerError> {
         )
         .collect::<Vec<_>>()
         .join("\n");
+    // Additional literal-file grants for the pinned runtime the
+    // deployment wired in: read and execute for engine and probe
+    // binaries, read only for weights. Literal files only, never a
+    // parent directory, so nothing beside the pinned artifacts
+    // becomes readable.
+    let mut grant_lines = String::new();
+    for path in exec_grants {
+        let path = literal(path)?;
+        grant_lines.push_str(&format!(
+            "(allow process-exec* file-read* file-map-executable (literal \"{path}\"))\n"
+        ));
+    }
+    for path in read_grants {
+        let path = literal(path)?;
+        grant_lines.push_str(&format!("(allow file-read* (literal \"{path}\"))\n"));
+    }
     // Deny by default. Grant only the mach, sysctl, and loader
     // allowances a process needs to reach main, execute and read the
     // worker, read the fixed runtime trees, read and write the jail,
@@ -90,8 +111,17 @@ fn profile(jail: &Path, worker: &Path) -> Result<String, RunnerError> {
 {runtime_reads}
   (subpath "/dev/fd"))
 (allow file-read* file-write* (subpath "{jail}"))
-"#
+{grant_lines}"#
     ))
+}
+
+/// The `--rlimit-as` argument value: a byte count, or `none` when the
+/// profile leaves the limit unset.
+fn rlimit_as_argument(limit: Option<u64>) -> String {
+    match limit {
+        Some(bytes) => bytes.to_string(),
+        None => "none".to_string(),
+    }
 }
 
 impl JailBackend for SeatbeltJail {
@@ -109,7 +139,12 @@ impl JailBackend for SeatbeltJail {
         let mut command = Command::new(SANDBOX_EXEC);
         command
             .arg("-p")
-            .arg(profile(spec.jail, spec.worker)?)
+            .arg(profile(
+                spec.jail,
+                spec.worker,
+                spec.exec_grants,
+                spec.read_grants,
+            )?)
             .arg(spec.worker)
             .arg("sandbox-helper")
             .arg("--jail")
@@ -119,7 +154,7 @@ impl JailBackend for SeatbeltJail {
             .arg("--adapter")
             .arg(spec.mode)
             .arg("--rlimit-as")
-            .arg(spec.limits.address_space_bytes.to_string())
+            .arg(rlimit_as_argument(spec.limits.address_space_bytes))
             .arg("--rlimit-cpu")
             .arg(spec.limits.cpu_seconds.to_string())
             .arg("--rlimit-fsize")
@@ -128,6 +163,12 @@ impl JailBackend for SeatbeltJail {
             .arg(spec.limits.max_processes.to_string())
             .arg("--seccomp")
             .arg("off");
+        for path in spec.exec_grants {
+            command.arg("--grant-exec").arg(path);
+        }
+        for path in spec.read_grants {
+            command.arg("--grant-read").arg(path);
+        }
         Ok(command)
     }
 

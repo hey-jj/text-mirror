@@ -292,31 +292,28 @@ fn a_scanned_pdf_fails_closed_behind_the_runner() {
 #[test]
 fn media_formats_record_unsupported_with_engine_unpinned() {
     let setup = setup();
-    // Audio and video engines are still unpinned. png, jpeg, and webp
-    // moved to the image-pixel-ocr converter, so a png is no longer
-    // engine-unpinned: it routes to a live converter, exercised below.
-    fs::write(setup.root.join("call.mp3"), b"ID3fake audio bytes").unwrap();
+    // Video engines are still unpinned everywhere. The audio formats
+    // moved to the asr-adapter on the pinned platform and are
+    // exercised in the audio suite.
     fs::write(setup.root.join("clip.mp4"), b"\0\0\0\x18ftypmp42fake").unwrap();
 
     let rules = Rules::builtin().unwrap();
     let report = run(&setup, &rules);
-    assert_eq!(report.counts.unsupported, 2, "records: {report:?}");
+    assert_eq!(report.counts.unsupported, 1, "records: {report:?}");
 
-    for (source, format) in [("call.mp3", "mp3"), ("clip.mp4", "mp4")] {
-        let record = terminal(&setup, source);
-        assert_eq!(record.status, Status::Unsupported, "{source}");
-        assert_eq!(record.detected_format, format, "{source}");
-        assert_eq!(
-            record.error.as_deref(),
-            Some("engine-unpinned"),
-            "{source} should carry the engine-unpinned reason"
-        );
-        assert!(record.text_path.is_none(), "{source} has no artifact");
-        assert!(
-            !setup.mirror.join(format!("alpha/{source}.txt")).exists(),
-            "{source} wrote no text file"
-        );
-    }
+    let record = terminal(&setup, "clip.mp4");
+    assert_eq!(record.status, Status::Unsupported);
+    assert_eq!(record.detected_format, "mp4");
+    assert_eq!(
+        record.error.as_deref(),
+        Some("engine-unpinned"),
+        "mp4 should carry the engine-unpinned reason"
+    );
+    assert!(record.text_path.is_none(), "mp4 has no artifact");
+    assert!(
+        !setup.mirror.join("alpha/clip.mp4.txt").exists(),
+        "mp4 wrote no text file"
+    );
 }
 
 #[test]

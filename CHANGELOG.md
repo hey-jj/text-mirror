@@ -4,6 +4,105 @@ All notable changes to this project are documented here. The format
 follows Keep a Changelog, and the project adheres to Semantic
 Versioning.
 
+## [0.7.0] - 2026-08-30
+
+### Added
+
+- An in-jail audio transcription converter for wav, mp3, flac, and
+  m4a, gated behind a new `audio-asr` feature. The source is decoded
+  by the pure-Rust symphonia crate inside the subprocess sandbox into
+  a wav at the decoder-reported sample rate and channel count, never
+  the container's declared rate, and the pinned speech engine reads
+  that wav. Resampling and channel mixing stay inside the engine, so
+  no resampler enters this crate. The converter ships as
+  `asr-adapter/2.0.0` and stamps transcripts with
+  `ArtifactKind::Transcript` and a `media` block naming the decoded
+  duration, the pinned language, and the engine identity as a role
+  label plus hashes. A build without the feature records the four
+  formats as `unsupported` with reason `audio-asr-not-built`. The
+  engine identity is pinned for one machine class, so a featured
+  build on any other platform records them as `unsupported` with
+  reason `engine-unpinned` until that platform gains its own pin.
+- The audio jail profile as versioned rules data, the `[asr]` section:
+  a one-hour decoded-duration ceiling asserted in-jail from the
+  decoded frame count with a sixteen-frame priming allowance
+  (`asr-duration-exceeded`, never truncation), a 1 GiB decoded-size
+  preflight (`asr-decoded-too-large`) sitting under the file-size
+  rlimit so the preflight is always the arbiter, wall, cpu, response,
+  stderr, and process ceilings, and the pinned runtime hashes. A
+  sub-LSB waveform fails as `asr-no-speech`. A louder waveform whose
+  engine response holds no segments fails as `empty_output`. Neither
+  ever writes an empty artifact.
+- m4a admission for the low-complexity AAC profile only, decided by a
+  first-party bounded reader over the track's decoder configuration:
+  spectral-band replication signaled on the flag bit (the sync word
+  alone never rejects), parametric coding, a non-low-complexity
+  object type, a reserved rate index, a container rate that disagrees
+  with the configuration rate, a lossless-codec track, more than one
+  track, and a truncated configuration all fail closed with
+  `asr-codec-unsupported`.
+- A parent-side resident-memory guard in the runner. When a limit
+  profile carries `max_resident_bytes`, the parent polls the worker's
+  whole process group, engine child included, sums resident bytes
+  with checked arithmetic, kills the group when the sum crosses the
+  ceiling, and fails closed with `worker-memory-exceeded`. A failed
+  measurement is itself a failure, `memory-monitor-failed`, and the
+  output drains keep running through the termination. The audio
+  profile uses it at 6 GiB with the address-space limit unset, the
+  same shape as the image profile on this platform.
+- A runtime-inventory mechanism shared by the image-OCR and audio
+  converters. A deployment maps generic role labels to file paths
+  through the new `RuntimeInventory` type, the
+  `Rules::builtin_with_inventory` constructor, or the new
+  `--runtime-inventory` flag on `text-mirror run`. The expected
+  BLAKE3 values live in the versioned rules (`[image_ocr.inventory]`
+  and `[asr.inventory]`). The jail grants each supplied file as a
+  literal path, never a directory, and the cold worker re-hashes
+  every file against its pinned hash right before preflight and
+  execution, so a swap after parent-side validation still fails
+  closed. Failures name role labels only.
+- A flac row in the format table, so flac detects as its own format
+  instead of falling to `unknown`.
+
+### Changed
+
+- The rules version moves from 9 to 10. Every record whose format
+  routing changed, the audio family above all, re-runs once under
+  this release.
+- The public `Outcome` struct gained a `media` field and the public
+  `CanonicalArtifact` struct gained a `media` field, so a
+  transcript's media block survives conversion, the checkpoint, and
+  both dedup paths. Both structs are exhaustive, so external code that
+  constructs them by listing every field must add the new one. The
+  on-disk `manifest@1` is unchanged: `media` was already an optional
+  record field.
+- The public runner `Limits` struct changed shape:
+  `address_space_bytes` is now an `Option`, `None` leaving the rlimit
+  unset, and the struct gained `max_resident_bytes` for the new
+  resident-memory guard. The public `ImageOcrLimits` struct gained an
+  `inventory` map, and the sandbox helper's public `HelperConfig`
+  gained the grant lists and the optional address-space value.
+  External code that constructs any of them by listing every field
+  must account for the changes.
+- The `AsrRequest` wire body gained required `max_duration_seconds`
+  and optional `inventory` fields, and `OcrRequest` gained an
+  optional `inventory` field that stays off the wire when empty. The
+  adapter schema identifiers are unchanged, and parent and worker
+  ship in one binary, so no mixed-version pairing exists for the
+  required field to trip.
+- The speech adapter's constructor now takes the parsed `[asr]`
+  profile and a runtime inventory instead of a bare runner, and the
+  image-OCR converter's constructor takes the inventory beside its
+  limits. The engine-unpinned speech scaffold and its fake worker
+  response are gone. The fake engine stage now runs behind a
+  dedicated worker mode that shares the production decode and
+  preflight layers.
+- An accepted consequence of the crate-wide 128 MiB source ceiling:
+  an hour-long uncompressed wav at 44.1 or 48 kHz exceeds it and
+  records `resource_limit` before any decode, while hour-long mp3,
+  m4a, and flac sources fit. Raising that ceiling is a crate-wide
+  decision for a later release.
+
 ## [0.6.0] - 2026-08-24
 
 ### Added

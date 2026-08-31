@@ -2,7 +2,7 @@
 
 Converts binary and rich files into plain text and builds a replica text-mirror tree with a manifest that records how every file was handled.
 
-Point it at a directory tree. It walks the tree, detects each format by content, runs the matching converter, and writes a parallel tree of text artifacts. `Q3 Budget.xlsx` becomes `Q3 Budget.xlsx.txt` at the same relative path under its division's mirror root. Shipped converters cover plain text, Markdown, CSV, and text-native developer formats, Word documents and presentations in both current and legacy formats, workbooks with hidden sheets, rows, and columns marked, text-layer PDF, HTML, and email with attachments expanded as child records. Zip archives expand into their members, each routed back through detection. Parquet, avro, and sqlite convert behind the opt-in `records-worker` feature described below. Raster images convert behind the opt-in `image-ocr` and `image-metadata` features described below. Audio and video are detected and recorded as `unsupported` with reason `engine-unpinned` until transcription engines are pinned in the rules data. The append-only JSONL manifest covers every file, including the ones that did not convert, so the mirror always has a known denominator.
+Point it at a directory tree. It walks the tree, detects each format by content, runs the matching converter, and writes a parallel tree of text artifacts. `Q3 Budget.xlsx` becomes `Q3 Budget.xlsx.txt` at the same relative path under its division's mirror root. Shipped converters cover plain text, Markdown, CSV, and text-native developer formats, Word documents and presentations in both current and legacy formats, workbooks with hidden sheets, rows, and columns marked, text-layer PDF, HTML, and email with attachments expanded as child records. Zip archives expand into their members, each routed back through detection. Parquet, avro, and sqlite convert behind the opt-in `records-worker` feature described below. Raster images convert behind the opt-in `image-ocr` and `image-metadata` features described below. Audio transcribes behind the opt-in `audio-asr` feature described below. Video is detected and recorded as `unsupported` with reason `engine-unpinned` until an engine is pinned in the rules data. The append-only JSONL manifest covers every file, including the ones that did not convert, so the mirror always has a known denominator.
 
 The mirror feeds downstream text tooling that cannot read binary formats. The companion crate `data-classification` is one such consumer. The text artifacts carry no in-band metadata, so the tree also serves directly as a corpus.
 
@@ -45,6 +45,20 @@ A default build records a png, jpeg, or webp source as `unsupported` with reason
 | svg | The raw markup passes through as the text artifact. No pixel OCR runs. |
 | ai | The PDF text layer is extracted through `pdf-subprocess`. A legacy PostScript-backed file has no PDF text layer and fails closed with a pdf-family reason. |
 | tiff | Recorded as `unsupported` with reason `engine-unpinned` until a rules bump pins a decoder. |
+
+## The audio feature
+
+Speech transcription for wav, mp3, flac, and m4a is gated behind the `audio-asr` feature, off by default. The audio bytes are decoded inside the subprocess jail by the pure-Rust symphonia crate into a wav at the decoder-reported sample rate and channel count, and the pinned speech engine reads that wav. The engine, its weights, and its backend probe are deployment artifacts named by generic role labels and bound by BLAKE3 in the rules; a run supplies their paths with `--runtime-inventory`, and the jailed worker re-hashes every file before use. Without a wired runtime a featured build decodes the audio and fails closed with `asr-runtime-missing`.
+
+```
+cargo build --release --features audio-asr
+text-mirror run <root> --mirror <mirror> --manifest <manifest> --division <name> \
+  --runtime-inventory inventory.toml
+```
+
+A default build records a wav, mp3, flac, or m4a source as `unsupported` with reason `audio-asr-not-built`. The pinned engine identity exists for one machine class, so on any other platform a featured build records the same formats as `unsupported` with reason `engine-unpinned` until that platform gains its own pin.
+
+Ceilings worth knowing: decoded duration is capped at one hour, and the crate-wide 128 MiB source ceiling applies before conversion, so an hour-long uncompressed wav at 44.1 or 48 kHz fails with `resource_limit` before it is decoded. Hour-long mp3, m4a, and flac sources fit. A transcript record carries a `media` block naming the decoded duration, the language, and the pinned engine identity by role label and hash. m4a is admitted for the low-complexity AAC profile only; other codec shapes fail closed with `asr-codec-unsupported`.
 
 ## License
 

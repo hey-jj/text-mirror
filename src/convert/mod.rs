@@ -90,6 +90,14 @@ pub struct ImageOcrLimits {
     pub file_size_bytes: u64,
     /// RLIMIT_NPROC for the child.
     pub max_processes: u64,
+    /// Expected BLAKE3 per pinned runtime role, keyed by the generic
+    /// role label. The deployment supplies the paths through the
+    /// runtime-inventory config; the cold worker re-hashes every file
+    /// against these values immediately before use. Empty when no
+    /// runtime is pinned in the rules, which leaves recognition on its
+    /// fail-closed runtime-missing path.
+    #[serde(default)]
+    pub inventory: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for ImageOcrLimits {
@@ -102,7 +110,219 @@ impl Default for ImageOcrLimits {
             cpu_seconds: 600,
             file_size_bytes: 64 * 1024 * 1024,
             max_processes: 64,
+            inventory: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+/// The pinned-runtime role labels of the image-OCR path: the engine
+/// binary, its weights, the projector, the fixed prompt, and the
+/// serialized limit policy. Generic labels only; the identities behind
+/// them are deployment data bound by hash.
+pub(crate) const IMAGE_OCR_ROLE_LABELS: [&str; 5] = [
+    "engine-cli",
+    "vision-weights",
+    "vision-projector",
+    "ocr-prompt",
+    "ocr-limit-policy",
+];
+
+/// The speech-transcription jail limit profile and pinned runtime
+/// hashes, held as rules data beside the image-OCR profile so a
+/// deployment changes them only in a visible versioned bump. Every
+/// number is a containment ceiling measured for the pinned engine on
+/// the pinned machine class. The registry reads this into the audio
+/// converter, which maps it into the runner limits its jailed worker
+/// enforces and sends the decoded-duration ceiling into the jail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsrProfile {
+    /// Decoded-duration ceiling in seconds, asserted in-jail from the
+    /// decoded frame count with a small priming allowance. Over the
+    /// ceiling fails closed with `asr-duration-exceeded`, never
+    /// truncation.
+    pub max_duration_seconds: u64,
+    /// Wall-clock ceiling for one source, in seconds.
+    pub wall_timeout_secs: u64,
+    /// RLIMIT_CPU for the child, in seconds. The second backstop
+    /// behind the accelerator preflight: a run that fell back to CPU
+    /// burns through it long before the wall clock.
+    pub cpu_seconds: u64,
+    /// Parent-side ceiling on the aggregate resident bytes of the
+    /// worker's whole process group, engine child included.
+    pub max_resident_bytes: u64,
+    /// Ceiling on the response frame payload, in bytes.
+    pub max_response_bytes: u32,
+    /// Ceiling on stderr bytes.
+    pub max_stderr_bytes: u64,
+    /// RLIMIT_FSIZE for the child, in bytes. Sits above the decoded
+    /// size preflight, so the preflight is the arbiter and this only
+    /// backstops it.
+    pub file_size_bytes: u64,
+    /// RLIMIT_NPROC for the child.
+    pub max_processes: u64,
+    /// The pinned transcription language. The built-in decode policy
+    /// pins `en`, and rules parsing refuses any other value.
+    pub language: String,
+    /// Expected BLAKE3 per pinned runtime role, keyed by the generic
+    /// role label: `asr-cli`, `asr-weights`, `asr-decode-policy`, and
+    /// `asr-probe`. Exactly those four roles must be present. The
+    /// deployment supplies the file paths through the runtime
+    /// inventory config; the cold worker re-hashes every file against
+    /// these values immediately before preflight and execution.
+    pub inventory: std::collections::BTreeMap<String, String>,
+}
+
+/// Whether a string is a lowercase hex BLAKE3.
+fn is_lower_hex_256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// Validates the `[asr]` rules section: the pinned language, exactly
+/// the four known roles, lowercase hex hashes, and an
+/// `asr-decode-policy` value that matches the serialization built into
+/// the adapter, so the rules cannot silently disagree with the code.
+fn validate_asr_profile(profile: &AsrProfile, name: &str) -> Result<()> {
+    let rules_error = |message: String| Error::Rules {
+        name: name.to_string(),
+        message,
+    };
+    if profile.language != "en" {
+        return Err(rules_error(format!(
+            "[asr] language {:?} is not supported: the built-in decode policy pins \"en\"",
+            profile.language
+        )));
+    }
+    let expected_roles = [
+        subprocess::ASR_ROLE_CLI,
+        subprocess::ASR_ROLE_WEIGHTS,
+        subprocess::ASR_ROLE_DECODE_POLICY,
+        subprocess::ASR_ROLE_PROBE,
+    ];
+    for role in expected_roles {
+        if !profile.inventory.contains_key(role) {
+            return Err(rules_error(format!(
+                "[asr.inventory] is missing role {role:?}"
+            )));
+        }
+    }
+    for (role, hash) in &profile.inventory {
+        if !expected_roles.contains(&role.as_str()) {
+            return Err(rules_error(format!(
+                "[asr.inventory] names unknown role {role:?}"
+            )));
+        }
+        if !is_lower_hex_256(hash) {
+            return Err(rules_error(format!(
+                "[asr.inventory] role {role:?} is not a lowercase hex BLAKE3"
+            )));
+        }
+    }
+    let built_in = crate::hash::hash_bytes(subprocess::ASR_DECODE_POLICY.as_bytes());
+    if profile.inventory[subprocess::ASR_ROLE_DECODE_POLICY] != built_in {
+        return Err(rules_error(
+            "[asr.inventory] asr-decode-policy does not match the built-in decode \
+             serialization"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates the `[image_ocr]` inventory keys against the known role
+/// labels and requires lowercase hex hashes.
+fn validate_image_ocr_limits(limits: &ImageOcrLimits, name: &str) -> Result<()> {
+    for (role, hash) in &limits.inventory {
+        if !IMAGE_OCR_ROLE_LABELS.contains(&role.as_str()) {
+            return Err(Error::Rules {
+                name: name.to_string(),
+                message: format!("[image_ocr.inventory] names unknown role {role:?}"),
+            });
+        }
+        if !is_lower_hex_256(hash) {
+            return Err(Error::Rules {
+                name: name.to_string(),
+                message: format!(
+                    "[image_ocr.inventory] role {role:?} is not a lowercase hex BLAKE3"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Deployment-side mapping from a pinned runtime role label to the
+/// file that fills it. Paths are deployment data and never enter the
+/// versioned rules: the expected hashes live in the rules, and the
+/// jailed worker re-hashes every supplied file against them
+/// immediately before use, so a swap after parent-side validation
+/// still fails closed. Roles are validated against the known label
+/// set, so a typo fails loudly instead of silently leaving a role
+/// unfilled.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeInventory {
+    paths: std::collections::BTreeMap<String, std::path::PathBuf>,
+}
+
+impl RuntimeInventory {
+    /// An inventory with no roles filled: every engine path stays on
+    /// its fail-closed runtime-missing seam.
+    pub fn empty() -> RuntimeInventory {
+        RuntimeInventory::default()
+    }
+
+    /// Every role label a deployment may fill.
+    pub fn known_roles() -> impl Iterator<Item = &'static str> {
+        IMAGE_OCR_ROLE_LABELS
+            .into_iter()
+            .chain(subprocess::ASR_FILE_ROLE_LABELS)
+    }
+
+    /// Fills one role with an absolute path.
+    pub fn set(&mut self, role: &str, path: std::path::PathBuf) -> Result<()> {
+        let rules_error = |message: String| Error::Rules {
+            name: "runtime-inventory".to_string(),
+            message,
+        };
+        if !Self::known_roles().any(|known| known == role) {
+            return Err(rules_error(format!("unknown runtime role {role:?}")));
+        }
+        if !path.is_absolute() {
+            return Err(rules_error(format!(
+                "runtime role {role:?} needs an absolute path"
+            )));
+        }
+        self.paths.insert(role.to_string(), path);
+        Ok(())
+    }
+
+    /// The path filling a role, when the deployment supplied one.
+    pub fn path(&self, role: &str) -> Option<&std::path::Path> {
+        self.paths.get(role).map(std::path::PathBuf::as_path)
+    }
+
+    /// Parses an inventory from TOML text: one flat table mapping each
+    /// role label to an absolute path.
+    pub fn parse(text: &str, name: &str) -> Result<RuntimeInventory> {
+        let raw: std::collections::BTreeMap<String, String> =
+            toml::from_str(text).map_err(|e| Error::Rules {
+                name: name.to_string(),
+                message: e.to_string(),
+            })?;
+        let mut inventory = RuntimeInventory::empty();
+        for (role, path) in raw {
+            inventory.set(&role, std::path::PathBuf::from(path))?;
+        }
+        Ok(inventory)
+    }
+
+    /// Loads an inventory from a TOML file.
+    pub fn load(path: &std::path::Path) -> Result<RuntimeInventory> {
+        let text = std::fs::read_to_string(path).map_err(|e| Error::io("read", path, e))?;
+        RuntimeInventory::parse(&text, &path.display().to_string())
     }
 }
 
@@ -178,6 +398,12 @@ pub(crate) mod records;
 // reaches it through a crate path.
 #[cfg(all(unix, feature = "image-ocr"))]
 pub(crate) mod image_ocr;
+// The in-jail audio decode and transcribe path. Crate-private for the
+// same reason image_ocr is: a library consumer must not run the
+// decode and engine path in process and bypass the jail. The worker
+// dispatch reaches it through a crate path.
+#[cfg(all(unix, feature = "audio-asr"))]
+pub(crate) mod audio_asr;
 // The image-metadata derived-child leg. The id, version, and the
 // applies predicate are always compiled so the registry and pipeline can
 // name the leg; the parsers and the parent rendering compile only under
@@ -222,6 +448,12 @@ pub struct Outcome {
     /// [`ArtifactKind::Ocr`], so the manifest records recognized text
     /// as OCR rather than extraction.
     pub artifact_kind: crate::manifest::ArtifactKind,
+    /// Media provenance for a transcript artifact: source duration,
+    /// language, and the pinned engine identity as a role label and
+    /// hashes. Every text and image converter returns `None`; the
+    /// audio converter populates it, and the pipeline copies it onto
+    /// the manifest record and through dedup.
+    pub media: Option<crate::manifest::Media>,
 }
 
 /// A conversion failure with a machine-readable reason.
@@ -342,6 +574,23 @@ pub const RECORDS_NOT_BUILT_REASON: &str = "records-worker-not-built";
 /// includes `rules_version`, so a later feature-carrying build
 /// reconverts every such record.
 pub const IMAGE_OCR_NOT_BUILT_REASON: &str = "image-ocr-not-built";
+
+/// The reason audio formats record on a build without the `audio-asr`
+/// feature. The converter exists and the rules route to it, but this
+/// binary has no in-jail decode-plus-transcribe path, so the formats
+/// are a deliberate capability gap rather than a converter error. The
+/// checkpoint key includes `rules_version`, so a later feature-carrying
+/// build reconverts every such record.
+pub const AUDIO_ASR_NOT_BUILT_REASON: &str = "audio-asr-not-built";
+
+/// The reason a media format records when its adapter's engine has no
+/// pinned identity for the running platform. Declared entries in the
+/// rules use the same string; the registry also applies it at
+/// construction to the audio formats on any platform outside the
+/// pinned machine class, because an engine pin is per machine class
+/// and a second class needs its own measured pin before the route
+/// opens there.
+pub const ENGINE_UNPINNED_REASON: &str = "engine-unpinned";
 
 /// Registry id of the passthrough converter.
 pub const PASSTHROUGH_ID: &str = "text-passthrough";
@@ -466,6 +715,7 @@ impl Converter for PlainTextPassthrough {
             warnings,
             segments,
             artifact_kind: crate::manifest::ArtifactKind::Text,
+            media: None,
         })
     }
 }
@@ -485,6 +735,8 @@ struct RawRegistry {
     image_ocr: Option<ImageOcrLimits>,
     #[serde(default)]
     image_metadata: Option<ImageMetadataLimits>,
+    #[serde(default)]
+    asr: Option<AsrProfile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -516,6 +768,7 @@ pub struct Registry {
     records_limits: RecordsLimits,
     image_ocr_limits: ImageOcrLimits,
     image_metadata_limits: ImageMetadataLimits,
+    asr_profile: Option<AsrProfile>,
     /// Index into `converters` of the auxiliary image-metadata converter,
     /// which never enters `by_format`. The pipeline reaches it by this
     /// index to run the derived-child leg. `None` when the feature is
@@ -532,8 +785,36 @@ impl Registry {
         )
     }
 
-    /// Parses a registry and binds entries to implementations.
+    /// The built-in registry with the deployment's runtime-inventory
+    /// paths wired into the pinned-engine converters.
+    pub fn builtin_with_inventory(inventory: &RuntimeInventory) -> Result<Self> {
+        Self::parse_with_inventory(
+            include_str!("../../rules/converters.toml"),
+            "converters.toml",
+            inventory,
+        )
+    }
+
+    /// Parses a registry and binds entries to implementations, with no
+    /// runtime inventory: every pinned-engine path stays on its
+    /// fail-closed runtime-missing seam.
     pub fn parse(text: &str, name: &str) -> Result<Self> {
+        Self::parse_with_inventory(text, name, &RuntimeInventory::empty())
+    }
+
+    /// Parses a registry and binds entries to implementations, wiring
+    /// the deployment's runtime-inventory paths into the pinned-engine
+    /// converters. The expected hashes stay in the rules text; the
+    /// inventory supplies only paths.
+    #[cfg_attr(
+        not(all(unix, any(feature = "image-ocr", feature = "audio-asr"))),
+        allow(unused_variables)
+    )]
+    pub fn parse_with_inventory(
+        text: &str,
+        name: &str,
+        inventory: &RuntimeInventory,
+    ) -> Result<Self> {
         let raw: RawRegistry = toml::from_str(text).map_err(|e| Error::Rules {
             name: name.to_string(),
             message: e.to_string(),
@@ -541,6 +822,11 @@ impl Registry {
         let records_limits = raw.records.clone().unwrap_or_default();
         let image_ocr_limits = raw.image_ocr.clone().unwrap_or_default();
         let image_metadata_limits = raw.image_metadata.clone().unwrap_or_default();
+        validate_image_ocr_limits(&image_ocr_limits, name)?;
+        let asr_profile = raw.asr.clone();
+        if let Some(profile) = &asr_profile {
+            validate_asr_profile(profile, name)?;
+        }
         let mut converters: Vec<Box<dyn Converter>> = Vec::new();
         let mut by_format = HashMap::new();
         let mut unsupported_reasons = HashMap::new();
@@ -605,6 +891,66 @@ impl Registry {
                 }
                 continue;
             }
+            // A build without the audio-asr feature has no in-jail
+            // decode-plus-transcribe path, so route the audio formats
+            // to a deliberate unsupported reason instead of a
+            // converter that cannot serve them. The rules stay one
+            // shared file: the routing decision is made here at
+            // construction.
+            #[cfg(not(all(unix, feature = "audio-asr")))]
+            if entry.id == subprocess::ASR_ADAPTER_ID {
+                for format in &entry.formats {
+                    if RESERVED_FORMAT_IDS.contains(&format.as_str()) {
+                        return Err(Error::Rules {
+                            name: name.to_string(),
+                            message: format!("format id {format:?} is reserved"),
+                        });
+                    }
+                    if by_format.contains_key(format)
+                        || unsupported_reasons
+                            .insert(format.clone(), AUDIO_ASR_NOT_BUILT_REASON.to_string())
+                            .is_some()
+                    {
+                        return Err(Error::Rules {
+                            name: name.to_string(),
+                            message: format!("format {format:?} claimed twice"),
+                        });
+                    }
+                }
+                continue;
+            }
+            // The pinned speech engine identity exists for one machine
+            // class. A feature-carrying build on any other platform
+            // routes the audio formats back to engine-unpinned, the
+            // same reason they carried before the pin, until that
+            // platform gains its own measured engine identity in a
+            // rules bump.
+            #[cfg(all(
+                unix,
+                feature = "audio-asr",
+                not(all(target_os = "macos", target_arch = "aarch64"))
+            ))]
+            if entry.id == subprocess::ASR_ADAPTER_ID {
+                for format in &entry.formats {
+                    if RESERVED_FORMAT_IDS.contains(&format.as_str()) {
+                        return Err(Error::Rules {
+                            name: name.to_string(),
+                            message: format!("format id {format:?} is reserved"),
+                        });
+                    }
+                    if by_format.contains_key(format)
+                        || unsupported_reasons
+                            .insert(format.clone(), ENGINE_UNPINNED_REASON.to_string())
+                            .is_some()
+                    {
+                        return Err(Error::Rules {
+                            name: name.to_string(),
+                            message: format!("format {format:?} claimed twice"),
+                        });
+                    }
+                }
+                continue;
+            }
             // The image-metadata converter is auxiliary and claims no
             // formats. Without the in-jail metadata reader, or on a
             // platform with no jail backend, the derived-child leg cannot
@@ -627,8 +973,22 @@ impl Registry {
                     Box::new(RecordsSubprocess::new(records_limits.clone()))
                 }
                 #[cfg(all(unix, feature = "image-ocr"))]
-                subprocess::IMAGE_PIXEL_OCR_ID => {
-                    Box::new(subprocess::ImagePixelOcr::new(image_ocr_limits.clone()))
+                subprocess::IMAGE_PIXEL_OCR_ID => Box::new(subprocess::ImagePixelOcr::new(
+                    image_ocr_limits.clone(),
+                    inventory,
+                )),
+                #[cfg(all(
+                    unix,
+                    feature = "audio-asr",
+                    target_os = "macos",
+                    target_arch = "aarch64"
+                ))]
+                subprocess::ASR_ADAPTER_ID => {
+                    let profile = asr_profile.clone().ok_or_else(|| Error::Rules {
+                        name: name.to_string(),
+                        message: "the asr-adapter entry requires an [asr] section".to_string(),
+                    })?;
+                    Box::new(subprocess::AsrAdapter::new(profile, inventory))
                 }
                 #[cfg(all(unix, feature = "image-metadata"))]
                 image_metadata::IMAGE_METADATA_ID => Box::new(subprocess::ImageMetadata::new(
@@ -702,6 +1062,7 @@ impl Registry {
             records_limits,
             image_ocr_limits,
             image_metadata_limits,
+            asr_profile,
             image_metadata_index,
         })
     }
@@ -736,6 +1097,37 @@ impl Registry {
     /// The image-metadata parser ceilings from the rules.
     pub fn image_metadata_limits(&self) -> &ImageMetadataLimits {
         &self.image_metadata_limits
+    }
+
+    /// The speech-transcription jail profile from the rules, when the
+    /// rules carry one.
+    pub fn asr_profile(&self) -> Option<&AsrProfile> {
+        self.asr_profile.as_ref()
+    }
+
+    /// Test-only: drives the audio formats through the fake-engine
+    /// speech adapter instead of the pinned-runtime one, so a pipeline
+    /// test can exercise the decode, preflight, rendering, and media
+    /// propagation without a wired engine. The shared decode,
+    /// duration, size, and silence layers are the production ones;
+    /// only the engine stage is the fake. A release build has no such
+    /// hook, and the registry never constructs the fake itself.
+    #[cfg(all(
+        unix,
+        feature = "audio-asr",
+        feature = "test-adapters",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ))]
+    pub fn use_fake_asr(&mut self) {
+        if let Some(index) = self
+            .converters
+            .iter()
+            .position(|c| c.id() == subprocess::ASR_ADAPTER_ID)
+            && let Some(profile) = self.asr_profile.clone()
+        {
+            self.converters[index] = Box::new(subprocess::AsrAdapter::new_fake(profile));
+        }
     }
 
     /// Test-only: drives the image formats through the fake-engine
@@ -810,6 +1202,7 @@ impl Registry {
             records_limits: RecordsLimits::default(),
             image_ocr_limits: ImageOcrLimits::default(),
             image_metadata_limits: ImageMetadataLimits::default(),
+            asr_profile: None,
             image_metadata_index: None,
         }
     }
@@ -958,7 +1351,7 @@ mod tests {
     #[test]
     fn builtin_registry_claims_the_text_family() {
         let registry = Registry::builtin().unwrap();
-        assert_eq!(registry.version(), "9");
+        assert_eq!(registry.version(), "10");
         assert!(registry.converter_for("json").is_some());
         assert!(registry.converter_for("yaml").is_some());
         assert!(registry.converter_for("svg").is_some());
@@ -1094,6 +1487,162 @@ mod tests {
                 );
             }
         }
+    }
+
+    // The audio family's route depends on the feature and the pinned
+    // machine class. All three arms are asserted through runtime
+    // branches, so each compiles in every configuration and none rots:
+    // with the feature on the pinned class the live converter claims
+    // the formats, with the feature elsewhere they stay engine-unpinned
+    // because the engine identity is per machine class, and without
+    // the feature they carry the deliberate not-built gap.
+    #[test]
+    fn the_audio_family_routes_by_the_feature_and_platform() {
+        let registry = Registry::builtin().unwrap();
+        let pinned_class = cfg!(all(
+            unix,
+            feature = "audio-asr",
+            target_os = "macos",
+            target_arch = "aarch64"
+        ));
+        let feature_present = cfg!(all(unix, feature = "audio-asr"));
+        for format in ["wav", "mp3", "flac", "m4a"] {
+            if pinned_class {
+                assert_eq!(
+                    registry.converter_for(format).map(|c| c.id()),
+                    Some("asr-adapter"),
+                    "{format}"
+                );
+                assert_eq!(registry.unsupported_reason(format), None, "{format}");
+            } else if feature_present {
+                assert!(registry.converter_for(format).is_none(), "{format}");
+                assert_eq!(
+                    registry.unsupported_reason(format),
+                    Some(ENGINE_UNPINNED_REASON),
+                    "{format}"
+                );
+            } else {
+                assert!(registry.converter_for(format).is_none(), "{format}");
+                assert_eq!(
+                    registry.unsupported_reason(format),
+                    Some(AUDIO_ASR_NOT_BUILT_REASON),
+                    "{format}"
+                );
+            }
+        }
+        // Video containers stay engine-unpinned everywhere: their
+        // audio-track extraction is a later, separately ruled path.
+        assert_eq!(registry.unsupported_reason("mp4"), Some("engine-unpinned"));
+        assert_eq!(registry.unsupported_reason("mov"), Some("engine-unpinned"));
+        // The [asr] profile parses with the ruled ceilings and exactly
+        // the four pinned roles, whatever the routing arm.
+        let profile = registry
+            .asr_profile()
+            .expect("the built-in rules carry an [asr] section");
+        assert_eq!(profile.max_duration_seconds, 3600);
+        assert_eq!(profile.wall_timeout_secs, 900);
+        assert_eq!(profile.cpu_seconds, 600);
+        assert_eq!(profile.max_resident_bytes, 6_442_450_944);
+        assert_eq!(profile.max_response_bytes, 4_194_304);
+        assert_eq!(profile.max_stderr_bytes, 4_194_304);
+        assert_eq!(profile.file_size_bytes, 1_207_959_552);
+        assert_eq!(profile.max_processes, 64);
+        assert_eq!(profile.language, "en");
+        assert_eq!(profile.inventory.len(), 4);
+    }
+
+    // The [asr] section is validated at parse: a wrong language, a
+    // missing or unknown role, a malformed hash, and a decode-policy
+    // hash that disagrees with the built-in serialization are all
+    // rules errors, not silent divergences.
+    #[test]
+    fn the_asr_profile_is_validated_at_parse() {
+        let policy_hash = crate::hash::hash_bytes(subprocess::ASR_DECODE_POLICY.as_bytes());
+        let base = |language: &str, probe_role: &str, policy: &str| {
+            format!(
+                r#"version = "1"
+converters = []
+
+[asr]
+max_duration_seconds = 3600
+wall_timeout_secs = 900
+cpu_seconds = 600
+max_resident_bytes = 6442450944
+max_response_bytes = 4194304
+max_stderr_bytes = 4194304
+file_size_bytes = 1207959552
+max_processes = 64
+language = "{language}"
+
+[asr.inventory]
+asr-cli = "{zeros}"
+asr-weights = "{zeros}"
+asr-decode-policy = "{policy}"
+{probe_role} = "{zeros}"
+"#,
+                zeros = "0".repeat(64),
+            )
+        };
+        // A well-formed section parses.
+        let good = base("en", "asr-probe", &policy_hash);
+        assert!(Registry::parse(&good, "converters.toml").is_ok());
+        // A non-pinned language is refused.
+        let err = Registry::parse(&base("fr", "asr-probe", &policy_hash), "converters.toml")
+            .err()
+            .expect("a non-pinned language must be refused");
+        assert!(err.to_string().contains("language"), "{err}");
+        // An unknown role is refused, which also leaves a known role
+        // missing.
+        let err = Registry::parse(&base("en", "asr-extra", &policy_hash), "converters.toml")
+            .err()
+            .expect("an unknown role must be refused");
+        assert!(err.to_string().contains("role"), "{err}");
+        // A decode-policy hash that disagrees with the built-in
+        // serialization is refused.
+        let err = Registry::parse(&base("en", "asr-probe", &"a".repeat(64)), "converters.toml")
+            .err()
+            .expect("a divergent decode-policy hash must be refused");
+        assert!(err.to_string().contains("decode"), "{err}");
+        // A malformed hash is refused.
+        let err = Registry::parse(&base("en", "asr-probe", "SHOUTING"), "converters.toml")
+            .err()
+            .expect("a malformed hash must be refused");
+        assert!(err.to_string().contains("hex"), "{err}");
+    }
+
+    #[test]
+    fn the_runtime_inventory_validates_roles_and_paths() {
+        let mut inventory = RuntimeInventory::empty();
+        assert!(
+            inventory
+                .set("asr-cli", std::path::PathBuf::from("/pinned/engine"))
+                .is_ok()
+        );
+        assert_eq!(
+            inventory.path("asr-cli"),
+            Some(std::path::Path::new("/pinned/engine"))
+        );
+        assert!(inventory.path("asr-weights").is_none());
+        // An unknown role and a relative path both fail loudly.
+        assert!(
+            inventory
+                .set("mystery-role", std::path::PathBuf::from("/x"))
+                .is_err()
+        );
+        assert!(
+            inventory
+                .set("asr-weights", std::path::PathBuf::from("relative"))
+                .is_err()
+        );
+        // The TOML form parses the same way.
+        let parsed =
+            RuntimeInventory::parse("asr-weights = \"/pinned/weights\"\n", "inventory.toml")
+                .unwrap();
+        assert_eq!(
+            parsed.path("asr-weights"),
+            Some(std::path::Path::new("/pinned/weights"))
+        );
+        assert!(RuntimeInventory::parse("nope = \"/x\"\n", "inventory.toml").is_err());
     }
 
     #[test]

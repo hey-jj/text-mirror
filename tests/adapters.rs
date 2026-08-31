@@ -1,4 +1,4 @@
-//! Protocol tests for the OCR, ASR, and video adapter scaffolds.
+//! Protocol tests for the OCR and video adapter scaffolds.
 //!
 //! Each adapter speaks the framed protocol to a fake engine compiled
 //! into the worker under the `test-adapters` feature. The engines are
@@ -6,13 +6,15 @@
 //! pinned. These tests prove the adapter renders a well-formed engine
 //! response into the outcome shape and the transcript format, so the
 //! protocol boundary is exercised end to end without any real engine.
+//! The audio adapter left this scaffold set: it decodes in-jail and
+//! drives the pinned engine, and its own suite exercises it.
 
 #![cfg(unix)]
 
 use std::time::Duration;
 
 use text_mirror::convert::Converter;
-use text_mirror::convert::subprocess::{AsrAdapter, OcrAdapter, VideoAdapter};
+use text_mirror::convert::subprocess::{OcrAdapter, VideoAdapter};
 use text_mirror::manifest::ArtifactKind;
 use text_mirror::runner::jail::platform_backend;
 use text_mirror::runner::{Limits, Runner, locate_worker};
@@ -59,21 +61,6 @@ fn the_ocr_adapter_renders_spans_and_flags_low_confidence() {
 }
 
 #[test]
-fn the_asr_adapter_renders_the_transcript_format() {
-    let outcome = AsrAdapter::new(runner())
-        .convert(b"fake mp3 bytes", "mp3")
-        .expect("the ASR adapter converts");
-    assert_eq!(outcome.converter_id, "asr-adapter");
-    // A speech transcript, not extracted text.
-    assert_eq!(outcome.artifact_kind, ArtifactKind::Transcript);
-    assert_eq!(
-        outcome.text,
-        "[00:00:00 -> 00:00:04] Speaker 1: welcome to the recording\n\
-         [00:00:04 -> 00:00:09] Speaker 2: glad to be here\n"
-    );
-}
-
-#[test]
 fn the_video_adapter_deduplicates_screen_states() {
     let outcome = VideoAdapter::new(runner())
         .convert(b"fake mp4 bytes", "mp4")
@@ -93,13 +80,6 @@ fn adapters_reject_formats_they_do_not_claim() {
     assert_eq!(
         OcrAdapter::new(runner())
             .convert(b"x", "mp3")
-            .unwrap_err()
-            .code,
-        "unclaimed_format"
-    );
-    assert_eq!(
-        AsrAdapter::new(runner())
-            .convert(b"x", "png")
             .unwrap_err()
             .code,
         "unclaimed_format"

@@ -31,8 +31,9 @@ pub struct HelperConfig {
     pub worker: PathBuf,
     /// The adapter mode to exec into.
     pub adapter: String,
-    /// RLIMIT_AS in bytes.
-    pub address_space_bytes: u64,
+    /// RLIMIT_AS in bytes, or `None` when the profile leaves the
+    /// limit unset.
+    pub address_space_bytes: Option<u64>,
     /// RLIMIT_CPU in seconds.
     pub cpu_seconds: u64,
     /// RLIMIT_FSIZE in bytes.
@@ -41,6 +42,12 @@ pub struct HelperConfig {
     pub max_processes: u64,
     /// Whether the syscall filter engages. Linux only.
     pub seccomp: bool,
+    /// Literal files granted read and execute beyond the worker: the
+    /// pinned engine and probe binaries.
+    pub exec_grants: Vec<PathBuf>,
+    /// Literal files granted read only: the pinned weights and other
+    /// read-only runtime files.
+    pub read_grants: Vec<PathBuf>,
 }
 
 /// Parses the `sandbox-helper` argument list.
@@ -48,11 +55,13 @@ pub fn parse_args(args: &[String]) -> Result<HelperConfig, String> {
     let mut jail = None;
     let mut worker = None;
     let mut adapter = None;
-    let mut address_space_bytes = None;
+    let mut address_space_bytes: Option<Option<u64>> = None;
     let mut cpu_seconds = None;
     let mut file_size_bytes = None;
     let mut max_processes = None;
     let mut seccomp = None;
+    let mut exec_grants = Vec::new();
+    let mut read_grants = Vec::new();
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -62,7 +71,13 @@ pub fn parse_args(args: &[String]) -> Result<HelperConfig, String> {
             "--jail" => jail = Some(PathBuf::from(value)),
             "--worker" => worker = Some(PathBuf::from(value)),
             "--adapter" => adapter = Some(value.clone()),
-            "--rlimit-as" => address_space_bytes = Some(parse_number(flag, value)?),
+            "--rlimit-as" => {
+                address_space_bytes = Some(if value == "none" {
+                    None
+                } else {
+                    Some(parse_number(flag, value)?)
+                })
+            }
             "--rlimit-cpu" => cpu_seconds = Some(parse_number(flag, value)?),
             "--rlimit-fsize" => file_size_bytes = Some(parse_number(flag, value)?),
             "--rlimit-nproc" => max_processes = Some(parse_number(flag, value)?),
@@ -73,6 +88,8 @@ pub fn parse_args(args: &[String]) -> Result<HelperConfig, String> {
                     other => return Err(format!("unknown seccomp mode {other:?}")),
                 })
             }
+            "--grant-exec" => exec_grants.push(PathBuf::from(value)),
+            "--grant-read" => read_grants.push(PathBuf::from(value)),
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
@@ -85,6 +102,8 @@ pub fn parse_args(args: &[String]) -> Result<HelperConfig, String> {
         file_size_bytes: file_size_bytes.ok_or("missing --rlimit-fsize")?,
         max_processes: max_processes.ok_or("missing --rlimit-nproc")?,
         seccomp: seccomp.ok_or("missing --seccomp")?,
+        exec_grants,
+        read_grants,
     })
 }
 
@@ -119,7 +138,12 @@ fn engage(config: &HelperConfig) -> Result<(), String> {
     super::linux::unshare_namespaces()?;
     apply_rlimits(config)?;
     close_extra_fds()?;
-    super::linux::apply_landlock(&config.jail, &config.worker)?;
+    super::linux::apply_landlock(
+        &config.jail,
+        &config.worker,
+        &config.exec_grants,
+        &config.read_grants,
+    )?;
     if config.seccomp {
         super::linux::apply_seccomp()?;
     }
@@ -144,19 +168,24 @@ fn engage(_config: &HelperConfig) -> Result<(), String> {
 ///
 /// `RLIMIT_NPROC` caps the process and thread count of the mapped
 /// real user id, so a compromised adapter cannot fork-bomb the host.
-/// `RLIMIT_AS` is applied on Linux only. On macOS the dyld shared
-/// cache reserves a large and version-dependent virtual range, so a
-/// hard address-space cap turns the next allocation into an abort. The CPU, file-size, process-count, and
-/// core limits hold on every platform, and the macOS backend is
-/// development containment where the wall-clock and output caps are
-/// the bounds that hold.
+/// `RLIMIT_AS` is applied on Linux only, and only when the profile
+/// carries a value: a profile whose mapped accelerator runtime
+/// reserves a virtual range above any sane cap leaves it unset and
+/// relies on the parent-side resident-memory guard. On macOS the dyld
+/// shared cache reserves a large and version-dependent virtual range,
+/// so a hard address-space cap turns the next allocation into an
+/// abort. The CPU, file-size, process-count, and core limits hold on
+/// every platform, and the macOS backend is development containment
+/// where the wall-clock and output caps are the bounds that hold.
 fn apply_rlimits(config: &HelperConfig) -> Result<(), String> {
     use rlimit::{Resource, setrlimit};
     let apply = |resource: Resource, name: &str, value: u64| {
         setrlimit(resource, value, value).map_err(|e| format!("setrlimit {name} failed: {e}"))
     };
     #[cfg(target_os = "linux")]
-    apply(Resource::AS, "RLIMIT_AS", config.address_space_bytes)?;
+    if let Some(bytes) = config.address_space_bytes {
+        apply(Resource::AS, "RLIMIT_AS", bytes)?;
+    }
     apply(Resource::CPU, "RLIMIT_CPU", config.cpu_seconds)?;
     apply(Resource::FSIZE, "RLIMIT_FSIZE", config.file_size_bytes)?;
     apply(Resource::NPROC, "RLIMIT_NPROC", config.max_processes)?;

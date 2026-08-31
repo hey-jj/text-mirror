@@ -43,7 +43,7 @@ use std::path::Path;
 
 use image::{ExtendedColorType, ImageEncoder, ImageFormat, ImageReader, Limits, RgbImage};
 
-use crate::runner::protocol::bodies::{OcrInput, OcrOk, OcrRequest, OcrSpan};
+use crate::runner::protocol::bodies::{InventoryEntry, OcrInput, OcrOk, OcrRequest, OcrSpan};
 
 /// The ruled encoder-input area cap: 1536 * 1536 = 2.36 MP, the
 /// validated-safe ceiling. Applied uniformly to every image fed to the
@@ -129,7 +129,7 @@ fn stage_pixels(request: &OcrRequest) -> Result<(RgbImage, Vec<String>), ImageOc
 /// all-features build recognizes through this same fail-closed path.
 pub fn recognize(request: &OcrRequest) -> Result<OcrOk, ImageOcrError> {
     let (rgb, warnings) = stage_pixels(request)?;
-    let spans = recognize_pixels(&rgb)?;
+    let spans = recognize_pixels(&rgb, &request.inventory)?;
     Ok(OcrOk { spans, warnings })
 }
 
@@ -266,20 +266,24 @@ fn recognize_pixels_fake(rgb: &RgbImage) -> Result<Vec<OcrSpan>, ImageOcrError> 
 }
 
 /// Stage 3 under the pinned runtime: re-encode the canonical raster,
-/// verify the runtime inventory fresh (the worker is cold-started per
-/// invocation, so a boot-time check would miss a swapped component),
-/// assert an accelerator-class device is present and selected, exec the
-/// engine child, and parse its fenced stdout. This core release wires
-/// no runtime, so `resolve_components` yields nothing and the verify
-/// fails closed with runtime-missing.
+/// verify the runtime inventory fresh in this cold worker (the request
+/// carries the deployment's paths and the rules-pinned hashes, and the
+/// worker re-hashes every file itself, so a swap after any parent-side
+/// validation still fails closed), assert an accelerator-class device
+/// is present and selected, exec the engine child, and parse its
+/// fenced stdout. With no inventory wired every role is unresolved and
+/// the verify fails closed with runtime-missing.
 ///
 /// This is the production recognition symbol. It carries no feature cfg,
 /// so it compiles identically in every feature combination, including an
 /// all-features build: the fake stage 3 above is a separate function and
 /// never stands in for this one.
-fn recognize_pixels(rgb: &RgbImage) -> Result<Vec<OcrSpan>, ImageOcrError> {
+fn recognize_pixels(
+    rgb: &RgbImage,
+    inventory: &[InventoryEntry],
+) -> Result<Vec<OcrSpan>, ImageOcrError> {
     let canonical = encode_png(rgb)?;
-    let components = runtime::resolve_components();
+    let components = runtime::components_from(inventory);
     runtime::verify_inventory(&runtime::CORE_ROLES, &components)?;
     let devices = runtime::enumerate_devices(&components);
     runtime::check_accelerator(&devices)?;
@@ -314,13 +318,7 @@ mod runtime {
     /// ships nothing of, so verification here is deliberately scoped to
     /// these five. Extending it to all eight is a carried obligation of
     /// the provider build (see the provider-surface note below).
-    pub(super) const CORE_ROLES: [&str; 5] = [
-        "engine-cli",
-        "vision-weights",
-        "vision-projector",
-        "ocr-prompt",
-        "ocr-limit-policy",
-    ];
+    pub(super) const CORE_ROLES: [&str; 5] = crate::convert::IMAGE_OCR_ROLE_LABELS;
 
     // Provider-surface TODO (carried obligation): the gated external
     // rasterizer build verifies eight roles, not five. It extends the
@@ -347,21 +345,30 @@ mod runtime {
 
     /// One runtime component, pinned by BLAKE3 and named by role label
     /// only. No filename, path, host, or device identity is a literal
-    /// in this crate: the path is resolved at runtime and the expected
-    /// hash is deployment data.
+    /// in this crate: the path is deployment data resolved through the
+    /// runtime inventory, and the expected hash is versioned rules
+    /// data.
     pub(super) struct Component {
-        pub(super) role: &'static str,
+        pub(super) role: String,
         pub(super) path: PathBuf,
         pub(super) expected_blake3: String,
     }
 
-    /// Resolves the pinned runtime components a deployment wired into
-    /// the jail. This core release wires none, so every role is
-    /// unresolved and recognition fails closed. A deployment implements
-    /// this against its hash-pinned engine, weights, projector, prompt,
-    /// and serialized limit policy, each named by role label only.
-    pub(super) fn resolve_components() -> Vec<Component> {
-        Vec::new()
+    /// The pinned runtime components the request carried in: the
+    /// deployment's paths paired with the rules-pinned hashes. An
+    /// empty inventory resolves nothing and recognition fails closed
+    /// with runtime-missing.
+    pub(super) fn components_from(
+        inventory: &[crate::runner::protocol::bodies::InventoryEntry],
+    ) -> Vec<Component> {
+        inventory
+            .iter()
+            .map(|entry| Component {
+                role: entry.role.clone(),
+                path: PathBuf::from(&entry.path),
+                expected_blake3: entry.expected_blake3.clone(),
+            })
+            .collect()
     }
 
     /// Verifies every required role is present and matches its pinned
@@ -537,8 +544,8 @@ mod runtime {
 mod tests {
     use super::runtime::{
         BEGIN_SENTINEL, CORE_ROLES, Component, DETERMINISM_PROOF_PENDING, Device, DeviceClass,
-        END_SENTINEL, check_accelerator, engine_stdout, enumerate_devices, parse_fenced_envelope,
-        resolve_components, verify_inventory,
+        END_SENTINEL, check_accelerator, components_from, engine_stdout, enumerate_devices,
+        parse_fenced_envelope, verify_inventory,
     };
     use super::*;
     use std::io::Write;
@@ -680,12 +687,22 @@ mod tests {
     }
 
     #[test]
-    fn the_core_build_resolves_no_runtime_so_recognition_fails_closed() {
-        // No runtime is wired into this core release, so every role is
-        // unresolved and the inventory verification fails closed.
-        assert!(resolve_components().is_empty());
-        let err = verify_inventory(&CORE_ROLES, &resolve_components()).unwrap_err();
+    fn an_empty_inventory_resolves_no_runtime_so_recognition_fails_closed() {
+        // With no inventory wired every role is unresolved and the
+        // verification fails closed.
+        assert!(components_from(&[]).is_empty());
+        let err = verify_inventory(&CORE_ROLES, &components_from(&[])).unwrap_err();
         assert_eq!(err.code, "image-ocr-runtime-missing");
+        // A wired entry maps role, path, and expected hash through.
+        let entry = crate::runner::protocol::bodies::InventoryEntry {
+            role: "engine-cli".to_string(),
+            path: "/pinned/engine".to_string(),
+            expected_blake3: "ab".repeat(32),
+        };
+        let components = components_from(std::slice::from_ref(&entry));
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].role, "engine-cli");
+        assert_eq!(components[0].expected_blake3, entry.expected_blake3);
     }
 
     #[test]
@@ -699,7 +716,7 @@ mod tests {
         file.flush().unwrap();
         let good = crate::hash::hash_file(file.path()).unwrap();
         let present = [Component {
-            role: "engine-cli",
+            role: "engine-cli".to_string(),
             path: file.path().to_path_buf(),
             expected_blake3: good.clone(),
         }];
@@ -707,7 +724,7 @@ mod tests {
         assert!(verify_inventory(&["engine-cli"], &present).is_ok());
         // Present but wrong hash is a mismatch, a distinct reason.
         let wrong = [Component {
-            role: "engine-cli",
+            role: "engine-cli".to_string(),
             path: file.path().to_path_buf(),
             expected_blake3: "0".repeat(64),
         }];
@@ -766,6 +783,7 @@ mod tests {
         let request = OcrRequest {
             input: path.to_str().unwrap().to_string(),
             kind: OcrInput::Image,
+            inventory: Vec::new(),
         };
         let err = recognize(&request).unwrap_err();
         assert_eq!(err.code, "image-ocr-runtime-missing");

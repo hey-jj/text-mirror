@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use crate::manifest::ArtifactKind;
+use crate::manifest::{ArtifactKind, Media};
 use crate::{Error, Result};
 
 /// Hashes a file with BLAKE3, streaming, and returns lowercase hex.
@@ -40,6 +40,10 @@ pub struct CanonicalArtifact {
     pub converter_version: String,
     /// The canonical artifact's kind.
     pub artifact_kind: Option<ArtifactKind>,
+    /// Media provenance of the canonical conversion. It describes the
+    /// bytes and the pinned engine, so a duplicate of the same bytes
+    /// inherits it.
+    pub media: Option<Media>,
     /// Warnings from the canonical conversion. They describe the
     /// bytes, so a duplicate of the same bytes inherits them.
     pub warnings: Vec<String>,
@@ -107,6 +111,7 @@ mod tests {
             converter_id: "text-passthrough".to_string(),
             converter_version: "1.0.0".to_string(),
             artifact_kind: Some(ArtifactKind::Text),
+            media: None,
             warnings: Vec::new(),
         };
         let mut second = first.clone();

@@ -420,7 +420,7 @@ fn a_legacy_postscript_ai_fails_closed_with_a_pdf_family_reason() {
 fn the_registry_routes_the_image_family_as_ruled() {
     let rules = Rules::builtin().unwrap();
     let registry = &rules.registry;
-    assert_eq!(registry.version(), "9");
+    assert_eq!(registry.version(), "10");
     for format in ["png", "jpeg", "webp"] {
         assert_eq!(
             registry.converter_for(format).map(|c| c.id()),

@@ -502,6 +502,12 @@ pub mod bodies {
         pub input: String,
         /// What the engine should read.
         pub kind: OcrInput,
+        /// The pinned runtime files for the recognition stage, when a
+        /// deployment supplies them. Skipped from the wire when empty,
+        /// so a request without an inventory serializes exactly as it
+        /// did before this field existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub inventory: Vec<InventoryEntry>,
     }
 
     /// One recognized text span with its confidence.
@@ -527,15 +533,43 @@ pub mod bodies {
         pub warnings: Vec<String>,
     }
 
+    /// One pinned runtime component a worker must verify before any
+    /// engine work: a generic role label, the deployment-resolved
+    /// path, and the expected BLAKE3 from the versioned rules. The
+    /// worker re-hashes the file itself immediately before preflight
+    /// and execution, so a swap after parent-side validation still
+    /// fails closed. Failures name the role label only.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct InventoryEntry {
+        /// Generic role label, such as `asr-cli`.
+        pub role: String,
+        /// Absolute path of the pinned file.
+        pub path: String,
+        /// Expected lowercase hex BLAKE3 of the file bytes.
+        pub expected_blake3: String,
+    }
+
     /// Request body for the `asr` adapter.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct AsrRequest {
         /// Input file name inside the jail.
         pub input: String,
-        /// Language hint, when the caller has one.
+        /// Language hint, when the caller has one. The worker honors
+        /// it only when it equals the pinned language.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub language: Option<String>,
+        /// Ruled decoded-duration ceiling in seconds. Rules data the
+        /// parent reads from the registry; the worker enforces it from
+        /// the decoded frame count and fails an over-cap source closed
+        /// with `asr-duration-exceeded`, never truncating.
+        pub max_duration_seconds: u64,
+        /// The pinned runtime files the worker verifies and execs.
+        /// Empty on the fake-engine path, which replaces only the
+        /// engine stage and needs no runtime.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub inventory: Vec<InventoryEntry>,
     }
 
     /// One transcribed speech segment.

@@ -98,6 +98,17 @@ fn run_mode(mode: &str) -> Result<Response, HardExit> {
         // production `image-ocr` mode above.
         #[cfg(all(unix, feature = "image-ocr", feature = "test-adapters"))]
         "image-ocr-fake" => image_ocr::image_ocr_fake(read_request()?),
+        // The in-jail audio decode plus transcribe path. Compiles only
+        // under the feature and runs only in the jail: the pure-Rust
+        // decode and the engine child both stay behind the sandbox.
+        #[cfg(all(unix, feature = "audio-asr"))]
+        "asr" => audio::asr(read_request()?),
+        // The fake engine-stage transcription, a separate mode the test
+        // harness selects. It runs the real decode, preflight, and
+        // silence layers and only the engine stage is fake, so it never
+        // stands in for the production `asr` mode above.
+        #[cfg(all(unix, feature = "audio-asr", feature = "test-adapters"))]
+        "asr-fake" => audio::asr_fake(read_request()?),
         // Held descendants get no stdin, so this mode never reads a
         // request frame.
         #[cfg(feature = "test-adapters")]
@@ -259,6 +270,46 @@ mod image_ocr {
     }
 }
 
+/// The jailed audio mode: decode to a native-rate wav, assert the
+/// duration, size, and silence layers, verify the pinned runtime, and
+/// transcribe through the engine child, all inside the sandbox.
+#[cfg(all(unix, feature = "audio-asr"))]
+mod audio {
+    use super::*;
+    use crate::convert::audio_asr;
+    use crate::runner::protocol::bodies::AsrRequest;
+
+    pub(super) fn asr(request: Request) -> Result<Response, HardExit> {
+        let body: AsrRequest = serde_json::from_value(request.payload.clone()).map_err(|e| {
+            eprintln!("worker_bad_payload: {e}");
+            HardExit(2)
+        })?;
+        match audio_asr::transcribe(&body) {
+            Ok(ok) => Ok(Response::ok(
+                serde_json::to_value(ok).expect("AsrOk serializes"),
+            )),
+            Err(error) => Ok(Response::err(error.code, error.message)),
+        }
+    }
+
+    /// The fake engine-stage transcription mode: the real decode and
+    /// preflights with deterministic segments. Selected only by the
+    /// test harness, never by the production `asr` mode.
+    #[cfg(feature = "test-adapters")]
+    pub(super) fn asr_fake(request: Request) -> Result<Response, HardExit> {
+        let body: AsrRequest = serde_json::from_value(request.payload.clone()).map_err(|e| {
+            eprintln!("worker_bad_payload: {e}");
+            HardExit(2)
+        })?;
+        match audio_asr::transcribe_fake(&body) {
+            Ok(ok) => Ok(Response::ok(
+                serde_json::to_value(ok).expect("AsrOk serializes"),
+            )),
+            Err(error) => Ok(Response::err(error.code, error.message)),
+        }
+    }
+}
+
 /// The jailed image-metadata mode: lift textual metadata out of a
 /// raster and return structured rows, all inside the sandbox.
 #[cfg(all(unix, feature = "image-metadata"))]
@@ -395,20 +446,19 @@ mod harness {
 
     use super::*;
     use crate::runner::protocol::bodies::{
-        AsrOk, AsrRequest, AsrSegment, OcrInput, OcrOk, OcrRequest, OcrSpan, ScreenState, VideoOk,
-        VideoRequest,
+        OcrInput, OcrOk, OcrRequest, OcrSpan, ScreenState, VideoOk, VideoRequest,
     };
 
     pub(super) fn run(mode: &str, request: Request) -> Result<Response, HardExit> {
         match mode {
             "ocr" => ocr(request),
-            "asr" => asr(request),
             "video" => video(request),
             "harness-echo" => Ok(Response::ok(request.payload)),
             "harness-env" => harness_env(),
             "harness-escape" => harness_escape(request),
             "harness-crash" => harness_crash(),
             "harness-sleep" => harness_sleep(),
+            "harness-balloon" => harness_balloon(),
             "harness-oversized" => harness_oversized(),
             "harness-trailing" => harness_trailing(),
             "harness-truncated" => harness_truncated(),
@@ -483,31 +533,6 @@ mod harness {
             warnings: Vec::new(),
         };
         Ok(Response::ok(serde_json::to_value(ok).expect("OcrOk")))
-    }
-
-    /// A fake speech engine. Returns two diarized segments.
-    fn asr(request: Request) -> Result<Response, HardExit> {
-        let body: AsrRequest = parse(&request)?;
-        confirm_input(&body.input)?;
-        let ok = AsrOk {
-            segments: vec![
-                AsrSegment {
-                    start_seconds: 0.0,
-                    end_seconds: 4.5,
-                    speaker: 1,
-                    text: "welcome to the recording".to_string(),
-                },
-                AsrSegment {
-                    start_seconds: 4.5,
-                    end_seconds: 9.0,
-                    speaker: 2,
-                    text: "glad to be here".to_string(),
-                },
-            ],
-            language: body.language.or_else(|| Some("en".to_string())),
-            duration_seconds: Some(9.0),
-        };
-        Ok(Response::ok(serde_json::to_value(ok).expect("AsrOk")))
     }
 
     /// A fake video engine. Returns deduplicated screen states, with a
@@ -659,6 +684,21 @@ mod harness {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
         }
+    }
+
+    /// Grows its resident set past any small ceiling and holds without
+    /// responding, so the parent-side resident-memory guard is what
+    /// must end it. The pages are written, so they are truly resident
+    /// rather than reserved.
+    fn harness_balloon() -> Result<Response, HardExit> {
+        const BALLOON_BYTES: usize = 192 * 1024 * 1024;
+        let mut balloon = vec![0u8; BALLOON_BYTES];
+        for index in (0..balloon.len()).step_by(4096) {
+            balloon[index] = (index % 251) as u8;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        drop(balloon);
+        Err(HardExit(0))
     }
 
     /// Writes a four-byte header declaring more than the response cap,

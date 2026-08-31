@@ -188,6 +188,7 @@ impl Converter for WorkbookIr {
             text,
             warnings,
             segments,
+            media: None,
         })
     }
 }
