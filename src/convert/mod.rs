@@ -1659,8 +1659,14 @@ asr-decode-policy = "{policy}"
         assert!(inventory.set("asr-cli", file.clone()).is_ok());
         assert_eq!(inventory.path("asr-cli"), Some(file.as_path()));
         assert!(inventory.path("asr-weights").is_none());
-        // An unknown role and a relative path both fail loudly.
+        // An unknown role and a relative path both fail loudly. The
+        // decode-policy role is deliberately unknown here: the crate
+        // owns that serialization as a constant, so it is never a
+        // deployment inventory key.
         assert!(inventory.set("mystery-role", file.clone()).is_err());
+        assert!(inventory.set("asr-decode-policy", file.clone()).is_err());
+        let policy_row = format!("asr-decode-policy = \"{}\"\n", file.display());
+        assert!(RuntimeInventory::parse(&policy_row, "inventory.toml").is_err());
         assert!(
             inventory
                 .set("asr-weights", std::path::PathBuf::from("relative"))
