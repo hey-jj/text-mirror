@@ -250,8 +250,12 @@ cpu_seconds = 600
 # Bounds the in-jail re-encoded raster the engine reads. A 2.36 MP RGB
 # raster is under 10 MiB uncompressed and smaller as PNG. 64 MiB.
 file_size_bytes = 67108864
-# The GPU driver spins its own threads; 64 gives headroom over the
-# default 16. A per-uid ceiling, not a per-invocation one.
+# The GPU driver spins its own threads, so 64 gives room over the
+# default 16. This is a spawn budget, not an absolute ceiling: the
+# helper applies it as headroom above the real uid's pre-existing
+# process count at spawn, clamped to the hard limit. A failed count
+# falls back to the absolute value and uid growth after the count
+# consumes the budget, so both drift cases only narrow.
 max_processes = 64
 
 # Speech-transcription jail limit profile, versioned with the rest of
@@ -286,7 +290,12 @@ max_stderr_bytes = 4194304
 # Sits above the 1 GiB decoded-size preflight, so the preflight is
 # the arbiter and RLIMIT_FSIZE only backstops it. 1.125 GiB.
 file_size_bytes = 1207959552
-# The accelerator driver spins its own threads; a per-uid ceiling.
+# The accelerator driver spins its own threads. This is a spawn
+# budget, not an absolute ceiling: the helper applies it as headroom
+# above the real uid's pre-existing process count at spawn, clamped
+# to the hard limit. A failed count falls back to the absolute value
+# and uid growth after the count consumes the budget, so both drift
+# cases only narrow.
 max_processes = 64
 # The pinned transcription language. The adapter sends it on every
 # request and honors a request language only when equal to it.
