@@ -60,6 +60,12 @@ pub(crate) const ASR_MAX_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
 /// is `rate * max_duration_seconds + 16` frames.
 pub(crate) const ASR_DURATION_PRIMING_FRAMES: u64 = 16;
 
+/// Ceiling on the engine's output envelope, the same value as the
+/// `[asr]` profile's response ceiling: the transcription the parent
+/// would accept can never exceed it, so a larger output file is
+/// refused by its size alone, before a byte of it is read or parsed.
+pub(crate) const ASR_MAX_ENGINE_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
+
 /// The decoded wav the engine reads, by bare name in the jail.
 const DECODED_WAV: &str = "decoded.wav";
 
@@ -242,6 +248,21 @@ fn decoded_byte_size(frames: u64, channels: u16) -> Option<u64> {
     frames.checked_mul(u64::from(channels))?.checked_mul(2)
 }
 
+/// The decoded-size preflight comparator: a waveform of exactly the
+/// ceiling is accepted, one byte past it is refused, and an overflow
+/// in the arithmetic is a decode failure of its own.
+fn check_decoded_size(frames: u64, channels: u16) -> Result<(), AsrError> {
+    let bytes = decoded_byte_size(frames, channels)
+        .ok_or_else(|| decode_failed("the decoded size overflowed"))?;
+    if bytes > ASR_MAX_DECODED_BYTES {
+        return Err(AsrError::new(
+            "asr-decoded-too-large",
+            format!("the decoded waveform passed the {ASR_MAX_DECODED_BYTES} byte ceiling"),
+        ));
+    }
+    Ok(())
+}
+
 /// Streams one source through the decoder into a canonical PCM wav at
 /// the decoder-reported rate and channel count, enforcing the
 /// duration and size ceilings during the decode and accumulating the
@@ -333,14 +354,7 @@ fn decode_to_wav(
                 format!("the decoded frame count passed the {max_duration_seconds} second ceiling"),
             ));
         }
-        let bytes = decoded_byte_size(frames, channels)
-            .ok_or_else(|| decode_failed("the decoded size overflowed"))?;
-        if bytes > ASR_MAX_DECODED_BYTES {
-            return Err(AsrError::new(
-                "asr-decoded-too-large",
-                format!("the decoded waveform passed the {ASR_MAX_DECODED_BYTES} byte ceiling"),
-            ));
-        }
+        check_decoded_size(frames, channels)?;
         let needed = decoded.frames() * spec.channels.count();
         let recreate = sample_buffer
             .as_ref()
@@ -702,12 +716,44 @@ fn run_engine(cli: &Path, weights: &str) -> Result<Vec<u8>, AsrError> {
     if !status.success() {
         return Err(engine_failed());
     }
-    std::fs::read(format!("{ENGINE_OUTPUT_BASE}.json")).map_err(|_| {
+    read_engine_output(Path::new(&format!("{ENGINE_OUTPUT_BASE}.json")))
+}
+
+/// Reads the engine's output file under the response ceiling. The
+/// size is refused from the file metadata BEFORE any byte is read, so
+/// a runaway envelope under the jail's file-size rlimit still cannot
+/// buy an allocation here, and the read itself stays bounded in case
+/// the file grows between the two steps.
+fn read_engine_output(path: &Path) -> Result<Vec<u8>, AsrError> {
+    use std::io::Read as _;
+    let missing = || {
         AsrError::new(
             "asr-protocol-error",
             "the engine produced no transcription envelope",
         )
-    })
+    };
+    let oversized = || {
+        AsrError::new(
+            "asr-protocol-error",
+            "the engine output exceeds the response ceiling",
+        )
+    };
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| missing())?;
+    if !metadata.is_file() {
+        return Err(missing());
+    }
+    if metadata.len() > ASR_MAX_ENGINE_OUTPUT_BYTES {
+        return Err(oversized());
+    }
+    let file = File::open(path).map_err(|_| missing())?;
+    let mut bytes = Vec::new();
+    file.take(ASR_MAX_ENGINE_OUTPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| missing())?;
+    if bytes.len() as u64 > ASR_MAX_ENGINE_OUTPUT_BYTES {
+        return Err(oversized());
+    }
+    Ok(bytes)
 }
 
 /// The transcription array only: integer-millisecond offsets and the
@@ -806,6 +852,120 @@ mod tests {
             .join("tests/data")
             .join(name);
         std::fs::read(path).unwrap()
+    }
+
+    // --- adjudicated boundary battery ---------------------------------
+
+    #[test]
+    fn the_extended_object_type_escape_is_parsed_and_fenced() {
+        // A complete extended encoding: 31 escapes to 32 plus the next
+        // six bits, never the low-complexity profile, so the named
+        // codec rejection fires after a full parse.
+        let complete = asc_bytes(&[(31, 5), (6, 6), (8, 4), (1, 4), (0, 3)]);
+        let error = parse_audio_config(&complete).unwrap_err();
+        assert_eq!(error.code, "asr-codec-unsupported");
+        assert!(error.message.contains("object type"), "{}", error.message);
+        // The same escape truncated inside its six extension bits is a
+        // truncation, proving the read stops at the declared bound.
+        let truncated = asc_bytes(&[(31, 5), (1, 2)]);
+        let error = parse_audio_config(&truncated).unwrap_err();
+        assert_eq!(error.code, "asr-codec-unsupported");
+        assert!(error.message.contains("truncated"), "{}", error.message);
+    }
+
+    #[test]
+    fn every_configuration_read_stops_at_the_declared_length() {
+        // A sync extension that would continue past the declared
+        // bytes: the sync word and extension type fit exactly, the
+        // replication flag does not, and the parse refuses rather
+        // than reading on.
+        let mut fenced = lc_base();
+        fenced.extend([(0x2b7, 11), (5, 5)]);
+        let error = parse_audio_config(&asc_bytes(&fenced)).unwrap_err();
+        assert_eq!(error.code, "asr-codec-unsupported");
+        assert!(error.message.contains("truncated"), "{}", error.message);
+        // A core-coder delay cut short mid-field is fenced the same
+        // way.
+        let cut = asc_bytes(&[(2, 5), (8, 4), (1, 4), (0, 1), (1, 1), (3, 5)]);
+        let error = parse_audio_config(&cut).unwrap_err();
+        assert_eq!(error.code, "asr-codec-unsupported");
+        assert!(error.message.contains("truncated"), "{}", error.message);
+        // A tail too short to hold a sync extension is left unread and
+        // the configuration is accepted as it stands.
+        let mut short_tail = lc_base();
+        short_tail.extend([(0x56, 8)]);
+        assert_eq!(parse_audio_config(&asc_bytes(&short_tail)).unwrap(), 16000);
+    }
+
+    #[test]
+    fn ordinary_durations_below_and_exactly_at_the_cap_are_accepted() {
+        // Rate 8000 with a one-second ceiling: the cap is 8016 frames
+        // including the priming allowance.
+        let below = vec![100i16; 4000];
+        let (_dir, result) = decode_temp(&wav_bytes(8000, 1, &below), "wav", 1);
+        assert_eq!(result.unwrap().frames, 4000);
+        let exactly = vec![100i16; 8016];
+        let (_dir, result) = decode_temp(&wav_bytes(8000, 1, &exactly), "wav", 1);
+        assert_eq!(result.unwrap().frames, 8016);
+    }
+
+    #[test]
+    fn the_decoded_size_comparator_accepts_the_ceiling_and_refuses_one_past_it() {
+        // Exactly the 1 GiB ceiling: accepted.
+        assert!(check_decoded_size(ASR_MAX_DECODED_BYTES / 2, 1).is_ok());
+        // One frame past it: refused with the named reason.
+        let error = check_decoded_size(ASR_MAX_DECODED_BYTES / 2 + 1, 1).unwrap_err();
+        assert_eq!(error.code, "asr-decoded-too-large");
+        // The overflow arm stays a decode failure.
+        assert_eq!(
+            check_decoded_size(u64::MAX, 2).unwrap_err().code,
+            "asr-decode-failed"
+        );
+    }
+
+    #[test]
+    fn the_stereo_silence_band_locks_the_per_channel_denominator() {
+        // 1000 stereo frames are 2000 samples. A squared sum inside
+        // [frames, 2*frames) is silent under a total-samples reading
+        // and NOT silent under the bound per-channel-frames reading,
+        // so this locks the bound one.
+        let mut in_band = vec![0i16; 2000];
+        for sample in in_band.iter_mut().take(1500) {
+            *sample = 1;
+        }
+        let (_dir, result) = decode_temp(&wav_bytes(8000, 2, &in_band), "wav", 3600);
+        assert!(
+            !result.unwrap().silent,
+            "a sum of 1500 at 1000 frames is not silent"
+        );
+        // Just under the per-channel frame count stays silent.
+        let mut under = vec![0i16; 2000];
+        for sample in under.iter_mut().take(999) {
+            *sample = 1;
+        }
+        let (_dir, result) = decode_temp(&wav_bytes(8000, 2, &under), "wav", 3600);
+        assert!(result.unwrap().silent);
+    }
+
+    #[test]
+    fn an_oversized_engine_output_is_refused_before_it_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine-output.json");
+        // One byte over the ceiling, created by length alone: the
+        // refusal comes from the metadata, before any read.
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(ASR_MAX_ENGINE_OUTPUT_BYTES + 1).unwrap();
+        drop(file);
+        let error = read_engine_output(&path).unwrap_err();
+        assert_eq!(error.code, "asr-protocol-error");
+        assert!(error.message.contains("ceiling"), "{}", error.message);
+        // A small file is read and returned whole.
+        let ok_path = dir.path().join("ok.json");
+        std::fs::write(&ok_path, b"{}").unwrap();
+        assert_eq!(read_engine_output(&ok_path).unwrap(), b"{}");
+        // A missing file keeps the missing-envelope message.
+        let error = read_engine_output(&dir.path().join("absent.json")).unwrap_err();
+        assert!(error.message.contains("envelope"), "{}", error.message);
     }
 
     // --- decode layer -------------------------------------------------

@@ -125,6 +125,11 @@ fn run_mode(mode: &str) -> Result<Response, HardExit> {
         // hold. Reads no request frame.
         #[cfg(feature = "test-adapters")]
         "harness-setsid-hold" => harness::setsid_hold(),
+        // Closes its stdio, grows a resident balloon, marks readiness
+        // in the jail, and holds. The descendant shape for the memory
+        // guard's exit-race test. Reads no request frame.
+        #[cfg(feature = "test-adapters")]
+        "harness-hold-balloon" => harness::hold_balloon(),
         #[cfg(feature = "test-adapters")]
         other => harness::run(other, read_request()?),
         #[cfg(not(feature = "test-adapters"))]
@@ -464,6 +469,7 @@ mod harness {
             "harness-truncated" => harness_truncated(),
             "harness-stderr-flood" => harness_stderr_flood(),
             "harness-survivor" => harness_survivor(request),
+            "harness-balloon-survivor" => harness_balloon_survivor(request),
             "harness-spawn-storm" => harness_spawn_storm(request),
             "harness-fd-check" => harness_fd_check(request),
             other => {
@@ -494,6 +500,55 @@ mod harness {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
         }
+    }
+
+    /// Closes its stdio, grows a resident set far past any small
+    /// memory ceiling, marks readiness through the jail, and holds.
+    /// The descendant shape for the memory guard's exit-race test: it
+    /// outlives its fast-exiting leader, and only the runner's final
+    /// group measurement and unconditional kill account for it.
+    pub(super) fn hold_balloon() -> ! {
+        for fd in 0..=2 {
+            let _ = nix::unistd::close(fd);
+        }
+        let mut balloon = vec![0u8; 192 * 1024 * 1024];
+        for index in (0..balloon.len()).step_by(4096) {
+            balloon[index] = (index % 251) as u8;
+        }
+        let _ = std::fs::write("ballooned", b"up");
+        loop {
+            std::hint::black_box(&balloon);
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
+    /// Spawns a descendant into the balloon-hold mode, waits for its
+    /// readiness marker in the jail, then answers cleanly and exits at
+    /// once, so the leader is gone while the group's memory is still
+    /// up. The runner's final measurement is what must catch it.
+    fn harness_balloon_survivor(request: Request) -> Result<Response, HardExit> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SurvivorRequest {
+            program: String,
+        }
+        let body: SurvivorRequest = parse(&request)?;
+        if let Err(e) = std::process::Command::new(&body.program)
+            .arg("harness-hold-balloon")
+            .spawn()
+        {
+            return Ok(Response::err(
+                "spawn_failed",
+                format!("cannot spawn the balloon: {e}"),
+            ));
+        }
+        for _ in 0..400 {
+            if std::fs::metadata("ballooned").is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Ok(Response::ok(serde_json::json!({ "spawned": true })))
     }
 
     /// Attempts to leave the process group with setsid and holds

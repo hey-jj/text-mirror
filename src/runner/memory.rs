@@ -7,7 +7,9 @@
 //! the monitor enumerates the child's process group and sums resident
 //! bytes over every member with checked arithmetic. A failed query is
 //! a runner failure, never a silent pass: the caller kills the group
-//! and fails closed with `memory-monitor-failed`.
+//! and fails closed with `memory-monitor-failed`. The one tolerated
+//! read failure is a confirmed exit race, a member that is provably
+//! gone by the time its records are read.
 
 /// The aggregate resident bytes of every process in the group led by
 /// `leader`. An empty group sums to zero, which callers read as the
@@ -17,8 +19,24 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
     use libproc::pid_rusage::{RUsageInfoV2, pidrusage};
     use libproc::processes::{ProcFilter, pids_by_type};
 
-    let members = pids_by_type(ProcFilter::ByProgramGroup { pgrpid: leader })
-        .map_err(|e| format!("cannot enumerate the process group: {e}"))?;
+    let members = match pids_by_type(ProcFilter::ByProgramGroup { pgrpid: leader }) {
+        Ok(members) => members,
+        Err(e) => {
+            // Enumerating a group that has fully exited can fail
+            // instead of listing empty. Only a confirmed absence is
+            // that shape: a zero-signal probe that finds no such group
+            // sums to zero, and anything else fails the query closed,
+            // because a live group the guard cannot enumerate is a
+            // group it cannot bound.
+            let Ok(leader_pid) = i32::try_from(leader) else {
+                return Err(format!("group leader pid {leader} does not fit a pid_t"));
+            };
+            return match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(leader_pid), None) {
+                Err(nix::errno::Errno::ESRCH) => Ok(0),
+                _ => Err(format!("cannot enumerate the process group: {e}")),
+            };
+        }
+    };
     let mut total: u64 = 0;
     for pid in &members {
         let Ok(pid_i32) = i32::try_from(*pid) else {
@@ -32,8 +50,9 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
             }
             Err(e) => {
                 // The member may have exited between the listing and
-                // the query, which is an ordinary race. Only a member
-                // still in the group is a real query failure.
+                // the query. Only a confirmed exit is a race: a member
+                // a fresh listing still names is a real query failure,
+                // and the guard fails closed on it.
                 let still = pids_by_type(ProcFilter::ByProgramGroup { pgrpid: leader })
                     .map_err(|e| format!("cannot re-enumerate the process group: {e}"))?;
                 if still.contains(pid) {
@@ -46,28 +65,61 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
 }
 
 /// The aggregate resident bytes of every process in the group led by
-/// `leader`, from the `/proc` view: a process belongs when the third
-/// field after its `stat` comm is the leader's id, and its resident
-/// size is the `VmRSS` line of its `status` file. A process that
-/// vanishes mid-scan is an ordinary race and is skipped; a process
-/// whose records cannot be parsed fails the query.
+/// `leader`, from the `/proc` view.
 #[cfg(target_os = "linux")]
 pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
     let entries = std::fs::read_dir("/proc").map_err(|e| format!("cannot enumerate /proc: {e}"))?;
-    let mut total: u64 = 0;
+    let mut pids = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("cannot enumerate /proc: {e}"))?;
-        let Some(pid) = entry
+        if let Some(pid) = entry
             .file_name()
             .to_str()
             .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        // A vanished process between listing and read is a race, not
-        // a failure.
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            continue;
+        {
+            pids.push(pid);
+        }
+    }
+    sum_group_records(
+        leader,
+        &pids,
+        |pid, file| std::fs::read_to_string(format!("/proc/{pid}/{file}")),
+        |pid| std::path::Path::new(&format!("/proc/{pid}")).exists(),
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(super) fn group_resident_bytes(_leader: u32) -> Result<u64, String> {
+    Err("no resident-memory monitor exists for this platform".to_string())
+}
+
+/// The record-view summation with injected readers, so the error
+/// discipline is testable on every platform. A process belongs to the
+/// group when the third field after its `stat` comm names the leader,
+/// and its resident size is the `VmRSS` line of its `status` record.
+///
+/// The error discipline is strict: only a NotFound read error,
+/// confirmed by a re-check showing the process gone, counts as an
+/// exit race and is skipped. Every other error kind, and a NotFound
+/// for a process the re-check still sees, fails the whole query
+/// closed, because a member whose memory cannot be read is a member
+/// the guard cannot bound.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn sum_group_records(
+    leader: u32,
+    pids: &[u32],
+    read: impl Fn(u32, &str) -> std::io::Result<String>,
+    still_exists: impl Fn(u32) -> bool,
+) -> Result<u64, String> {
+    let mut total: u64 = 0;
+    for &pid in pids {
+        let stat = match read(pid, "stat") {
+            Ok(stat) => stat,
+            Err(e) => {
+                confirmed_exit_race(pid, &e, &still_exists)?;
+                continue;
+            }
         };
         let Some(pgrp) = stat_process_group(&stat) else {
             return Err(format!("cannot parse the stat record of process {pid}"));
@@ -75,8 +127,12 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
         if pgrp != leader {
             continue;
         }
-        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-            continue;
+        let status = match read(pid, "status") {
+            Ok(status) => status,
+            Err(e) => {
+                confirmed_exit_race(pid, &e, &still_exists)?;
+                continue;
+            }
         };
         // A zombie member holds no resident pages and carries no VmRSS
         // line, which reads as zero.
@@ -88,15 +144,25 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
     Ok(total)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(super) fn group_resident_bytes(_leader: u32) -> Result<u64, String> {
-    Err("no resident-memory monitor exists for this platform".to_string())
+/// Passes only for the confirmed exit race: a NotFound error for a
+/// process the re-check no longer sees. Anything else fails closed.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn confirmed_exit_race(
+    pid: u32,
+    error: &std::io::Error,
+    still_exists: &impl Fn(u32) -> bool,
+) -> Result<(), String> {
+    if error.kind() == std::io::ErrorKind::NotFound && !still_exists(pid) {
+        return Ok(());
+    }
+    Err(format!("cannot read the records of process {pid}: {error}"))
 }
 
-/// The process-group id from one `/proc/<pid>/stat` record: the third
-/// whitespace field after the parenthesized comm, which itself may
-/// contain spaces and parentheses, so the parse anchors on the last
-/// closing parenthesis.
+/// The process-group id from one `stat` record: the third whitespace
+/// field after the parenthesized comm, which itself may contain
+/// spaces and parentheses, so the parse anchors on the last closing
+/// parenthesis.
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn stat_process_group(stat: &str) -> Option<u32> {
@@ -104,9 +170,9 @@ fn stat_process_group(stat: &str) -> Option<u32> {
     after_comm.split_whitespace().nth(2)?.parse().ok()
 }
 
-/// The `VmRSS` value of one `/proc/<pid>/status` record, in bytes.
-/// `Ok(None)` when the line is absent, the zombie shape. A present
-/// line that does not parse as kibibytes fails the query.
+/// The `VmRSS` value of one `status` record, in bytes. `Ok(None)`
+/// when the line is absent, the zombie shape. A present line that
+/// does not parse as kibibytes fails the query.
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn vm_rss_bytes(status: &str) -> Result<Option<u64>, String> {
@@ -132,6 +198,7 @@ fn vm_rss_bytes(status: &str) -> Result<Option<u64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Error, ErrorKind};
 
     #[test]
     fn the_stat_parse_survives_a_hostile_comm() {
@@ -151,6 +218,54 @@ mod tests {
         // A present but malformed line fails the query.
         assert!(vm_rss_bytes("VmRSS:\tnonsense kB\n").is_err());
         assert!(vm_rss_bytes("VmRSS:\t12 mB\n").is_err());
+    }
+
+    /// A two-member record view: a group member with 2 MiB resident
+    /// and a stranger in another group.
+    fn read_two(pid: u32, file: &str) -> std::io::Result<String> {
+        Ok(match (pid, file) {
+            (10, "stat") => "10 (worker) S 1 77 1".to_string(),
+            (10, "status") => "VmRSS:\t2048 kB\n".to_string(),
+            (11, "stat") => "11 (other) S 1 99 1".to_string(),
+            (11, "status") => "VmRSS:\t4096 kB\n".to_string(),
+            _ => return Err(Error::new(ErrorKind::NotFound, "no such process")),
+        })
+    }
+
+    #[test]
+    fn the_summation_counts_only_the_leaders_group() {
+        let total = sum_group_records(77, &[10, 11], read_two, |_| true).unwrap();
+        assert_eq!(total, 2048 * 1024);
+    }
+
+    #[test]
+    fn only_a_confirmed_exit_race_is_skipped() {
+        // NotFound plus a re-check that no longer sees the process:
+        // the ordinary exit race, skipped, the rest still summed.
+        let total = sum_group_records(77, &[10, 12], read_two, |pid| pid != 12).unwrap();
+        assert_eq!(total, 2048 * 1024);
+
+        // NotFound for a process the re-check STILL sees: the guard
+        // cannot bound that member, so the query fails closed.
+        let error = sum_group_records(77, &[10, 12], read_two, |_| true)
+            .expect_err("an unconfirmed read failure must fail the query");
+        assert!(error.contains("12"), "{error}");
+    }
+
+    #[test]
+    fn every_other_error_kind_fails_the_query_closed() {
+        let denied = |pid: u32, file: &str| -> std::io::Result<String> {
+            if pid == 12 {
+                return Err(Error::new(ErrorKind::PermissionDenied, "denied"));
+            }
+            read_two(pid, file)
+        };
+        // PermissionDenied never counts as a race, whatever the
+        // re-check says: a live member the guard cannot read is an
+        // unbounded member.
+        let error = sum_group_records(77, &[10, 12], denied, |_| false)
+            .expect_err("a denied read must fail the query");
+        assert!(error.contains("denied"), "{error}");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

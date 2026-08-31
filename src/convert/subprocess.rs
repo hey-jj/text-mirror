@@ -765,21 +765,8 @@ mod imp {
             profile: crate::convert::AsrProfile,
             inventory: &crate::convert::RuntimeInventory,
         ) -> AsrAdapter {
-            let mut files = Vec::new();
-            for role in ASR_FILE_ROLE_LABELS {
-                if let Some(path) = inventory.path(role) {
-                    files.push((role.to_string(), path.to_path_buf()));
-                }
-            }
-            let mut exec_grants = Vec::new();
-            let mut read_grants = Vec::new();
-            for (role, path) in &files {
-                if role == ASR_ROLE_WEIGHTS {
-                    read_grants.push(path.clone());
-                } else {
-                    exec_grants.push(path.clone());
-                }
-            }
+            let files = pinned_asr_runtime_files(&profile, inventory);
+            let (exec_grants, read_grants) = asr_grant_lists(&files);
             AsrAdapter {
                 mode: "asr",
                 runner: build_asr_runner(&profile, exec_grants, read_grants),
@@ -804,6 +791,48 @@ mod imp {
                 inventory: Vec::new(),
             }
         }
+    }
+
+    /// The runtime files that may reach the jail: only a role whose
+    /// expected hash the rules pin AND whose path the deployment
+    /// supplied qualifies. Pin-first is the point: a supplied path for
+    /// an unpinned role earns no jail grant and no wire entry, so the
+    /// jail never gains a capability the versioned rules did not
+    /// authorize, and the worker reports the role missing exactly as
+    /// if no path had been supplied.
+    #[cfg(feature = "audio-asr")]
+    fn pinned_asr_runtime_files(
+        profile: &crate::convert::AsrProfile,
+        inventory: &crate::convert::RuntimeInventory,
+    ) -> Vec<(String, std::path::PathBuf)> {
+        let mut files = Vec::new();
+        for role in ASR_FILE_ROLE_LABELS {
+            if !profile.inventory.contains_key(role) {
+                continue;
+            }
+            if let Some(path) = inventory.path(role) {
+                files.push((role.to_string(), path.to_path_buf()));
+            }
+        }
+        files
+    }
+
+    /// Grant lists over the pin-filtered files: read and execute for
+    /// the engine and probe binaries, read only for the weights.
+    #[cfg(feature = "audio-asr")]
+    fn asr_grant_lists(
+        files: &[(String, std::path::PathBuf)],
+    ) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+        let mut exec_grants = Vec::new();
+        let mut read_grants = Vec::new();
+        for (role, path) in files {
+            if role == ASR_ROLE_WEIGHTS {
+                read_grants.push(path.clone());
+            } else {
+                exec_grants.push(path.clone());
+            }
+        }
+        (exec_grants, read_grants)
     }
 
     /// Maps the `[asr]` rules profile onto the runner limits. The
@@ -1014,6 +1043,73 @@ mod imp {
         ConvertError {
             code: "empty_output",
             message: format!("source is {source_len} bytes but conversion produced no text"),
+        }
+    }
+
+    #[cfg(all(test, feature = "audio-asr"))]
+    mod audio_grant_tests {
+        use super::*;
+
+        // Pin-first grant assembly: a role the deployment supplies but
+        // the rules do not pin reaches neither the wire inventory nor
+        // either jail grant list, so the jail never gains a capability
+        // the versioned rules did not authorize.
+        #[test]
+        fn a_supplied_but_unpinned_role_earns_no_grant_and_no_wire_entry() {
+            let dir = tempfile::tempdir().unwrap();
+            let make = |name: &str| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, name).unwrap();
+                path.canonicalize().unwrap()
+            };
+            let cli = make("cli");
+            let weights = make("weights");
+            let probe = make("probe");
+            let mut pins = std::collections::BTreeMap::new();
+            pins.insert(ASR_ROLE_CLI.to_string(), "0".repeat(64));
+            pins.insert(ASR_ROLE_WEIGHTS.to_string(), "0".repeat(64));
+            pins.insert(
+                ASR_ROLE_DECODE_POLICY.to_string(),
+                crate::hash::hash_bytes(ASR_DECODE_POLICY.as_bytes()),
+            );
+            let profile = crate::convert::AsrProfile {
+                max_duration_seconds: 3600,
+                wall_timeout_secs: 900,
+                cpu_seconds: 600,
+                max_resident_bytes: 6_442_450_944,
+                max_response_bytes: 4_194_304,
+                max_stderr_bytes: 4_194_304,
+                file_size_bytes: 1_207_959_552,
+                max_processes: 64,
+                language: "en".to_string(),
+                inventory: pins,
+            };
+            let mut supplied = crate::convert::RuntimeInventory::empty();
+            supplied.set(ASR_ROLE_CLI, cli.clone()).unwrap();
+            supplied.set(ASR_ROLE_WEIGHTS, weights.clone()).unwrap();
+            // The probe role is supplied while carrying no pinned
+            // hash, the shipped-rules shape before its pin lands.
+            supplied.set(ASR_ROLE_PROBE, probe.clone()).unwrap();
+
+            let files = pinned_asr_runtime_files(&profile, &supplied);
+            assert_eq!(files.len(), 2, "{files:?}");
+            assert!(files.iter().all(|(role, _)| role != ASR_ROLE_PROBE));
+            let (exec_grants, read_grants) = asr_grant_lists(&files);
+            assert_eq!(exec_grants, vec![cli.clone()]);
+            assert_eq!(read_grants, vec![weights.clone()]);
+
+            // The built runner's jail spec carries exactly those
+            // lists, so the excluded role is provably absent from the
+            // spawn capabilities too.
+            let adapter = AsrAdapter::new(profile, &supplied);
+            let runner = adapter
+                .runner
+                .as_ref()
+                .expect("this platform has a jail backend");
+            let (spec_exec, spec_read) = runner.grant_lists();
+            assert_eq!(spec_exec, std::slice::from_ref(&cli));
+            assert_eq!(spec_read, std::slice::from_ref(&weights));
+            assert!(!spec_exec.contains(&probe) && !spec_read.contains(&probe));
         }
     }
 }

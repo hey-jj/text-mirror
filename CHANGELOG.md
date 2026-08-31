@@ -32,7 +32,16 @@ Versioning.
   stderr, and process ceilings, and the pinned runtime hashes. A
   sub-LSB waveform fails as `asr-no-speech`. A louder waveform whose
   engine response holds no segments fails as `empty_output`. Neither
-  ever writes an empty artifact.
+  ever writes an empty artifact, and the engine's output envelope is
+  size-checked against the same response ceiling before it is read.
+- The complete audio reason vocabulary, every value static and free
+  of role paths: `audio-asr-not-built`, `engine-unpinned`,
+  `asr-decode-failed`, `asr-codec-unsupported`,
+  `asr-duration-exceeded`, `asr-decoded-too-large`, `asr-no-speech`,
+  `empty_output`, `asr-runtime-missing`, `asr-runtime-mismatch`,
+  `asr-backend-unavailable`, and `asr-protocol-error` on records,
+  plus the runner codes `worker-memory-exceeded` and
+  `memory-monitor-failed`.
 - m4a admission for the low-complexity AAC profile only, decided by a
   first-party bounded reader over the track's decoder configuration:
   spectral-band replication signaled on the flag bit (the sync word
@@ -47,20 +56,28 @@ Versioning.
   with checked arithmetic, kills the group when the sum crosses the
   ceiling, and fails closed with `worker-memory-exceeded`. A failed
   measurement is itself a failure, `memory-monitor-failed`, and the
-  output drains keep running through the termination. The audio
-  profile uses it at 6 GiB with the address-space limit unset, the
-  same shape as the image profile on this platform.
+  output drains keep running through the termination. When the leader
+  exits, one final group measurement runs before the cleanup kill, so
+  a fast exit cannot carry a ballooned descendant past the guard, and
+  a member whose records cannot be read fails the query unless a
+  recheck confirms the member already exited. The audio profile uses
+  the guard at 6 GiB with the address-space limit unset, the same
+  shape as the image profile on this platform.
 - A runtime-inventory mechanism shared by the image-OCR and audio
   converters. A deployment maps generic role labels to file paths
   through the new `RuntimeInventory` type, the
   `Rules::builtin_with_inventory` constructor, or the new
   `--runtime-inventory` flag on `text-mirror run`. The expected
   BLAKE3 values live in the versioned rules (`[image_ocr.inventory]`
-  and `[asr.inventory]`). The jail grants each supplied file as a
-  literal path, never a directory, and the cold worker re-hashes
-  every file against its pinned hash right before preflight and
-  execution, so a swap after parent-side validation still fails
-  closed. Failures name role labels only.
+  and `[asr.inventory]`). Grant assembly is pin-first: a supplied
+  path for a role the rules do not pin earns no jail grant and no
+  wire entry, and the worker reports that role missing. The jail
+  grants each qualifying file as a literal path, never a directory:
+  directories and symlinks are refused when the inventory is
+  configured and again right before every spawn. The cold worker
+  re-hashes every file against its pinned hash right before
+  preflight and execution, so a swap after parent-side validation
+  still fails closed. Failures name role labels only.
 - A flac row in the format table, so flac detects as its own format
   instead of falling to `unknown`.
 
@@ -80,10 +97,12 @@ Versioning.
   `address_space_bytes` is now an `Option`, `None` leaving the rlimit
   unset, and the struct gained `max_resident_bytes` for the new
   resident-memory guard. The public `ImageOcrLimits` struct gained an
-  `inventory` map, and the sandbox helper's public `HelperConfig`
-  gained the grant lists and the optional address-space value.
-  External code that constructs any of them by listing every field
-  must account for the changes.
+  `inventory` map, the sandbox helper's public `HelperConfig` gained
+  the grant lists and the optional address-space value, and the jail
+  `SpawnSpec` gained the `exec_grants` and `read_grants` fields, so
+  an external jail backend that constructs it exhaustively must add
+  them. External code that constructs any of these by listing every
+  field must account for the changes.
 - The `AsrRequest` wire body gained required `max_duration_seconds`
   and optional `inventory` fields, and `OcrRequest` gained an
   optional `inventory` field that stays off the wire when empty. The

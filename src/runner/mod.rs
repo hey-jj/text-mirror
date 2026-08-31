@@ -218,6 +218,13 @@ impl Runner {
         &self.limits
     }
 
+    /// Test-only view of the literal grant lists, so a converter test
+    /// can prove exactly which capabilities its jail would receive.
+    #[cfg(test)]
+    pub(crate) fn grant_lists(&self) -> (&[PathBuf], &[PathBuf]) {
+        (&self.exec_grants, &self.read_grants)
+    }
+
     /// The policy digest that keys this runner's probe cache entry.
     pub fn policy_digest(&self) -> Result<String, RunnerError> {
         jail::policy_digest(
@@ -254,6 +261,28 @@ impl Runner {
         files: &[(&str, &[u8])],
         seccomp: bool,
     ) -> Result<Response, RunnerError> {
+        // Literal-file re-assertion at spawn time: every grant must be
+        // a regular file right now, whatever an earlier validation
+        // saw, so a path swapped for a directory or a symlink between
+        // configuration and spawn refuses the run instead of widening
+        // the jail.
+        for grant in self.exec_grants.iter().chain(self.read_grants.iter()) {
+            let refuse = |detail: &str| RunnerError {
+                code: "adapter_spawn_error",
+                message: format!(
+                    "grant {} is not a literal regular file: {detail}",
+                    grant.display()
+                ),
+            };
+            match std::fs::symlink_metadata(grant) {
+                Ok(metadata) if metadata.file_type().is_file() => {}
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(refuse("it is a symlink"));
+                }
+                Ok(_) => return Err(refuse("it is not a regular file")),
+                Err(e) => return Err(refuse(&e.to_string())),
+            }
+        }
         let jail_dir = tempfile::tempdir().map_err(|e| RunnerError {
             code: "adapter_spawn_error",
             message: format!("cannot create the jail directory: {e}"),
@@ -447,6 +476,21 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         }
         std::thread::sleep(Duration::from_millis(2));
     };
+
+    // One final group measurement after the leader exits and BEFORE
+    // the unconditional group kill below, so a descendant that
+    // ballooned and outlived a fast-exiting leader is still measured:
+    // a clean exit inside the first polling interval must not bypass
+    // the guard. Over the ceiling discards the response, and a failed
+    // measurement fails closed, exactly as the polled path does. The
+    // wall-timeout path keeps its own verdict, and a group the kill
+    // paths already emptied simply measures zero.
+    if let Some(ceiling) = limits.max_resident_bytes
+        && memory_failure.is_none()
+        && !timed_out
+    {
+        memory_failure = memory_verdict(memory::group_resident_bytes(child.id()), ceiling);
+    }
 
     // The final group kill runs on every exit path, the normal clean
     // exit included, so a descendant that closed its stdio and

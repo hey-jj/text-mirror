@@ -22,6 +22,11 @@ Apache-2.0 and carry no separate notice; kamadak-exif and mutate_once
 are BSD-2-Clause and appear in the section below. A build without that
 feature links none of them.
 
+The audio-asr feature pulls the symphonia decoder family, all
+MPL-2.0 and listed in the section below. A build without that
+feature links none of them. Separately, the runner's resident-memory
+monitor links libproc (MIT) on macOS.
+
 ## Apache-2.0 NOTICE files
 
 Two Apache-2.0 dependencies ship a NOTICE file, reproduced here under
@@ -72,10 +77,15 @@ BSD-3-Clause, whose terms match the section below.
 ## MPL-2.0
 
 Covered crates, all consumed unmodified: cssparser 0.36.0,
-cssparser-macros 0.6.1, dtoa-short 0.3.5, selectors 0.37.0. Under
-MPL-2.0 section 3.2, these unmodified covered files are available
-from crates.io. If any of them is ever vendored and modified, the
-modified files must be published under MPL-2.0.
+cssparser-macros 0.6.1, dtoa-short 0.3.5, selectors 0.37.0,
+symphonia 0.5.5, symphonia-bundle-flac 0.5.5, symphonia-bundle-mp3
+0.5.5, symphonia-codec-aac 0.5.5, symphonia-codec-pcm 0.5.5,
+symphonia-core 0.5.5, symphonia-format-isomp4 0.5.5,
+symphonia-format-riff 0.5.5, symphonia-metadata 0.5.5, and
+symphonia-utils-xiph 0.5.5. Under MPL-2.0 section 3.2, these
+unmodified covered files are available from crates.io. If any of
+them is ever vendored and modified, the modified files must be
+published under MPL-2.0.
 
 ```text
 Mozilla Public License Version 2.0

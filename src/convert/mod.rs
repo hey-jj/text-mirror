@@ -166,9 +166,10 @@ pub struct AsrProfile {
     pub language: String,
     /// Expected BLAKE3 per pinned runtime role, keyed by the generic
     /// role label. `asr-cli`, `asr-weights`, and `asr-decode-policy`
-    /// must be present; `asr-probe` is accepted and gains its pinned
-    /// value in a later rules release, and until that row lands the
-    /// worker fails the engine path closed on the absent probe pin.
+    /// must be present; `asr-probe` is accepted and pinned in the
+    /// built-in rules, and a required role whose pin a rules file
+    /// omits fails the engine path closed in the worker as
+    /// runtime-missing rather than parsing as an invented identity.
     /// The deployment supplies the file paths through the runtime
     /// inventory config; the cold worker re-hashes every file against
     /// these values immediately before preflight and execution.
@@ -292,7 +293,10 @@ impl RuntimeInventory {
             .chain(subprocess::ASR_FILE_ROLE_LABELS)
     }
 
-    /// Fills one role with an absolute path.
+    /// Fills one role with the absolute path of a literal regular
+    /// file. A directory or a symlink is refused here, before it can
+    /// become a broader jail capability, and the spawn path re-asserts
+    /// the same rule right before every run.
     pub fn set(&mut self, role: &str, path: std::path::PathBuf) -> Result<()> {
         let rules_error = |message: String| Error::Rules {
             name: "runtime-inventory".to_string(),
@@ -304,6 +308,13 @@ impl RuntimeInventory {
         if !path.is_absolute() {
             return Err(rules_error(format!(
                 "runtime role {role:?} needs an absolute path"
+            )));
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| rules_error(format!("runtime role {role:?} cannot be inspected: {e}")))?;
+        if !metadata.file_type().is_file() {
+            return Err(rules_error(format!(
+                "runtime role {role:?} is not a literal regular file"
             )));
         }
         self.paths.insert(role.to_string(), path);
@@ -1559,10 +1570,9 @@ mod tests {
         assert_eq!(profile.file_size_bytes, 1_207_959_552);
         assert_eq!(profile.max_processes, 64);
         assert_eq!(profile.language, "en");
-        // Three pinned roles ship; the probe row lands in a later
-        // rules release.
-        assert_eq!(profile.inventory.len(), 3);
-        assert!(!profile.inventory.contains_key("asr-probe"));
+        // All four runtime roles ship pinned, the probe included.
+        assert_eq!(profile.inventory.len(), 4);
+        assert!(profile.inventory.contains_key("asr-probe"));
     }
 
     // The [asr] section is validated at parse: a wrong language, a
@@ -1639,37 +1649,42 @@ asr-decode-policy = "{policy}"
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_runtime_inventory_validates_roles_and_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("engine");
+        std::fs::write(&file, b"pinned bytes").unwrap();
         let mut inventory = RuntimeInventory::empty();
-        assert!(
-            inventory
-                .set("asr-cli", std::path::PathBuf::from("/pinned/engine"))
-                .is_ok()
-        );
-        assert_eq!(
-            inventory.path("asr-cli"),
-            Some(std::path::Path::new("/pinned/engine"))
-        );
+        assert!(inventory.set("asr-cli", file.clone()).is_ok());
+        assert_eq!(inventory.path("asr-cli"), Some(file.as_path()));
         assert!(inventory.path("asr-weights").is_none());
         // An unknown role and a relative path both fail loudly.
-        assert!(
-            inventory
-                .set("mystery-role", std::path::PathBuf::from("/x"))
-                .is_err()
-        );
+        assert!(inventory.set("mystery-role", file.clone()).is_err());
         assert!(
             inventory
                 .set("asr-weights", std::path::PathBuf::from("relative"))
                 .is_err()
         );
-        // The TOML form parses the same way.
-        let parsed =
-            RuntimeInventory::parse("asr-weights = \"/pinned/weights\"\n", "inventory.toml")
-                .unwrap();
-        assert_eq!(
-            parsed.path("asr-weights"),
-            Some(std::path::Path::new("/pinned/weights"))
+        // A directory, a symlink, and a missing path are all refused:
+        // the jail grants literal regular files only, and the spawn
+        // path re-asserts the same rule.
+        assert!(
+            inventory
+                .set("asr-weights", dir.path().to_path_buf())
+                .is_err()
         );
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(inventory.set("asr-weights", link).is_err());
+        assert!(
+            inventory
+                .set("asr-weights", dir.path().join("absent"))
+                .is_err()
+        );
+        // The TOML form parses the same way.
+        let toml_text = format!("asr-weights = \"{}\"\n", file.display());
+        let parsed = RuntimeInventory::parse(&toml_text, "inventory.toml").unwrap();
+        assert_eq!(parsed.path("asr-weights"), Some(file.as_path()));
         assert!(RuntimeInventory::parse("nope = \"/x\"\n", "inventory.toml").is_err());
     }
 

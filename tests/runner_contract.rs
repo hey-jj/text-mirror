@@ -329,6 +329,70 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 #[test]
+fn a_non_literal_grant_refuses_the_run_at_spawn() {
+    // The grant lists carry literal regular files only, re-asserted
+    // right before every spawn: a directory or a symlink refuses the
+    // run instead of widening the jail.
+    let dir = tempfile::tempdir().unwrap();
+    let backend = platform_backend().unwrap();
+    let runner = Runner::with_grants(
+        backend,
+        worker_path(),
+        brisk_limits(),
+        vec![dir.path().to_path_buf()],
+        Vec::new(),
+    );
+    let error = runner
+        .run("harness-echo", serde_json::json!({}), &[])
+        .unwrap_err();
+    assert_eq!(error.code, "adapter_spawn_error", "{error}");
+    assert!(error.message.contains("literal"), "{error}");
+
+    let real = dir.path().join("real");
+    std::fs::write(&real, b"bytes").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let backend = platform_backend().unwrap();
+    let runner = Runner::with_grants(
+        backend,
+        worker_path(),
+        brisk_limits(),
+        Vec::new(),
+        vec![link],
+    );
+    let error = runner
+        .run("harness-echo", serde_json::json!({}), &[])
+        .unwrap_err();
+    assert_eq!(error.code, "adapter_spawn_error", "{error}");
+    assert!(error.message.contains("symlink"), "{error}");
+}
+
+#[test]
+fn a_ballooned_descendant_cannot_hide_behind_a_fast_leader_exit() {
+    // The leader spawns a ballooning descendant, answers cleanly, and
+    // exits at once, usually inside the first polling interval. The
+    // final group measurement on leader exit is what must refuse the
+    // response; a slower run is caught by the ordinary poll, and the
+    // verdict is the same either way. The process ceiling is raised
+    // because the cap counts every process of this user.
+    let runner = runner_with(Limits {
+        max_resident_bytes: Some(64 * 1024 * 1024),
+        wall_timeout: Duration::from_secs(20),
+        max_processes: 1024,
+        ..brisk_limits()
+    });
+    let worker = worker_path();
+    let error = runner
+        .run(
+            "harness-balloon-survivor",
+            serde_json::json!({ "program": worker.to_str().unwrap() }),
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "worker-memory-exceeded", "{error}");
+}
+
+#[test]
 fn the_resident_memory_guard_kills_an_overshooting_worker() {
     // The balloon harness writes far more resident pages than this
     // ceiling and then holds without responding, so the parent's
