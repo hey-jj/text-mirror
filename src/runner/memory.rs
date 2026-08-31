@@ -84,7 +84,7 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
         leader,
         &pids,
         |pid, file| std::fs::read_to_string(format!("/proc/{pid}/{file}")),
-        |pid| std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        |pid| std::fs::exists(format!("/proc/{pid}")),
     )
 }
 
@@ -99,18 +99,19 @@ pub(super) fn group_resident_bytes(_leader: u32) -> Result<u64, String> {
 /// and its resident size is the `VmRSS` line of its `status` record.
 ///
 /// The error discipline is strict: only a NotFound read error,
-/// confirmed by a re-check showing the process gone, counts as an
-/// exit race and is skipped. Every other error kind, and a NotFound
-/// for a process the re-check still sees, fails the whole query
-/// closed, because a member whose memory cannot be read is a member
-/// the guard cannot bound.
+/// confirmed by a re-check that itself succeeds and reports the
+/// process gone, counts as an exit race and is skipped. Every other
+/// error kind, a NotFound for a process the re-check still sees, and
+/// a re-check that fails at all, fail the whole query closed, because
+/// a member whose memory cannot be read is a member the guard cannot
+/// bound.
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn sum_group_records(
     leader: u32,
     pids: &[u32],
     read: impl Fn(u32, &str) -> std::io::Result<String>,
-    still_exists: impl Fn(u32) -> bool,
+    still_exists: impl Fn(u32) -> std::io::Result<bool>,
 ) -> Result<u64, String> {
     let mut total: u64 = 0;
     for &pid in pids {
@@ -145,16 +146,27 @@ fn sum_group_records(
 }
 
 /// Passes only for the confirmed exit race: a NotFound error for a
-/// process the re-check no longer sees. Anything else fails closed.
+/// process the confirming re-check successfully reports gone. A
+/// re-check that itself errors is indeterminate and fails the query
+/// closed, exactly like every non-NotFound read error: the guard
+/// never treats a member it cannot see as a member that exited.
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn confirmed_exit_race(
     pid: u32,
     error: &std::io::Error,
-    still_exists: &impl Fn(u32) -> bool,
+    still_exists: &impl Fn(u32) -> std::io::Result<bool>,
 ) -> Result<(), String> {
-    if error.kind() == std::io::ErrorKind::NotFound && !still_exists(pid) {
-        return Ok(());
+    if error.kind() == std::io::ErrorKind::NotFound {
+        match still_exists(pid) {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(recheck) => {
+                return Err(format!(
+                    "cannot re-check process {pid} after a read failure: {recheck}"
+                ));
+            }
+        }
     }
     Err(format!("cannot read the records of process {pid}: {error}"))
 }
@@ -234,7 +246,7 @@ mod tests {
 
     #[test]
     fn the_summation_counts_only_the_leaders_group() {
-        let total = sum_group_records(77, &[10, 11], read_two, |_| true).unwrap();
+        let total = sum_group_records(77, &[10, 11], read_two, |_| Ok(true)).unwrap();
         assert_eq!(total, 2048 * 1024);
     }
 
@@ -242,14 +254,27 @@ mod tests {
     fn only_a_confirmed_exit_race_is_skipped() {
         // NotFound plus a re-check that no longer sees the process:
         // the ordinary exit race, skipped, the rest still summed.
-        let total = sum_group_records(77, &[10, 12], read_two, |pid| pid != 12).unwrap();
+        let total = sum_group_records(77, &[10, 12], read_two, |pid| Ok(pid != 12)).unwrap();
         assert_eq!(total, 2048 * 1024);
 
         // NotFound for a process the re-check STILL sees: the guard
         // cannot bound that member, so the query fails closed.
-        let error = sum_group_records(77, &[10, 12], read_two, |_| true)
+        let error = sum_group_records(77, &[10, 12], read_two, |_| Ok(true))
             .expect_err("an unconfirmed read failure must fail the query");
         assert!(error.contains("12"), "{error}");
+    }
+
+    #[test]
+    fn an_indeterminate_recheck_fails_the_query_closed() {
+        // NotFound from the record read, and the confirming re-check
+        // itself errors: the guard cannot tell an exit from a member
+        // it is not allowed to see, so the query fails closed rather
+        // than treating the member as gone.
+        let error = sum_group_records(77, &[10, 12], read_two, |_| {
+            Err(Error::new(ErrorKind::PermissionDenied, "re-check denied"))
+        })
+        .expect_err("an indeterminate re-check must fail the query");
+        assert!(error.contains("re-check"), "{error}");
     }
 
     #[test]
@@ -263,7 +288,7 @@ mod tests {
         // PermissionDenied never counts as a race, whatever the
         // re-check says: a live member the guard cannot read is an
         // unbounded member.
-        let error = sum_group_records(77, &[10, 12], denied, |_| false)
+        let error = sum_group_records(77, &[10, 12], denied, |_| Ok(false))
             .expect_err("a denied read must fail the query");
         assert!(error.contains("denied"), "{error}");
     }

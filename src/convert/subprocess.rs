@@ -1087,8 +1087,9 @@ mod imp {
             let mut supplied = crate::convert::RuntimeInventory::empty();
             supplied.set(ASR_ROLE_CLI, cli.clone()).unwrap();
             supplied.set(ASR_ROLE_WEIGHTS, weights.clone()).unwrap();
-            // The probe role is supplied while carrying no pinned
-            // hash, the shipped-rules shape before its pin lands.
+            // The probe role is supplied while this profile carries
+            // no pin for it, the shape of a custom profile that omits
+            // the optional probe row.
             supplied.set(ASR_ROLE_PROBE, probe.clone()).unwrap();
 
             let files = pinned_asr_runtime_files(&profile, &supplied);

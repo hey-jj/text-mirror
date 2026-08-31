@@ -1338,10 +1338,11 @@ mod tests {
         ];
         assert!(verify_runtime(&all).is_ok());
 
-        // The probe role can lack a pinned hash entirely, the shipped
-        // rules shape before its pin lands: no entry travels for it,
-        // and the engine path fails closed as missing, never as a
-        // mismatch, because nothing pinned can mismatch.
+        // The probe role can lack a pinned hash entirely, the shape
+        // of a custom profile that omits the optional probe row: no
+        // entry travels for it, and the engine path fails closed as
+        // missing, never as a mismatch, because nothing pinned can
+        // mismatch.
         let unpinned_probe = [entry(ASR_ROLE_CLI, &good), entry(ASR_ROLE_WEIGHTS, &good)];
         let error = verify_runtime(&unpinned_probe).unwrap_err();
         assert_eq!(error.code, "asr-runtime-missing");

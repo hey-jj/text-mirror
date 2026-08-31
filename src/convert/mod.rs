@@ -189,9 +189,10 @@ fn is_lower_hex_256(value: &str) -> bool {
 /// hashes, and an `asr-decode-policy` value that matches the
 /// serialization built into the adapter, so the rules cannot silently
 /// disagree with the code. The probe role is allowed but not
-/// required: its pin lands in a later rules release, and a required
-/// runtime role with no pinned hash fails closed in the worker as
-/// runtime-missing rather than parsing as an invented identity here.
+/// required: the built-in rules pin it, a custom profile may omit
+/// it, and a required runtime role with no pinned hash fails closed
+/// in the worker as runtime-missing rather than parsing as an
+/// invented identity here.
 fn validate_asr_profile(profile: &AsrProfile, name: &str) -> Result<()> {
     let rules_error = |message: String| Error::Rules {
         name: name.to_string(),
@@ -1607,11 +1608,11 @@ asr-decode-policy = "{policy}"
                 zeros = zeros.as_str(),
             )
         };
-        // The shipped shape parses: three pinned roles, no probe row.
+        // A custom profile that omits the optional probe row parses.
         let good = base("en", "", &policy_hash);
         assert!(Registry::parse(&good, "converters.toml").is_ok());
-        // A probe row with a value also parses: the shape a later
-        // rules release lands.
+        // The probe-bearing shape the built-in rules ship parses the
+        // same way.
         let with_probe = base("en", &format!("asr-probe = \"{zeros}\"\n"), &policy_hash);
         assert!(Registry::parse(&with_probe, "converters.toml").is_ok());
         // A non-pinned language is refused.
