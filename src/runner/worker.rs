@@ -85,6 +85,12 @@ fn run_mode(mode: &str) -> Result<Response, HardExit> {
         // decode and the engine child both stay behind the sandbox.
         #[cfg(all(unix, feature = "image-ocr"))]
         "image-ocr" => image_ocr::image_ocr(read_request()?),
+        // The in-jail svg raster path. Compiles only under the feature
+        // and runs only in the provider jail: the pinned external
+        // components are verified and executed there, never here in
+        // the parent.
+        #[cfg(all(unix, feature = "svg-provider"))]
+        "svg-raster" => svg_raster::svg_raster(read_request()?),
         // The in-jail image-metadata reader. Compiles only under the
         // feature and runs only in the jail: the exif, png text-chunk,
         // xmp, iptc, and iso base media file format parsers all stay
@@ -309,6 +315,30 @@ mod audio {
         match audio_asr::transcribe_fake(&body) {
             Ok(ok) => Ok(Response::ok(
                 serde_json::to_value(ok).expect("AsrOk serializes"),
+            )),
+            Err(error) => Ok(Response::err(error.code, error.message)),
+        }
+    }
+}
+
+/// The jailed svg raster mode: parse the declared geometry, verify and
+/// run the pinned external components, assert the geometry and the area
+/// cap, and return the flattened raster, all inside the provider jail.
+#[cfg(all(unix, feature = "svg-provider"))]
+mod svg_raster {
+    use super::*;
+    use crate::convert::svg_raster::rasterize;
+    use crate::runner::protocol::bodies::SvgRasterRequest;
+
+    pub(super) fn svg_raster(request: Request) -> Result<Response, HardExit> {
+        let body: SvgRasterRequest =
+            serde_json::from_value(request.payload.clone()).map_err(|e| {
+                eprintln!("worker_bad_payload: {e}");
+                HardExit(2)
+            })?;
+        match rasterize(&body) {
+            Ok(ok) => Ok(Response::ok(
+                serde_json::to_value(ok).expect("SvgRasterOk serializes"),
             )),
             Err(error) => Ok(Response::err(error.code, error.message)),
         }

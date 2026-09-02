@@ -98,6 +98,15 @@ pub struct ImageOcrLimits {
     /// fail-closed runtime-missing path.
     #[serde(default)]
     pub inventory: std::collections::BTreeMap<String, String>,
+    /// The svg provider pins, keyed by the two provider role labels:
+    /// the expected BLAKE3, the exact version, and, for the rasterizer,
+    /// the aggregate digest over its executable closure. Rules data,
+    /// like every other pinned expectation; the deployment supplies only
+    /// paths and jail parameters through the provider configuration.
+    /// Empty when the rules pin no provider, which leaves the svg leg
+    /// unconfigurable.
+    #[serde(default)]
+    pub svg_provider: std::collections::BTreeMap<String, provider::ProviderPin>,
 }
 
 impl Default for ImageOcrLimits {
@@ -111,9 +120,35 @@ impl Default for ImageOcrLimits {
             file_size_bytes: 64 * 1024 * 1024,
             max_processes: 64,
             inventory: std::collections::BTreeMap::new(),
+            svg_provider: std::collections::BTreeMap::new(),
         }
     }
 }
+
+/// The ruled encoder-input area cap: 1536 * 1536 = 2.36 MP, the
+/// validated-safe ceiling. Applied uniformly to every image fed to the
+/// engine, because the hazard is encoder-side and degenerates on
+/// oversized area, not on any single dimension.
+pub const IMAGE_OCR_MAX_AREA_PX: u64 = 2_359_296;
+
+/// The largest single edge the engine was validated against. An input
+/// under the area cap but with a longer edge is legal by area and must
+/// not fail; it logs one note for validation and proceeds.
+pub const IMAGE_OCR_VALIDATED_LONG_EDGE: u32 = 1600;
+
+/// Decode-time allocation guard: one layer of a layered containment,
+/// not a single invariant. Three independent limits bound this path.
+/// The parent's source-bytes ceiling bounds the bytes that stage into
+/// the jail; this guard bounds the decoder's working pixel buffers; and
+/// the area cap bounds the encoder input. This guard's job is only the
+/// middle layer: it caps the decoder against a decompression bomb whose
+/// declared dimensions the area preflight has not yet seen. The largest
+/// in-scope raster is the area cap at 4 bytes per pixel, about 9 MiB, so
+/// this value leaves room for the decoded buffer plus codec scratch
+/// while refusing a bomb demanding hundreds of megabytes. It is not the
+/// jail's address-space limit and not the area cap; each of the three
+/// fails closed on its own.
+pub const IMAGE_OCR_DECODE_ALLOC: u64 = 64 * 1024 * 1024;
 
 /// The pinned-runtime role labels of the image-OCR path: the engine
 /// binary, its weights, the projector, the fixed prompt, and the
@@ -248,6 +283,10 @@ fn validate_asr_profile(profile: &AsrProfile, name: &str) -> Result<()> {
 /// Validates the `[image_ocr]` inventory keys against the known role
 /// labels and requires lowercase hex hashes.
 fn validate_image_ocr_limits(limits: &ImageOcrLimits, name: &str) -> Result<()> {
+    provider::validate_pins(&limits.svg_provider).map_err(|message| Error::Rules {
+        name: name.to_string(),
+        message,
+    })?;
     for (role, hash) in &limits.inventory {
         if !IMAGE_OCR_ROLE_LABELS.contains(&role.as_str()) {
             return Err(Error::Rules {
@@ -433,7 +472,17 @@ pub(crate) mod audio_asr;
 // the feature, crate-private for the same reason records is: a library
 // consumer must not run the parsers in process and bypass the jail.
 pub mod image_metadata;
+// The deployment-owned provider configuration. Always compiled, so a
+// build without the provider feature still parses and validates a
+// configuration it was handed rather than ignoring it silently.
+pub mod provider;
 pub mod subprocess;
+// The in-jail svg raster path. Crate-private for the same reason
+// image_ocr is: a library consumer must not run the external
+// components in process and bypass the provider jail. The worker
+// dispatch reaches it through a crate path.
+#[cfg(all(unix, feature = "svg-provider"))]
+pub(crate) mod svg_raster;
 mod visibility;
 mod workbook;
 
@@ -597,6 +646,15 @@ pub const RECORDS_NOT_BUILT_REASON: &str = "records-worker-not-built";
 /// includes `rules_version`, so a later feature-carrying build
 /// reconverts every such record.
 pub const IMAGE_OCR_NOT_BUILT_REASON: &str = "image-ocr-not-built";
+
+/// The warning an svg record carries when a deployment configured the
+/// external provider but this binary was built without the
+/// `svg-provider` feature. The configuration is valid and the operator
+/// asked for the leg, so the record says the leg did not run rather
+/// than looking like a provider-free run. A later build that carries
+/// the feature is not allowed to skip such a record as unchanged, so
+/// the child is minted on the first build that can produce it.
+pub const SVG_PROVIDER_NOT_BUILT: &str = "svg-provider-not-built";
 
 /// The reason audio formats record on a build without the `audio-asr`
 /// feature. The converter exists and the rules route to it, but this
@@ -792,6 +850,23 @@ pub struct Registry {
     image_ocr_limits: ImageOcrLimits,
     image_metadata_limits: ImageMetadataLimits,
     asr_profile: Option<AsrProfile>,
+    /// Index into `converters` of the converter that runs the svg
+    /// provider leg. It is the same pixel-OCR converter the raster
+    /// formats route to, constructed with the provider wired, and it is
+    /// reached by this index alone: svg never enters `by_format`, so
+    /// its primary stays the passthrough. `None` whenever no complete
+    /// provider is configured, which is every default run.
+    svg_ocr_index: Option<usize>,
+    /// The configured svg provider, kept so the test-only fake hook can
+    /// rebuild the converter with the same provider wired. A release
+    /// build has no such hook and carries no such field.
+    #[cfg(all(
+        unix,
+        feature = "image-ocr",
+        feature = "svg-provider",
+        feature = "test-adapters"
+    ))]
+    svg_provider: Option<provider::SvgProvider>,
     /// Index into `converters` of the auxiliary image-metadata converter,
     /// which never enters `by_format`. The pipeline reaches it by this
     /// index to run the derived-child leg. `None` when the feature is
@@ -818,6 +893,20 @@ impl Registry {
         )
     }
 
+    /// The built-in registry with the deployment's runtime-inventory
+    /// paths and its external provider configuration wired in.
+    pub fn builtin_with_runtime(
+        inventory: &RuntimeInventory,
+        provider: Option<&provider::ProviderConfig>,
+    ) -> Result<Self> {
+        Self::parse_with_runtime(
+            include_str!("../../rules/converters.toml"),
+            "converters.toml",
+            inventory,
+            provider,
+        )
+    }
+
     /// Parses a registry and binds entries to implementations, with no
     /// runtime inventory: every pinned-engine path stays on its
     /// fail-closed runtime-missing seam.
@@ -838,6 +927,23 @@ impl Registry {
         name: &str,
         inventory: &RuntimeInventory,
     ) -> Result<Self> {
+        Self::parse_with_runtime(text, name, inventory, None)
+    }
+
+    /// Parses a registry, wiring both the deployment's runtime
+    /// inventory and, when one is configured, the external svg
+    /// provider. The provider is opt-in twice over: the feature must be
+    /// built and a configuration must name both roles.
+    #[cfg_attr(
+        not(all(unix, any(feature = "image-ocr", feature = "audio-asr"))),
+        allow(unused_variables)
+    )]
+    pub fn parse_with_runtime(
+        text: &str,
+        name: &str,
+        inventory: &RuntimeInventory,
+        provider: Option<&provider::ProviderConfig>,
+    ) -> Result<Self> {
         let raw: RawRegistry = toml::from_str(text).map_err(|e| Error::Rules {
             name: name.to_string(),
             message: e.to_string(),
@@ -857,6 +963,10 @@ impl Registry {
         // converter is never constructed and the index stays absent.
         #[allow(unused_mut)]
         let mut image_metadata_index: Option<usize> = None;
+        // Reassigned only when the feature is built and a complete
+        // provider is configured; otherwise the svg leg does not exist.
+        #[allow(unused_mut)]
+        let mut svg_ocr_index: Option<usize> = None;
         for entry in &raw.converters {
             // A build without the records-worker feature has no records
             // mode in its worker, so route the records formats to a
@@ -996,10 +1106,42 @@ impl Registry {
                     Box::new(RecordsSubprocess::new(records_limits.clone()))
                 }
                 #[cfg(all(unix, feature = "image-ocr"))]
-                subprocess::IMAGE_PIXEL_OCR_ID => Box::new(subprocess::ImagePixelOcr::new(
-                    image_ocr_limits.clone(),
-                    inventory,
-                )),
+                subprocess::IMAGE_PIXEL_OCR_ID => {
+                    // With a provider configured the same converter
+                    // additionally carries the svg leg. Without one it
+                    // is the direct raster converter it has always
+                    // been, and svg never reaches it.
+                    #[cfg(feature = "svg-provider")]
+                    let converter = match provider.and_then(provider::ProviderConfig::svg) {
+                        Some(svg) => {
+                            // A configured provider needs pinned
+                            // expectations to be verified against. Rules
+                            // that pin none cannot run one, and saying
+                            // so beats running an unverified executable.
+                            if image_ocr_limits.svg_provider.is_empty() {
+                                return Err(Error::Rules {
+                                    name: name.to_string(),
+                                    message: "a provider is configured but [image_ocr.svg_provider] pins no expectations for it".to_string(),
+                                });
+                            }
+                            Box::new(subprocess::ImagePixelOcr::with_svg_provider(
+                                image_ocr_limits.clone(),
+                                inventory,
+                                svg,
+                            ))
+                        }
+                        None => Box::new(subprocess::ImagePixelOcr::new(
+                            image_ocr_limits.clone(),
+                            inventory,
+                        )),
+                    };
+                    #[cfg(not(feature = "svg-provider"))]
+                    let converter = Box::new(subprocess::ImagePixelOcr::new(
+                        image_ocr_limits.clone(),
+                        inventory,
+                    ));
+                    converter
+                }
                 #[cfg(all(
                     unix,
                     feature = "audio-asr",
@@ -1036,6 +1178,12 @@ impl Registry {
                 });
             }
             let index = converters.len();
+            #[cfg(all(unix, feature = "image-ocr", feature = "svg-provider"))]
+            if entry.id == subprocess::IMAGE_PIXEL_OCR_ID
+                && provider.and_then(provider::ProviderConfig::svg).is_some()
+            {
+                svg_ocr_index = Some(index);
+            }
             #[cfg(all(unix, feature = "image-metadata"))]
             if entry.id == image_metadata::IMAGE_METADATA_ID {
                 image_metadata_index = Some(index);
@@ -1087,6 +1235,14 @@ impl Registry {
             image_metadata_limits,
             asr_profile,
             image_metadata_index,
+            svg_ocr_index,
+            #[cfg(all(
+                unix,
+                feature = "image-ocr",
+                feature = "svg-provider",
+                feature = "test-adapters"
+            ))]
+            svg_provider: provider.and_then(provider::ProviderConfig::svg).cloned(),
         })
     }
 
@@ -1166,10 +1322,39 @@ impl Registry {
             .iter()
             .position(|c| c.id() == subprocess::IMAGE_PIXEL_OCR_ID)
         {
-            self.converters[index] = Box::new(subprocess::ImagePixelOcr::new_fake(
-                self.image_ocr_limits.clone(),
-            ));
+            // A configured provider stays wired: only the recognition
+            // stage is faked, so the provider half of the svg leg runs
+            // for real, jail and all.
+            #[cfg(feature = "svg-provider")]
+            {
+                self.converters[index] = match &self.svg_provider {
+                    Some(svg) => Box::new(subprocess::ImagePixelOcr::new_fake_with_svg_provider(
+                        self.image_ocr_limits.clone(),
+                        svg,
+                    )),
+                    None => Box::new(subprocess::ImagePixelOcr::new_fake(
+                        self.image_ocr_limits.clone(),
+                    )),
+                };
+            }
+            #[cfg(not(feature = "svg-provider"))]
+            {
+                self.converters[index] = Box::new(subprocess::ImagePixelOcr::new_fake(
+                    self.image_ocr_limits.clone(),
+                ));
+            }
         }
+    }
+
+    /// The converter that runs the svg provider leg, when a complete
+    /// provider is configured and this build carries the feature. It
+    /// never enters `by_format`, so the pipeline reaches it here to run
+    /// the derived-child leg, exactly as it reaches the metadata
+    /// converter. `None` means the leg does not run and svg is a
+    /// passthrough primary with no child.
+    pub fn svg_ocr_converter(&self) -> Option<&dyn Converter> {
+        self.svg_ocr_index
+            .map(|index| self.converters[index].as_ref())
     }
 
     /// The auxiliary image-metadata converter, if the feature built one.
@@ -1227,6 +1412,14 @@ impl Registry {
             image_metadata_limits: ImageMetadataLimits::default(),
             asr_profile: None,
             image_metadata_index: None,
+            svg_ocr_index: None,
+            #[cfg(all(
+                unix,
+                feature = "image-ocr",
+                feature = "svg-provider",
+                feature = "test-adapters"
+            ))]
+            svg_provider: None,
         }
     }
 }

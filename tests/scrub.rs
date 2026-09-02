@@ -70,6 +70,46 @@ fn forbidden() -> Vec<Forbidden> {
         .collect()
 }
 
+/// The product identities that must never appear on an implementation
+/// or product surface: the rasterizer, its vendor, the encoder, the
+/// platform preview tools, and the automation driver whose calibration
+/// the provider tuple came from. Same reversed-spelling construction as
+/// the set above, and the same case-insensitive matching.
+///
+/// These are separate from the set above because of one carveout: a
+/// bundled license text may name a vendor, and removing an attribution
+/// to satisfy a scrub would be worse than the leak it prevents. The
+/// legal-notice file is scanned against the set above and exempt from
+/// this one; every other file, source and prose alike, is held to
+/// both.
+///
+/// The generic role labels stay permitted, which is what they exist
+/// for: `raster-magick` names a role, not a product, and the full
+/// product identity is what is banned here.
+fn forbidden_products() -> Vec<Forbidden> {
+    let reversed: &[(&str, bool)] = &[
+        ("emorhc", false),
+        ("muimorhc", false),
+        ("elgoog", false),
+        ("kcigamegami", false),
+        ("eganamlq", false),
+        ("koolkciuq", false),
+        ("reeteppup", false),
+        ("spis", true),
+    ];
+    reversed
+        .iter()
+        .map(|(spelling, whole_word)| Forbidden {
+            token: spelling.chars().rev().collect(),
+            whole_word: *whole_word,
+        })
+        .collect()
+}
+
+/// The one file exempt from the product set: a bundled license text
+/// legitimately names its copyright holders.
+const LEGAL_NOTICE: &str = "THIRD-PARTY-NOTICES.md";
+
 /// Directory names skipped: build output and VCS metadata. Every other
 /// file is in scope, including this battery itself.
 fn is_skipped(path: &Path) -> bool {
@@ -134,10 +174,11 @@ fn contains_token(text: &str, forbidden: &Forbidden) -> bool {
 
 /// Scan one body of text, appending a violation line for each forbidden
 /// token it contains. Shared by the crate sweep and the negative control.
-fn scan_text(label: &str, text: &str, violations: &mut Vec<String>) {
+/// Scan one body against one token set.
+fn scan_with(label: &str, text: &str, tokens: &[Forbidden], violations: &mut Vec<String>) {
     let lowered = text.to_ascii_lowercase();
-    for forbidden in forbidden() {
-        if contains_token(&lowered, &forbidden) {
+    for forbidden in tokens {
+        if contains_token(&lowered, forbidden) {
             violations.push(format!("{label} contains {:?}", forbidden.token));
         }
     }
@@ -164,11 +205,21 @@ fn no_forbidden_token_appears_in_the_crate() {
     assert!(!files.is_empty(), "the scrub found no files to scan");
 
     let mut violations = Vec::new();
+    let base = forbidden();
+    let products = forbidden_products();
     for file in &files {
         let Ok(text) = fs::read_to_string(file) else {
             continue;
         };
-        scan_text(&file.display().to_string(), &text, &mut violations);
+        let label = file.display().to_string();
+        scan_with(&label, &text, &base, &mut violations);
+        // The legal-notice carveout: a bundled license may name its
+        // copyright holders, and the fix for a hit there is never to
+        // edit the notice.
+        let legal = file.file_name().and_then(|n| n.to_str()) == Some(LEGAL_NOTICE);
+        if !legal {
+            scan_with(&label, &text, &products, &mut violations);
+        }
     }
     assert!(
         violations.is_empty(),
@@ -179,17 +230,55 @@ fn no_forbidden_token_appears_in_the_crate() {
 
 /// The whole-word tokens match a bare word and not a longer word that
 /// merely begins with one, so the sweep cannot fire on ordinary prose.
+/// The legal-notice carveout is exactly one file wide and covers only
+/// the product set: the process vocabulary is forbidden there too, and
+/// every other file is held to both sets.
+#[test]
+fn the_legal_notice_carveout_is_narrow() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(LEGAL_NOTICE);
+    assert!(root.is_file(), "the legal notice ships with the crate");
+    let text = fs::read_to_string(&root).unwrap();
+    // It is scanned against the process vocabulary like anything else.
+    let mut violations = Vec::new();
+    scan_with("notice", &text, &forbidden(), &mut violations);
+    assert!(violations.is_empty(), "{violations:?}");
+    // And the carveout is needed: the notice does name a vendor the
+    // product set forbids everywhere else.
+    let mut vendor = Vec::new();
+    scan_with("notice", &text, &forbidden_products(), &mut vendor);
+    assert!(
+        !vendor.is_empty(),
+        "the carveout exists for an attribution that is actually there"
+    );
+}
+
+/// The role labels this crate ships publicly stay legal under the
+/// product set, so tightening the scrub can never force a rename of a
+/// settled public label.
+#[test]
+fn the_public_role_labels_survive_the_product_set() {
+    let mut violations = Vec::new();
+    let labels = "raster-browser raster-magick engine-cli vision-weights vision-projector \
+                  ocr-prompt ocr-limit-policy asr-cli asr-weights asr-probe asr-decode-policy";
+    scan_with("labels", labels, &forbidden_products(), &mut violations);
+    assert!(violations.is_empty(), "{violations:?}");
+}
+
 #[test]
 fn whole_word_tokens_do_not_match_inside_longer_words() {
-    let bounded: Vec<Forbidden> = forbidden().into_iter().filter(|f| f.whole_word).collect();
+    let all: Vec<Forbidden> = forbidden()
+        .into_iter()
+        .chain(forbidden_products())
+        .collect();
+    let bounded: Vec<&Forbidden> = all.iter().filter(|f| f.whole_word).collect();
     assert!(!bounded.is_empty(), "the set has whole-word tokens");
     for forbidden in &bounded {
         let inside = format!("x{}x", forbidden.token);
         let mut violations = Vec::new();
-        scan_text("embedded", &inside, &mut violations);
+        scan_with("embedded", &inside, &all, &mut violations);
         assert!(violations.is_empty(), "{violations:?}");
         let bare = format!("({}).", forbidden.token);
-        scan_text("bare", &bare, &mut violations);
+        scan_with("bare", &bare, &all, &mut violations);
         assert_eq!(violations.len(), 1, "{violations:?}");
     }
 }
@@ -203,16 +292,20 @@ fn whole_word_tokens_do_not_match_inside_longer_words() {
 #[test]
 #[should_panic(expected = "forbidden tokens found")]
 fn negative_control_gate_fires_on_all_forbidden_tokens() {
-    let probe = forbidden()
+    let all: Vec<Forbidden> = forbidden()
+        .into_iter()
+        .chain(forbidden_products())
+        .collect();
+    let probe = all
         .iter()
         .map(|f| f.token.clone())
         .collect::<Vec<String>>()
         .join(" and ");
     let mut violations = Vec::new();
-    scan_text("planted-probe", &probe, &mut violations);
+    scan_with("planted-probe", &probe, &all, &mut violations);
     assert_eq!(
         violations.len(),
-        forbidden().len(),
+        all.len(),
         "the gate must catch every planted token, found: {violations:?}"
     );
     assert!(

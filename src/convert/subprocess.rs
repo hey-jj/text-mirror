@@ -62,8 +62,19 @@ pub const RECORDS_SUBPROCESS_VERSION: &str = "1.0.0";
 
 /// Registry id of the in-jail pixel-OCR converter for raster images.
 pub const IMAGE_PIXEL_OCR_ID: &str = "image-pixel-ocr";
-/// Version of the in-jail pixel-OCR converter.
-pub const IMAGE_PIXEL_OCR_VERSION: &str = "1.0.0";
+/// Version of the in-jail pixel-OCR converter. 1.1.0 because the same
+/// converter gained the svg input route through the external provider
+/// and the child-specific segment source: additive behavior under the
+/// shared id, so every prior direct-raster record reconverts once.
+pub const IMAGE_PIXEL_OCR_VERSION: &str = "1.1.0";
+
+/// The segment source the direct raster path labels its spans with.
+pub const OCR_SEGMENT_SOURCE_DOCUMENT: &str = "document";
+
+/// The segment source the svg provider child labels its spans with, so
+/// a consumer can tell recognized text lifted from a vector source's
+/// rendering from the source's own markup.
+pub const OCR_SEGMENT_SOURCE_OCR: &str = "ocr";
 
 /// Registry id of the OCR adapter.
 pub const OCR_ADAPTER_ID: &str = "ocr-adapter";
@@ -180,6 +191,16 @@ mod imp {
             "image-metadata-xml-exceeded",
             "image-metadata-limit-exceeded",
             "image-metadata-unsupported",
+            // Svg provider reasons, in the ruled order. Each must
+            // survive the wire-to-static mapping so the manifest keeps
+            // the specific reason rather than collapsing it to
+            // adapter_error, and each names a generic role label only.
+            "rasterizer-missing",
+            "rasterizer-hash-drift",
+            "rasterizer-version-drift",
+            "raster-exec-failed",
+            "raster-geometry-mismatch",
+            "encoder-area-cap",
             // Audio worker reasons. Each must survive the wire-to-
             // static mapping so the manifest keeps the specific reason
             // rather than collapsing it to adapter_error.
@@ -474,6 +495,12 @@ mod imp {
         /// the pinned-runtime `image-ocr` mode; the test-only fake
         /// constructor selects the harness `image-ocr-fake` mode.
         mode: &'static str,
+        /// The svg leg, present only when a deployment configured a
+        /// complete external provider. Absent, this converter handles
+        /// the direct raster formats and nothing else, and svg stays a
+        /// passthrough primary with no derived child at all.
+        #[cfg(feature = "svg-provider")]
+        svg: Option<SvgProviderLeg>,
         /// The runtime files the deployment wired in, as wire entries
         /// pairing each role's path with its rules-pinned hash. The
         /// cold worker re-hashes each file itself before recognition.
@@ -485,6 +512,21 @@ mod imp {
         /// fix for every later one.
         runner: Result<Runner, RunnerError>,
     }
+
+    /// The svg leg's own state: the verified-at-exec role entries the
+    /// worker re-checks, and the runner over the provider jail class.
+    #[cfg(all(feature = "image-ocr", feature = "svg-provider"))]
+    struct SvgProviderLeg {
+        roles: Vec<crate::runner::protocol::bodies::SvgRoleEntry>,
+        runner: Result<Runner, RunnerError>,
+    }
+
+    /// Ceiling on the provider response frame. The flattened raster
+    /// crosses the frame as hex, so the ceiling is sized for the
+    /// largest raster the area cap admits rather than the smaller image
+    /// response the recognition path returns.
+    #[cfg(all(feature = "image-ocr", feature = "svg-provider"))]
+    const PROVIDER_MAX_RESPONSE_BYTES: u32 = 64 * 1024 * 1024;
 
     #[cfg(feature = "image-ocr")]
     impl ImagePixelOcr {
@@ -527,12 +569,157 @@ mod imp {
             }
             ImagePixelOcr {
                 mode: "image-ocr",
+                #[cfg(feature = "svg-provider")]
+                svg: None,
                 inventory: entries,
                 // The image worker runs the base jail class: its own
                 // engine grant buys it no allowance measured for a
                 // different engine.
                 runner: build_image_runner(image_runner_limits(&limits), exec_grants, read_grants),
             }
+        }
+
+        /// The same converter with the svg leg wired: the deployment's
+        /// configured provider components travel to the provider worker
+        /// as role entries, and the runner runs that worker under the
+        /// provider jail class with the measured closures granted.
+        ///
+        /// The recognition half is unchanged: the flattened raster the
+        /// provider returns goes through the identical decode, area
+        /// guard, and engine path a direct raster takes.
+        #[cfg(feature = "svg-provider")]
+        pub fn with_svg_provider(
+            limits: crate::convert::ImageOcrLimits,
+            inventory: &crate::convert::RuntimeInventory,
+            provider: &crate::convert::provider::SvgProvider,
+        ) -> ImagePixelOcr {
+            use crate::runner::protocol::bodies::SvgRoleEntry;
+            // The expectations come from the rules and the path from
+            // the configuration; the wire entry pairs them, and the
+            // worker re-asserts the pair before every execution. A role
+            // the rules do not pin travels with no expectation at all,
+            // so the worker refuses it as missing.
+            let entry = |label: &str, role: &crate::convert::provider::ProviderRole| {
+                let pin = limits.svg_provider.get(label);
+                SvgRoleEntry {
+                    role: label.to_string(),
+                    path: role.path.display().to_string(),
+                    expected_blake3: pin.map(|pin| pin.blake3.clone()).unwrap_or_default(),
+                    version: pin.map(|pin| pin.version.clone()).unwrap_or_default(),
+                    closure_root: role
+                        .closure_root
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    closure_blake3: pin.and_then(|pin| pin.closure_blake3.clone()),
+                    jail_temp_env: role.jail_temp_env.clone(),
+                }
+            };
+            let roles = vec![
+                entry(
+                    crate::convert::provider::PROVIDER_ROLE_RASTER,
+                    &provider.raster,
+                ),
+                entry(
+                    crate::convert::provider::PROVIDER_ROLE_ENCODER,
+                    &provider.encoder,
+                ),
+            ];
+            // The literal grants are the two pinned executables. The
+            // closures they load helpers from are the jail's subpath
+            // grants, and the worker asserts an aggregate digest over
+            // each of them before every execution.
+            let exec_grants = vec![provider.raster.path.clone(), provider.encoder.path.clone()];
+            let mut closures = Vec::new();
+            for role in [&provider.raster, &provider.encoder] {
+                if let Some(root) = &role.closure_root {
+                    closures.push(root.clone());
+                }
+            }
+            let jail = crate::runner::jail::ProviderJail {
+                closures,
+                service_prefix: provider.raster.jail_service_prefix.clone(),
+                temp_env: provider.raster.jail_temp_env.clone(),
+            };
+            let mut provider_limits = image_runner_limits(&limits);
+            provider_limits.max_response_bytes = PROVIDER_MAX_RESPONSE_BYTES;
+            let runner = crate::runner::jail::platform_backend().and_then(|backend| {
+                Ok(Runner::with_provider_jail(
+                    backend,
+                    crate::runner::locate_worker()?,
+                    provider_limits,
+                    exec_grants,
+                    Vec::new(),
+                    jail,
+                ))
+            });
+            let mut converter = ImagePixelOcr::new(limits, inventory);
+            converter.svg = Some(SvgProviderLeg { roles, runner });
+            converter
+        }
+
+        /// The fake-engine converter with the svg leg wired: the
+        /// provider half is the real one, jail and all, and only the
+        /// recognition stage is the deterministic fake. It is how the
+        /// pipeline tests exercise the child lifecycle without a pinned
+        /// vision engine, and the registry never constructs it.
+        #[cfg(all(feature = "svg-provider", feature = "test-adapters"))]
+        pub fn new_fake_with_svg_provider(
+            limits: crate::convert::ImageOcrLimits,
+            provider: &crate::convert::provider::SvgProvider,
+        ) -> ImagePixelOcr {
+            let wired = ImagePixelOcr::with_svg_provider(
+                limits.clone(),
+                &crate::convert::RuntimeInventory::empty(),
+                provider,
+            );
+            let mut converter = ImagePixelOcr::new_fake(limits);
+            converter.svg = wired.svg;
+            converter
+        }
+
+        /// Runs the provider leg for one source and returns the
+        /// flattened raster's bytes. Every assertion runs inside the
+        /// jailed worker, immediately before each of the two external
+        /// executions.
+        #[cfg(feature = "svg-provider")]
+        fn rasterize(&self, source: &[u8]) -> std::result::Result<Vec<u8>, ConvertError> {
+            use crate::runner::protocol::bodies::{SvgRasterOk, SvgRasterRequest};
+            let leg = self.svg.as_ref().ok_or_else(|| ConvertError {
+                code: "unclaimed_format",
+                message: "no svg provider is configured for this converter".to_string(),
+            })?;
+            // Presence is checked here as well as in the worker. The
+            // worker's check is the authority, because it runs in the
+            // cold jail immediately before the execution; this one
+            // exists so an absent component is named as one rather
+            // than surfacing as the jail refusing to grant a path that
+            // is not there.
+            for entry in &leg.roles {
+                let present = std::fs::symlink_metadata(&entry.path)
+                    .is_ok_and(|metadata| metadata.file_type().is_file());
+                if !present {
+                    return Err(ConvertError {
+                        code: "rasterizer-missing",
+                        message: format!("provider component {} is not present", entry.role),
+                    });
+                }
+            }
+            let runner = leg.runner.as_ref().map_err(|e| runner_failure(e.clone()))?;
+            let body: SvgRasterOk = call(
+                runner,
+                "svg-raster",
+                &SvgRasterRequest {
+                    input: crate::convert::svg_raster::JAIL_SOURCE.to_string(),
+                    roles: leg.roles.clone(),
+                },
+                &[(crate::convert::svg_raster::JAIL_SOURCE, source)],
+            )?;
+            crate::convert::svg_raster::hex_decode(&body.raster_png_hex).ok_or_else(|| {
+                ConvertError {
+                    code: "raster-exec-failed",
+                    message: "the provider returned a raster that does not decode".to_string(),
+                }
+            })
         }
 
         /// A test-only converter that drives the harness `image-ocr-fake`
@@ -546,6 +733,8 @@ mod imp {
         pub fn new_fake(limits: crate::convert::ImageOcrLimits) -> ImagePixelOcr {
             ImagePixelOcr {
                 mode: "image-ocr-fake",
+                #[cfg(feature = "svg-provider")]
+                svg: None,
                 inventory: Vec::new(),
                 runner: build_image_runner(image_runner_limits(&limits), Vec::new(), Vec::new()),
             }
@@ -601,7 +790,15 @@ mod imp {
             source: &[u8],
             detected_format: &str,
         ) -> std::result::Result<Outcome, ConvertError> {
-            if !matches!(detected_format, "png" | "jpeg" | "webp") {
+            // A vector source has no pixels of its own. It is claimed
+            // here only when a deployment configured the external
+            // provider; without one the format is not this converter's,
+            // and the pipeline never routes it here at all.
+            #[cfg(feature = "svg-provider")]
+            let is_svg = detected_format == "svg" && self.svg.is_some();
+            #[cfg(not(feature = "svg-provider"))]
+            let is_svg = false;
+            if !is_svg && !matches!(detected_format, "png" | "jpeg" | "webp") {
                 return Err(ConvertError {
                     code: "unclaimed_format",
                     message: format!(
@@ -609,11 +806,27 @@ mod imp {
                     ),
                 });
             }
+            // The provider leg runs first and on its own. Its raster is
+            // what the recognition path then reads, so an upstream
+            // failure returns here and the recognition worker never
+            // starts.
+            #[cfg(feature = "svg-provider")]
+            let rendered = if is_svg {
+                Some(self.rasterize(source)?)
+            } else {
+                None
+            };
+            #[cfg(feature = "svg-provider")]
+            let (input, staged): (String, &[u8]) = match &rendered {
+                Some(raster) => ("input.png".to_string(), raster.as_slice()),
+                None => (format!("input.{detected_format}"), source),
+            };
+            #[cfg(not(feature = "svg-provider"))]
+            let (input, staged): (String, &[u8]) = (format!("input.{detected_format}"), source);
             let runner = self
                 .runner
                 .as_ref()
                 .map_err(|e| runner_failure(e.clone()))?;
-            let input = format!("input.{detected_format}");
             let body: OcrOk = call(
                 runner,
                 self.mode,
@@ -622,7 +835,7 @@ mod imp {
                     kind: OcrInput::Image,
                     inventory: self.inventory.clone(),
                 },
-                &[(&input, source)],
+                &[(&input, staged)],
             )?;
             // The worker's own notes (such as the long-edge validation
             // note) propagate; the span mapping appends any low-confidence
@@ -630,12 +843,21 @@ mod imp {
             let mut warnings = body.warnings;
             let (text, low_confidence) = render_ocr_spans(&body.spans, source.len())?;
             warnings.extend(low_confidence);
+            // The direct raster path keeps the label it always had; the
+            // provider child names its own source, so a consumer can
+            // tell recognized pixels of a rendered vector from the
+            // markup the vector's own primary artifact carries.
+            let segment_source = if is_svg {
+                OCR_SEGMENT_SOURCE_OCR
+            } else {
+                OCR_SEGMENT_SOURCE_DOCUMENT
+            };
             Ok(Outcome {
                 converter_id: IMAGE_PIXEL_OCR_ID.to_string(),
                 converter_version: IMAGE_PIXEL_OCR_VERSION.to_string(),
                 detected_format: detected_format.to_string(),
                 artifact_kind: ArtifactKind::Ocr,
-                segments: vec![Segment::span(0, text.len(), "document")],
+                segments: vec![Segment::span(0, text.len(), segment_source)],
                 text,
                 warnings,
                 media: None,
@@ -1165,6 +1387,116 @@ mod imp {
                 runner.runtime_profile(),
                 crate::runner::jail::RuntimeProfile::Plain
             );
+        }
+    }
+
+    #[cfg(all(test, feature = "svg-provider"))]
+    mod svg_provider_grant_tests {
+        use super::*;
+
+        /// The provider leg's jail carries exactly what the
+        /// configuration named: the two pinned executables as literal
+        /// grants, their closures as the jail's subpath grants, the
+        /// deployment's service namespace, and the provider class. A
+        /// capability none of those named cannot reach the jail.
+        #[test]
+        fn the_provider_leg_grants_exactly_what_the_configuration_named() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let make = |name: &str| {
+                let path = root.join(name);
+                std::fs::write(&path, name).unwrap();
+                path
+            };
+            let raster = make("raster");
+            let encoder = make("encoder");
+            let closure = root.join("closure");
+            std::fs::create_dir_all(&closure).unwrap();
+            let text = format!(
+                "schema = \"{schema}\"\n\n\
+                 [providers.svg.\"{raster_role}\"]\n\
+                 path = \"{raster}\"\n\
+                 closure_root = \"{closure}\"\n\
+                 jail_service_prefix = \"^ex\\\\.ample\\\\.\"\n\
+                 jail_temp_env = \"EXAMPLE_TMPDIR\"\n\n\
+                 [providers.svg.\"{encoder_role}\"]\n\
+                 path = \"{encoder}\"\n",
+                schema = crate::convert::provider::PROVIDER_SCHEMA,
+                raster_role = crate::convert::provider::PROVIDER_ROLE_RASTER,
+                encoder_role = crate::convert::provider::PROVIDER_ROLE_ENCODER,
+                raster = raster.display(),
+                encoder = encoder.display(),
+                closure = closure.display(),
+            );
+            let mut limits = crate::convert::ImageOcrLimits::default();
+            for (label, version) in [
+                (crate::convert::provider::PROVIDER_ROLE_RASTER, "1.2.3"),
+                (crate::convert::provider::PROVIDER_ROLE_ENCODER, "4.5.6"),
+            ] {
+                limits.svg_provider.insert(
+                    label.to_string(),
+                    crate::convert::provider::ProviderPin {
+                        blake3: "0".repeat(64),
+                        version: version.to_string(),
+                        closure_blake3: None,
+                    },
+                );
+            }
+            let config = crate::convert::provider::ProviderConfig::parse(&text).unwrap();
+            let svg = config.svg().expect("both roles");
+            let adapter = ImagePixelOcr::with_svg_provider(
+                limits,
+                &crate::convert::RuntimeInventory::empty(),
+                svg,
+            );
+            let leg = adapter.svg.as_ref().expect("the leg is wired");
+            let runner = leg
+                .runner
+                .as_ref()
+                .expect("this platform has a jail backend");
+            let (exec, read) = runner.grant_lists();
+            assert_eq!(exec, [raster.clone(), encoder.clone()]);
+            assert!(read.is_empty(), "{read:?}");
+            assert_eq!(
+                runner.runtime_profile(),
+                crate::runner::jail::RuntimeProfile::Provider
+            );
+            let jail = runner.provider_jail().expect("the provider parameters");
+            assert_eq!(jail.closures, vec![closure]);
+            assert_eq!(jail.service_prefix.as_deref(), Some(r"^ex\.ample\."));
+            assert_eq!(jail.temp_env.as_deref(), Some("EXAMPLE_TMPDIR"));
+            // The role entries the worker re-verifies carry the pins
+            // and never a product name of their own.
+            let roles: Vec<&str> = leg.roles.iter().map(|entry| entry.role.as_str()).collect();
+            assert_eq!(
+                roles,
+                vec![
+                    crate::convert::provider::PROVIDER_ROLE_RASTER,
+                    crate::convert::provider::PROVIDER_ROLE_ENCODER
+                ]
+            );
+            assert_eq!(leg.roles[0].version, "1.2.3");
+            assert_eq!(leg.roles[1].version, "4.5.6");
+        }
+
+        /// The direct raster path is unchanged by a configured
+        /// provider: its own runner keeps the base class, so the
+        /// widened profile reaches only the leg it was measured for.
+        #[test]
+        fn a_configured_provider_never_moves_the_raster_path_off_the_base_class() {
+            let adapter = ImagePixelOcr::new(
+                crate::convert::ImageOcrLimits::default(),
+                &crate::convert::RuntimeInventory::empty(),
+            );
+            let runner = adapter
+                .runner
+                .as_ref()
+                .expect("this platform has a jail backend");
+            assert_eq!(
+                runner.runtime_profile(),
+                crate::runner::jail::RuntimeProfile::Plain
+            );
+            assert!(runner.provider_jail().is_none());
         }
     }
 

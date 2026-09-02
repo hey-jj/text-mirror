@@ -42,7 +42,7 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
-use jail::{JailBackend, RuntimeProfile, SpawnSpec};
+use jail::{JailBackend, ProviderJail, RuntimeProfile, SpawnSpec};
 use protocol::{FrameRead, Request, RequestSchema, Response};
 
 /// Resource and output limits for one adapter class.
@@ -177,6 +177,7 @@ pub struct Runner {
     exec_grants: Vec<PathBuf>,
     read_grants: Vec<PathBuf>,
     runtime_profile: RuntimeProfile,
+    provider: Option<ProviderJail>,
 }
 
 impl Runner {
@@ -219,6 +220,34 @@ impl Runner {
             exec_grants,
             read_grants,
             runtime_profile,
+            provider: None,
+        }
+    }
+
+    /// A runner under the provider jail class, whose profile
+    /// additionally grants the measured closures and service namespace
+    /// the pinned external components need.
+    ///
+    /// The class alone buys nothing: the backend renders the widened
+    /// profile only when this class arrives together with a non-empty
+    /// executable grant and these parameters, so a worker that names
+    /// the class with nothing wired keeps the base profile.
+    pub fn with_provider_jail(
+        backend: Box<dyn JailBackend>,
+        worker: PathBuf,
+        limits: Limits,
+        exec_grants: Vec<PathBuf>,
+        read_grants: Vec<PathBuf>,
+        provider: ProviderJail,
+    ) -> Runner {
+        Runner {
+            backend,
+            worker,
+            limits,
+            exec_grants,
+            read_grants,
+            runtime_profile: RuntimeProfile::Provider,
+            provider: Some(provider),
         }
     }
 
@@ -256,6 +285,13 @@ impl Runner {
         self.runtime_profile
     }
 
+    /// Test-only view of the provider jail parameters, so a converter
+    /// test can prove exactly which closures its jail would grant.
+    #[cfg(test)]
+    pub(crate) fn provider_jail(&self) -> Option<&ProviderJail> {
+        self.provider.as_ref()
+    }
+
     /// The policy digest that keys this runner's probe cache entry.
     pub fn policy_digest(&self) -> Result<String, RunnerError> {
         jail::policy_digest(
@@ -264,6 +300,7 @@ impl Runner {
             &self.exec_grants,
             &self.read_grants,
             self.runtime_profile,
+            self.provider.as_ref(),
         )
     }
 
@@ -345,6 +382,7 @@ impl Runner {
             exec_grants: &self.exec_grants,
             read_grants: &self.read_grants,
             runtime_profile: self.runtime_profile,
+            provider: self.provider.as_ref(),
         };
         let mut command = self.backend.command(&spec)?;
         command

@@ -41,6 +41,14 @@ pub enum RuntimeProfile {
     /// The base profile plus the device allowances measured for the
     /// pinned accelerator engine. Only the audio worker mode.
     Accelerator,
+    /// The provider jail: the widened profile measured for the pinned
+    /// external rasterizer, which spawns helper processes, reads a
+    /// larger runtime closure, and registers its own services. Only the
+    /// svg raster worker mode. It is a class of its own and shares
+    /// nothing with the accelerator class above: neither inherits the
+    /// other's allowances, and a platform with no measured provider
+    /// profile refuses this class outright.
+    Provider,
 }
 
 impl RuntimeProfile {
@@ -49,8 +57,31 @@ impl RuntimeProfile {
         match self {
             RuntimeProfile::Plain => "plain",
             RuntimeProfile::Accelerator => "accelerator",
+            RuntimeProfile::Provider => "provider",
         }
     }
+}
+
+/// The provider jail's measured parameters: the executable closures the
+/// pinned components load from, and the service namespace their runtime
+/// registers under.
+///
+/// Both are deployment data, so neither is a literal in this crate. The
+/// closures are granted as subpaths, which is wider than a literal file
+/// grant and is why the worker asserts an aggregate digest over each
+/// closure before every execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderJail {
+    /// Roots granted read and execute as subpaths.
+    pub closures: Vec<std::path::PathBuf>,
+    /// The namespace service registration is scoped to, when the
+    /// runtime registers any. `None` grants no registration at all.
+    pub service_prefix: Option<String>,
+    /// The additional temp-directory variable the worker sets for the
+    /// runtime, when it reads one. Not rendered into the profile, but
+    /// part of this jail's identity all the same, so the probe pass is
+    /// keyed on every parameter the deployment supplied.
+    pub temp_env: Option<String>,
 }
 
 /// What one adapter invocation needs from a backend.
@@ -76,6 +107,12 @@ pub struct SpawnSpec<'a> {
     pub read_grants: &'a [std::path::PathBuf],
     /// The measured jail profile this worker mode is authorized for.
     pub runtime_profile: RuntimeProfile,
+    /// The provider jail's measured parameters, present only for the
+    /// provider class. The class is the authorization and these are the
+    /// necessity: without them the provider profile renders nothing
+    /// wider than the base, so no other worker can reach the widened
+    /// allowances by naming the class alone.
+    pub provider: Option<&'a ProviderJail>,
 }
 
 /// A platform jail backend.
@@ -138,6 +175,7 @@ pub(super) fn policy_digest(
     exec_grants: &[std::path::PathBuf],
     read_grants: &[std::path::PathBuf],
     runtime_profile: RuntimeProfile,
+    provider: Option<&ProviderJail>,
 ) -> Result<String, RunnerError> {
     let worker_hash = hash::hash_file(worker).map_err(|e| RunnerError {
         code: "worker_not_found",
@@ -150,8 +188,22 @@ pub(super) fn policy_digest(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let provider_material = match provider {
+        Some(provider) => format!(
+            "closures={}\nservice-prefix={}\ntemp-env={}",
+            provider
+                .closures
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            provider.service_prefix.clone().unwrap_or_default(),
+            provider.temp_env.clone().unwrap_or_default()
+        ),
+        None => String::new(),
+    };
     let material = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\nruntime-profile={}",
+        "{}\n{}\n{}\n{}\n{}\n{}\nruntime-profile={}\n{}",
         backend.name(),
         backend.policy_material(),
         worker.display(),
@@ -159,6 +211,7 @@ pub(super) fn policy_digest(
         grant_lines("exec", exec_grants),
         grant_lines("read", read_grants),
         runtime_profile.label(),
+        provider_material,
     );
     Ok(hash::hash_bytes(material.as_bytes()))
 }

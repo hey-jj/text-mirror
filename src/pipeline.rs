@@ -48,12 +48,20 @@ pub struct Rules {
     pub table: FormatTable,
     /// The converter registry from `rules/converters.toml`.
     pub registry: Registry,
+    /// The effective rules version recorded in every record: the shared
+    /// numeric version of the two rules files, with the configured
+    /// provider's identity appended when one is wired.
+    effective_version: String,
+    /// Whether a deployment configured a provider this build cannot
+    /// run. The svg records of such a run carry a warning saying so, so
+    /// a later build that carries the feature does not skip them.
+    provider_not_built: bool,
 }
 
 impl Rules {
     /// The rules compiled into the binary.
     pub fn builtin() -> Result<Self> {
-        Self::from_registry(Registry::builtin()?)
+        Self::from_registry(Registry::builtin()?, None, false)
     }
 
     /// The rules compiled into the binary, with the deployment's
@@ -61,11 +69,82 @@ impl Rules {
     /// converters. The expected hashes stay in the rules; the
     /// inventory supplies only paths.
     pub fn builtin_with_inventory(inventory: &convert::RuntimeInventory) -> Result<Self> {
-        Self::from_registry(Registry::builtin_with_inventory(inventory)?)
+        Self::from_registry(Registry::builtin_with_inventory(inventory)?, None, false)
     }
 
-    fn from_registry(registry: Registry) -> Result<Self> {
-        let table = FormatTable::builtin()?;
+    /// The rules compiled into the binary, with the deployment's
+    /// runtime-inventory paths and its external provider configuration
+    /// wired in.
+    ///
+    /// A configured provider changes the effective rules version, so
+    /// enabling, disabling, moving to different pinned executables, or
+    /// changing the adapter re-runs every affected source instead of
+    /// skipping it as unchanged. A configuration this build cannot run
+    /// leaves the version alone and marks the run instead.
+    pub fn builtin_with_runtime(
+        inventory: &convert::RuntimeInventory,
+        provider: Option<&convert::provider::ProviderConfig>,
+    ) -> Result<Self> {
+        let registry = Registry::builtin_with_runtime(inventory, provider)?;
+        let wired = registry.svg_ocr_converter().is_some();
+        let configured = provider
+            .and_then(convert::provider::ProviderConfig::svg)
+            .is_some();
+        Self::from_registry(
+            registry,
+            if wired { provider } else { None },
+            configured && !wired,
+        )
+    }
+
+    /// Rules over an explicit format table and registry, for a caller
+    /// that compiled its own rules rather than the built-in ones. No
+    /// provider is wired, so the effective version is the shared
+    /// numeric version of the two tables.
+    pub fn from_parts(table: FormatTable, registry: Registry) -> Result<Self> {
+        Self::assemble(table, registry, None, false)
+    }
+
+    /// Rules over an explicit table and registry with the provider
+    /// configuration the registry was built against, so the effective
+    /// version carries the provider's identity exactly as the built-in
+    /// constructor's does.
+    pub fn from_parts_with_runtime(
+        table: FormatTable,
+        registry: Registry,
+        provider: Option<&convert::provider::ProviderConfig>,
+    ) -> Result<Self> {
+        let wired = registry.svg_ocr_converter().is_some();
+        let configured = provider
+            .and_then(convert::provider::ProviderConfig::svg)
+            .is_some();
+        Self::assemble(
+            table,
+            registry,
+            if wired { provider } else { None },
+            configured && !wired,
+        )
+    }
+
+    fn from_registry(
+        registry: Registry,
+        provider: Option<&convert::provider::ProviderConfig>,
+        provider_not_built: bool,
+    ) -> Result<Self> {
+        Self::assemble(
+            FormatTable::builtin()?,
+            registry,
+            provider,
+            provider_not_built,
+        )
+    }
+
+    fn assemble(
+        table: FormatTable,
+        registry: Registry,
+        provider: Option<&convert::provider::ProviderConfig>,
+        provider_not_built: bool,
+    ) -> Result<Self> {
         if table.version() != registry.version() {
             return Err(Error::Rules {
                 name: "rules".to_string(),
@@ -76,12 +155,40 @@ impl Rules {
                 ),
             });
         }
-        Ok(Rules { table, registry })
+        // The effective version: the numeric rules version alone, or
+        // that version plus the configured provider's identity. The
+        // identity digests presence, the generic role labels, the
+        // pinned hashes and versions, the adapter version, and the
+        // geometry and flatten options, and excludes every absolute
+        // path, so moving an identical provider skips nothing and
+        // changing any pinned identity re-runs everything.
+        let suffix = provider.and_then(|config| {
+            config.svg()?;
+            convert::provider::ProviderConfig::version_suffix(
+                &registry.image_ocr_limits().svg_provider,
+            )
+        });
+        let effective_version = match suffix {
+            Some(suffix) => format!("{}+{suffix}", table.version()),
+            None => table.version().to_string(),
+        };
+        Ok(Rules {
+            table,
+            registry,
+            effective_version,
+            provider_not_built,
+        })
     }
 
-    /// The shared rules version.
+    /// The effective rules version, recorded in every record.
     pub fn version(&self) -> &str {
-        self.table.version()
+        &self.effective_version
+    }
+
+    /// Whether a configured provider could not be built into this
+    /// binary.
+    pub fn provider_not_built(&self) -> bool {
+        self.provider_not_built
     }
 }
 
@@ -477,6 +584,84 @@ fn metadata_child_path(source_path: &str) -> String {
     format!("{source_path}.d/#image-metadata")
 }
 
+/// The synthetic derived-child path a vector source's pixel-OCR leg
+/// writes to. It is the recognized text of the source's rendering, so
+/// it sits beside the metadata child under the same `.d/` namespace and
+/// never replaces the source's own passthrough primary.
+fn svg_ocr_child_path(source_path: &str) -> String {
+    format!("{source_path}.d/#image-ocr")
+}
+
+/// Which auxiliary derived-child leg one source runs, if any.
+///
+/// The two are mutually exclusive by construction: the metadata leg
+/// covers the raster carriers, whose primary is recognized pixels,
+/// and the OCR leg covers vector sources, whose primary is their own
+/// markup. Both are structurally identical to a container member, so
+/// they share the claim, reconciliation, and checkpoint machinery below
+/// and differ only in their path, their converter, and what counts as
+/// nothing to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildLeg {
+    /// The hidden metadata child of a raster carrier.
+    Metadata,
+    /// The visible recognized-text child of a vector source.
+    SvgOcr,
+}
+
+impl ChildLeg {
+    /// The child path this leg writes to.
+    fn child_path(self, source_path: &str) -> String {
+        match self {
+            ChildLeg::Metadata => metadata_child_path(source_path),
+            ChildLeg::SvgOcr => svg_ocr_child_path(source_path),
+        }
+    }
+
+    /// Whether a converter failure means this leg has nothing to write,
+    /// as opposed to a failure worth recording.
+    ///
+    /// For the metadata leg that is an image carrying no textual
+    /// metadata. For the OCR leg it is a rendering that holds no
+    /// readable text at all, which is the vector equivalent: the
+    /// source's own markup is already the primary artifact, so a
+    /// text-free rendering adds nothing rather than failing. Every
+    /// other failure, the whole provider vocabulary included, records a
+    /// failed child.
+    fn is_nothing_to_write(self, reason: &str) -> bool {
+        match self {
+            ChildLeg::Metadata => {
+                reason.starts_with(convert::image_metadata::IMAGE_METADATA_NOT_APPLICABLE)
+            }
+            ChildLeg::SvgOcr => reason.starts_with("empty_output"),
+        }
+    }
+
+    /// The converter id and version a failed child of this leg is
+    /// attributed to.
+    fn converter_identity(self) -> (&'static str, &'static str) {
+        match self {
+            ChildLeg::Metadata => (
+                convert::image_metadata::IMAGE_METADATA_ID,
+                convert::image_metadata::IMAGE_METADATA_VERSION,
+            ),
+            ChildLeg::SvgOcr => (
+                convert::subprocess::IMAGE_PIXEL_OCR_ID,
+                convert::subprocess::IMAGE_PIXEL_OCR_VERSION,
+            ),
+        }
+    }
+
+    /// The warning a source records when this leg's namespace is
+    /// already occupied by a real source.
+    fn namespace_occupied(self) -> &'static str {
+        match self {
+            ChildLeg::Metadata => convert::image_metadata::IMAGE_METADATA_NAMESPACE_OCCUPIED,
+            ChildLeg::SvgOcr => "svg-ocr-namespace-occupied",
+        }
+    }
+}
+
 /// The claimed-path state for one top-level container's whole
 /// expansion, so members cannot alias each other's paths and a
 /// re-expansion can retire the descendants a shrunken member set
@@ -591,11 +776,11 @@ impl Expander<'_> {
             _ => converter.map(|c| c.version()),
         };
 
-        // An image carrier whose metadata leg runs owns a derived child
-        // the way a container owns members: the checkpoint and dedup
-        // decisions below account for that child.
-        let metadata_leg = self.metadata_leg_applies(&meta.detection.detected);
-        let has_children = kind.is_some() || metadata_leg;
+        // A source whose auxiliary leg runs owns a derived child the way
+        // a container owns members: the checkpoint and dedup decisions
+        // below account for that child.
+        let leg = self.child_leg(&meta.detection.detected);
+        let has_children = kind.is_some() || leg.is_some();
 
         // Checkpoint: an unchanged source with an intact artifact
         // skips, containers included. A skipped container leaves its
@@ -612,7 +797,7 @@ impl Expander<'_> {
             // never had its metadata leg run. Once the converter is
             // present that record is not skippable, so the child is
             // minted on the first build that can produce it.
-            let leg_never_ran = metadata_leg
+            let leg_never_ran = leg == Some(ChildLeg::Metadata)
                 && previous
                     .warnings
                     .iter()
@@ -649,7 +834,7 @@ impl Expander<'_> {
                             .cloned()
                             .collect();
                         if let Some(claim) = &mut self.claim {
-                            if metadata_leg {
+                            if leg.is_some() {
                                 for path in &kept {
                                     claim.claimed.insert(collision_key(path));
                                 }
@@ -689,7 +874,7 @@ impl Expander<'_> {
         // because borrowing its artifact would skip re-expanding its
         // members under their own paths.
         if kind.is_none()
-            && !(metadata_leg && over_ceiling)
+            && !(leg.is_some() && over_ceiling)
             && let Some(canonical) = self.dedup.get(&meta.source_hash)
             && canonical.source_path != meta.source_path
             && converter.is_some_and(|c| {
@@ -717,21 +902,18 @@ impl Expander<'_> {
                 // and the child belongs to this path. The bytes are
                 // loaded here, before the record, so a load failure is
                 // recorded the way the leaf path records it.
-                #[cfg(all(unix, feature = "image-metadata"))]
-                let raw = if metadata_leg {
-                    match bytes.load(&meta.source_hash) {
+                let raw = match leg {
+                    Some(_) => match bytes.load(&meta.source_hash) {
                         Ok(raw) => Some(raw),
                         Err(reason) => return self.fail(&meta, reason, started),
-                    }
-                } else {
-                    None
+                    },
+                    None => None,
                 };
                 let mut meta = meta;
-                let collides = metadata_leg && self.metadata_collides(&meta.source_path);
-                if collides {
-                    meta.detect_warnings.push(
-                        convert::image_metadata::IMAGE_METADATA_NAMESPACE_OCCUPIED.to_string(),
-                    );
+                let collides = leg.is_some_and(|leg| self.leg_collides(leg, &meta.source_path));
+                if let Some(leg) = leg.filter(|_| collides) {
+                    meta.detect_warnings
+                        .push(leg.namespace_occupied().to_string());
                 }
                 let mut record = self.base_record(&meta, Status::Dedup);
                 for warning in &canonical.warnings {
@@ -759,13 +941,16 @@ impl Expander<'_> {
                 }
                 record.duration_ms = Some(elapsed_ms(started));
                 self.emit(record)?;
-                #[cfg(all(unix, feature = "image-metadata"))]
-                if let Some(raw) = raw
+                // The auxiliary leg still runs for a borrowed primary:
+                // the bytes are identical by hash and the child belongs
+                // to this path, not to the canonical one.
+                if let (Some(leg), Some(raw)) = (leg, raw)
                     && !collides
                 {
                     let format = meta.detection.detected.clone();
                     let declared = meta.detection.declared.clone();
-                    return self.run_metadata_leg(
+                    return self.run_child_leg(
+                        leg,
                         &meta.source_path,
                         &format,
                         declared,
@@ -780,7 +965,7 @@ impl Expander<'_> {
         }
 
         let Some(kind) = kind else {
-            return self.convert_leaf_with_metadata(meta, bytes, started);
+            return self.convert_leaf_with_children(meta, bytes, started);
         };
         // A top-level container owns the claim state for its whole
         // subtree. Nested containers share the owner's state.
@@ -959,33 +1144,89 @@ impl Expander<'_> {
         self.emit(record)
     }
 
-    /// The leaf path plus, for an image carrier, the auxiliary
-    /// metadata derived-child leg.
+    /// The leaf path plus, for a source that has one, its auxiliary
+    /// derived-child leg.
     ///
-    /// The primary conversion is the unchanged leaf path. When the format
-    /// is an image carrier and the metadata converter is built, one
-    /// image source additionally yields a hidden metadata child at
-    /// `<source>.d/#image-metadata`, structurally parallel to a container
-    /// member. The two legs share nothing: a failure of the metadata
-    /// child never touches the primary image record.
-    fn convert_leaf_with_metadata(
+    /// The primary conversion is the unchanged leaf path. A raster
+    /// carrier additionally yields a hidden metadata child, and a vector
+    /// source with a configured provider additionally yields a visible
+    /// recognized-text child, each structurally parallel to a container
+    /// member. The two legs share nothing with the primary: a failing
+    /// child never touches the primary record, and a failing primary
+    /// never suppresses the child.
+    fn convert_leaf_with_children(
         &mut self,
         mut meta: Meta,
         bytes: UnitBytes,
         started: Instant,
     ) -> Result<()> {
-        #[cfg(all(unix, feature = "image-metadata"))]
-        if self.metadata_leg_applies(&meta.detection.detected) {
-            return self.convert_image_with_metadata(meta, bytes, started);
+        if let Some(leg) = self.child_leg(&meta.detection.detected) {
+            return self.convert_leaf_and_child(leg, meta, bytes, started);
         }
-        // An image carrier in a build without the metadata converter
+        // A raster carrier in a build without the metadata converter
         // records that its leg never ran, so a later build that carries
         // the converter does not skip this record as unchanged.
         if convert::image_metadata::image_metadata_applies(&meta.detection.detected) {
             meta.detect_warnings
                 .push(convert::image_metadata::IMAGE_METADATA_NOT_BUILT.to_string());
         }
-        self.convert_leaf(meta, bytes, started)
+        // A vector source whose deployment configured a provider this
+        // build cannot run says so on the record, rather than looking
+        // like a run with no provider configured at all.
+        if meta.detection.detected == "svg" && self.rules.provider_not_built() {
+            meta.detect_warnings
+                .push(convert::SVG_PROVIDER_NOT_BUILT.to_string());
+        }
+        // A source that used to run a leg and no longer does still owns
+        // the namespace its child sits in, so the prior child is
+        // retired here the way a re-expansion retires a member the
+        // container no longer holds. Without this a provider that was
+        // turned off would leave a live converted child behind with
+        // nothing to produce it.
+        let prefix = format!("{}.d/", meta.source_path);
+        let stale =
+            self.claim.is_none() && self.terminal.keys().any(|path| path.starts_with(&prefix));
+        if !stale {
+            return self.convert_leaf(meta, bytes, started);
+        }
+        let source_path = meta.source_path.clone();
+        self.claim = Some(ClaimState {
+            prefix,
+            claimed: std::collections::HashSet::new(),
+            emitted: std::collections::HashSet::new(),
+            collisions: 0,
+        });
+        let result = self.convert_leaf(meta, bytes, started);
+        if let Some(claim) = self.claim.take() {
+            self.reconcile(&source_path, &claim, started)?;
+        }
+        result
+    }
+
+    /// Which auxiliary leg one detected format runs, if any.
+    ///
+    /// The metadata leg runs for a raster carrier when the build
+    /// carries that converter. The OCR leg runs for a vector source
+    /// only when a deployment configured a complete external provider
+    /// and this build can drive it; with no provider there is no leg,
+    /// no child, and no change to the vector source's own primary.
+    fn child_leg(&self, format: &str) -> Option<ChildLeg> {
+        if self.metadata_leg_applies(format) {
+            return Some(ChildLeg::Metadata);
+        }
+        if format == "svg" && self.rules.registry.svg_ocr_converter().is_some() {
+            return Some(ChildLeg::SvgOcr);
+        }
+        None
+    }
+
+    /// The converter one leg runs. Both are auxiliary: neither claims a
+    /// format, so neither can be reached through the routing table.
+    fn leg_converter(&self, leg: ChildLeg) -> Option<&dyn convert::Converter> {
+        match leg {
+            ChildLeg::Metadata => self.rules.registry.image_metadata_converter(),
+            ChildLeg::SvgOcr => self.rules.registry.svg_ocr_converter(),
+        }
     }
 
     /// Whether the metadata derived-child leg runs for a detected
@@ -1004,18 +1245,18 @@ impl Expander<'_> {
         }
     }
 
-    /// Whether the metadata child of an image at `source_path` would
-    /// collide with a real source, claiming the child path inside a
-    /// container expansion as it checks.
+    /// Whether one leg's child at `source_path` would collide with a
+    /// real source, claiming the child path inside a container
+    /// expansion as it checks.
     ///
-    /// A real walked source in the image `.d/` namespace occupies it. So
-    /// does a container member already claimed at the child path: the
-    /// literal member came first, so the child yields to it. When the
-    /// image comes first, the claim made here makes the later literal
-    /// member the collision, so archive order never silently overwrites
-    /// either artifact.
-    fn metadata_collides(&mut self, source_path: &str) -> bool {
-        let child_path = metadata_child_path(source_path);
+    /// A real walked source in the `.d/` namespace occupies it. So does
+    /// a container member already claimed at the child path: the literal
+    /// member came first, so the child yields to it. When the source
+    /// comes first, the claim made here makes the later literal member
+    /// the collision, so archive order never silently overwrites either
+    /// artifact.
+    fn leg_collides(&mut self, leg: ChildLeg, source_path: &str) -> bool {
+        let child_path = leg.child_path(source_path);
         self.expansion_collides(source_path)
             || (self.claim.is_some()
                 && !self
@@ -1026,11 +1267,11 @@ impl Expander<'_> {
                     .insert(collision_key(&child_path)))
     }
 
-    /// Runs the primary OCR leg, then the metadata derived-child leg,
-    /// for one image source, loading the bytes once for both.
-    #[cfg(all(unix, feature = "image-metadata"))]
-    fn convert_image_with_metadata(
+    /// Runs the primary leg, then the auxiliary child leg, for one
+    /// source, loading the bytes once for both.
+    fn convert_leaf_and_child(
         &mut self,
+        leg: ChildLeg,
         mut meta: Meta,
         bytes: UnitBytes,
         started: Instant,
@@ -1042,32 +1283,33 @@ impl Expander<'_> {
             return self.convert_leaf(meta, bytes, started);
         }
         // Load once. A load error means the primary leg records it and no
-        // metadata child is attempted, so route it through the leaf path.
+        // child is attempted, so route it through the leaf path.
         let raw = match bytes.load(&meta.source_hash) {
             Ok(raw) => raw,
             Err(reason) => return self.fail(&meta, reason, started),
         };
-        // Collision guard on the image `.d/` namespace, before the primary
-        // leg records, so the warning rides the parent image record. A
-        // real walked source in the namespace means the metadata leg is
-        // skipped rather than overwriting that source's artifact.
-        let collides = self.metadata_collides(&meta.source_path);
+        // Collision guard on the `.d/` namespace, before the primary leg
+        // records, so the warning rides the parent record. A real walked
+        // source in the namespace means the leg is skipped rather than
+        // overwriting that source's artifact.
+        let collides = self.leg_collides(leg, &meta.source_path);
         if collides {
             meta.detect_warnings
-                .push(convert::image_metadata::IMAGE_METADATA_NAMESPACE_OCCUPIED.to_string());
+                .push(leg.namespace_occupied().to_string());
         }
         let source_path = meta.source_path.clone();
         let format = meta.detection.detected.clone();
         let declared = meta.detection.declared.clone();
         let source_hash = meta.source_hash.clone();
         let source_size = meta.source_size;
-        // The primary OCR leg is the unchanged leaf path. It emits the
-        // parent image record, carrying the collision warning when set.
+        // The primary leg is the unchanged leaf path. It emits the
+        // parent record, carrying the collision warning when set.
         self.convert_leaf(meta, UnitBytes::Mem(raw.clone()), started)?;
         if collides {
             return Ok(());
         }
-        self.run_metadata_leg(
+        self.run_child_leg(
+            leg,
             &source_path,
             &format,
             declared,
@@ -1078,16 +1320,16 @@ impl Expander<'_> {
         )
     }
 
-    /// Runs the metadata child under the claim-and-reconcile machinery,
-    /// so a re-run that finds no metadata retires a prior metadata child.
+    /// Runs one child leg under the claim-and-reconcile machinery, so a
+    /// re-run that finds nothing to write retires the prior child.
     ///
-    /// A top-level image owns a claim over its own `.d/` namespace; an
-    /// image that is itself a container member shares the owning
+    /// A top-level source owns a claim over its own `.d/` namespace; a
+    /// source that is itself a container member shares the owning
     /// container's claim, which already covers the child path.
-    #[cfg(all(unix, feature = "image-metadata"))]
     #[allow(clippy::too_many_arguments)]
-    fn run_metadata_leg(
+    fn run_child_leg(
         &mut self,
+        leg: ChildLeg,
         source_path: &str,
         format: &str,
         declared: Option<String>,
@@ -1105,7 +1347,8 @@ impl Expander<'_> {
                 collisions: 0,
             });
         }
-        let result = self.emit_metadata_child(
+        let result = self.emit_child(
+            leg,
             source_path,
             format,
             declared,
@@ -1120,14 +1363,16 @@ impl Expander<'_> {
         result
     }
 
-    /// Converts the metadata child and emits its record. Zero rows is the
-    /// not-applicable outcome: nothing is written and reconciliation
-    /// retires any prior child. A malformation records one failed child
-    /// with a machine-readable reason and no artifact.
-    #[cfg(all(unix, feature = "image-metadata"))]
+    /// Converts one child and emits its record. Nothing to write is the
+    /// leg's own not-applicable outcome: no record and no files, and
+    /// reconciliation retires any prior child. Every other failure
+    /// records one failed child with a machine-readable reason and no
+    /// artifact, so a configured provider that cannot run is a failure
+    /// on the record rather than a silently missing child.
     #[allow(clippy::too_many_arguments)]
-    fn emit_metadata_child(
+    fn emit_child(
         &mut self,
+        leg: ChildLeg,
         source_path: &str,
         format: &str,
         declared: Option<String>,
@@ -1136,13 +1381,11 @@ impl Expander<'_> {
         raw: &[u8],
         started: Instant,
     ) -> Result<()> {
-        let child_path = metadata_child_path(source_path);
+        let child_path = leg.child_path(source_path);
         let (text_absolute, segments_absolute, text_relative) = self.artifact_paths(&child_path);
         let converter = self
-            .rules
-            .registry
-            .image_metadata_converter()
-            .expect("the metadata leg runs only when the converter is present");
+            .leg_converter(leg)
+            .expect("a leg runs only when its converter is present");
         let detection = Detection {
             declared,
             detected: format.to_string(),
@@ -1177,11 +1420,10 @@ impl Expander<'_> {
                         self.emit(record)
                     }
                     Err(detail) => {
+                        let (id, version) = leg.converter_identity();
                         let mut record = self.base_record(&child_meta, Status::Failed);
-                        record.converter_id =
-                            Some(convert::image_metadata::IMAGE_METADATA_ID.to_string());
-                        record.converter_version =
-                            Some(convert::image_metadata::IMAGE_METADATA_VERSION.to_string());
+                        record.converter_id = Some(id.to_string());
+                        record.converter_version = Some(version.to_string());
                         record.error = Some(format!("mirror_write_error: {detail}"));
                         record.duration_ms = Some(elapsed_ms(started));
                         remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
@@ -1189,18 +1431,17 @@ impl Expander<'_> {
                     }
                 }
             }
-            Err(reason)
-                if reason.starts_with(convert::image_metadata::IMAGE_METADATA_NOT_APPLICABLE) =>
-            {
-                // No textual metadata: write nothing. A prior child, if
-                // any, is retired by the owning reconciliation.
+            Err(reason) if leg.is_nothing_to_write(&reason) => {
+                // Nothing to write: no record and no files. A prior
+                // child, if any, is retired by the owning
+                // reconciliation.
                 Ok(())
             }
             Err(reason) => {
+                let (id, version) = leg.converter_identity();
                 let mut record = self.base_record(&child_meta, Status::Failed);
-                record.converter_id = Some(convert::image_metadata::IMAGE_METADATA_ID.to_string());
-                record.converter_version =
-                    Some(convert::image_metadata::IMAGE_METADATA_VERSION.to_string());
+                record.converter_id = Some(id.to_string());
+                record.converter_version = Some(version.to_string());
                 record.error = Some(reason);
                 record.duration_ms = Some(elapsed_ms(started));
                 remove_stale_artifact(&text_absolute, &segments_absolute, &mut record);
@@ -2205,7 +2446,7 @@ extensions = ["ocrfmt"]
                 (Box::new(OcrKindConverter), vec!["ocrfmt"]),
             ],
         );
-        Rules { table, registry }
+        Rules::from_parts(table, registry).unwrap()
     }
 
     #[test]

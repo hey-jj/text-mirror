@@ -24,7 +24,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::jail::{JailBackend, RuntimeProfile, SpawnSpec};
+use super::jail::{JailBackend, ProviderJail, RuntimeProfile, SpawnSpec};
 use super::{Runner, RunnerError};
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -48,12 +48,118 @@ const ACCELERATOR_OPEN_LINE: &str =
 /// The device property-read line the same measurement required.
 const ACCELERATOR_PROPERTIES_LINE: &str = "(allow iokit-get-properties)\n";
 
+/// The provider jail profile, as one template whose only substitutions
+/// are the per-run jail, the worker binary, the deployment's measured
+/// closures, and the deployment's service namespace.
+///
+/// This is the profile the provider spike measured, with three
+/// deliberate differences, each recorded with the pin:
+///
+/// - The closure subpaths and the service expression are placeholders
+///   filled from the deployment configuration, because both name an
+///   installed product and this crate carries no product name.
+/// - The worker binary is granted execute and read, because the
+///   provider runs through the same two-stage spawn as every other
+///   adapter rather than as a bare external process, so it inherits the
+///   resource limits, the descriptor sweep, the process group, the
+///   output caps, and the wall clock.
+/// - The exec allowance names the worker and the closures, which is
+///   what the two spike parameters resolved to.
+///
+/// Everything else is byte for byte the measured profile. A test pins
+/// this template's own BLAKE3, so any edit fails there and has to be
+/// re-measured and re-approved rather than shipped quietly.
+///
+/// Two allowances are wider than a literal grant and are recorded with
+/// the pin as the widest surface this jail keeps: device access is
+/// unscoped, because scoping it to any
+/// user-client class crashed the renderer in measurement, and the
+/// closures are readable as subpaths rather than as literal files. The
+/// aggregate closure digest the worker asserts before every execution
+/// is the integrity control that stands in for that granularity.
+const PROVIDER_PROFILE_TEMPLATE: &str = r#"(version 1)
+(deny default)
+(deny network*)
+(allow network-bind network-outbound
+  (subpath "{jail}"))
+(allow process-fork)
+(allow process-exec*
+  (literal "{worker}")
+{closures})
+(allow signal (target same-sandbox))
+(import "dyld-support.sb")
+(allow file-read-metadata)
+(allow sysctl-read)
+(allow system-sched)
+(allow ipc-posix-shm*)
+(allow mach-lookup)
+(allow mach-bootstrap)
+{service}(allow iokit-open)
+(allow file-read* file-map-executable
+  (literal "{worker}")
+{closures}  (subpath "/usr/lib")
+  (subpath "/System")
+  (subpath "/dev/fd"))
+(allow file-read*
+  (literal "/dev/urandom")
+  (literal "/dev/random")
+  (literal "/dev/null")
+  (subpath "/System/Library/Fonts")
+  (subpath "/Library/Fonts"))
+(allow file-write-data (literal "/dev/null"))
+(allow file-read* file-write* (subpath "{jail}"))
+"#;
+
+/// Renders the provider profile for one invocation.
+fn provider_profile(
+    jail: &str,
+    worker: &str,
+    provider: &ProviderJail,
+    grant_lines: &str,
+) -> Result<String, RunnerError> {
+    let refuse = |message: String| RunnerError {
+        code: "sandbox_unavailable",
+        message,
+    };
+    let mut closures = Vec::new();
+    for path in &provider.closures {
+        let text = path
+            .to_str()
+            .ok_or_else(|| refuse(format!("closure path {} is not UTF-8", path.display())))?;
+        if text.contains('"') || text.contains('\\') {
+            return Err(refuse(format!(
+                "closure path {text:?} cannot be quoted in a jail profile"
+            )));
+        }
+        closures.push(format!("  (subpath \"{text}\")\n"));
+    }
+    let service = match &provider.service_prefix {
+        Some(prefix) => {
+            if prefix.contains('"') || prefix.contains('\n') {
+                return Err(refuse(
+                    "the provider service expression cannot be quoted in a jail profile"
+                        .to_string(),
+                ));
+            }
+            format!("(allow mach-register (global-name-regex #\"{prefix}\"))\n")
+        }
+        None => String::new(),
+    };
+    let rendered = PROVIDER_PROFILE_TEMPLATE
+        .replace("{jail}", jail)
+        .replace("{worker}", worker)
+        .replace("{closures}", &closures.concat())
+        .replace("{service}", &service);
+    Ok(format!("{rendered}{grant_lines}"))
+}
+
 fn profile(
     jail: &Path,
     worker: &Path,
     exec_grants: &[std::path::PathBuf],
     read_grants: &[std::path::PathBuf],
     runtime_profile: RuntimeProfile,
+    provider: Option<&ProviderJail>,
 ) -> Result<String, RunnerError> {
     let literal = |path: &Path| -> Result<String, RunnerError> {
         let text = path.to_str().ok_or_else(|| RunnerError {
@@ -134,6 +240,21 @@ fn profile(
         grant_lines.push_str(ACCELERATOR_PROPERTIES_LINE);
         grant_lines.push_str(ACCELERATOR_OPEN_LINE);
     }
+    // The provider class renders its own measured profile. The class
+    // is the authorization and the wired components are the necessity:
+    // the widened profile appears only when the class arrives together
+    // with an executable grant and the deployment's measured
+    // parameters, so no other worker mode can reach these allowances.
+    if runtime_profile == RuntimeProfile::Provider {
+        let Some(provider) = provider.filter(|_| !exec_grants.is_empty()) else {
+            return Err(RunnerError {
+                code: "sandbox_unavailable",
+                message: "the provider jail class needs a wired provider, refusing the run"
+                    .to_string(),
+            });
+        };
+        return provider_profile(&jail, &worker, provider, &grant_lines);
+    }
     // Deny by default. Grant only the mach, sysctl, and loader
     // allowances a process needs to reach main, execute and read the
     // worker, read the fixed runtime trees, read and write the jail,
@@ -193,6 +314,7 @@ impl JailBackend for SeatbeltJail {
                 spec.exec_grants,
                 spec.read_grants,
                 spec.runtime_profile,
+                spec.provider,
             )?)
             .arg(spec.worker)
             .arg("sandbox-helper")
@@ -279,6 +401,15 @@ mod tests {
     const DEVICE_LINES: &str = "(allow iokit-get-properties)\n(allow iokit-open (iokit-user-client-class \"AGXDeviceUserClient\"))\n";
 
     fn render(exec: &[&str], read: &[&str], runtime_profile: RuntimeProfile) -> String {
+        render_with(exec, read, runtime_profile, None).expect("the fixed paths render")
+    }
+
+    fn render_with(
+        exec: &[&str],
+        read: &[&str],
+        runtime_profile: RuntimeProfile,
+        provider: Option<&ProviderJail>,
+    ) -> Result<String, RunnerError> {
         let exec: Vec<PathBuf> = exec.iter().map(PathBuf::from).collect();
         let read: Vec<PathBuf> = read.iter().map(PathBuf::from).collect();
         profile(
@@ -287,8 +418,146 @@ mod tests {
             &exec,
             &read,
             runtime_profile,
+            provider,
         )
-        .expect("the fixed paths render")
+    }
+
+    /// The provider profile a wired provider renders, byte for byte,
+    /// for fixed paths. A literal, not a re-rendering, so any drift in
+    /// the shape fails here instead of moving the expectation with it.
+    const PROVIDER_0_7_0: &str = r#"(version 1)
+(deny default)
+(deny network*)
+(allow network-bind network-outbound
+  (subpath "/jail/run"))
+(allow process-fork)
+(allow process-exec*
+  (literal "/opt/worker/text-mirror-worker")
+  (subpath "/deploy/closure")
+)
+(allow signal (target same-sandbox))
+(import "dyld-support.sb")
+(allow file-read-metadata)
+(allow sysctl-read)
+(allow system-sched)
+(allow ipc-posix-shm*)
+(allow mach-lookup)
+(allow mach-bootstrap)
+(allow mach-register (global-name-regex #"^ex\.ample\."))
+(allow iokit-open)
+(allow file-read* file-map-executable
+  (literal "/opt/worker/text-mirror-worker")
+  (subpath "/deploy/closure")
+  (subpath "/usr/lib")
+  (subpath "/System")
+  (subpath "/dev/fd"))
+(allow file-read*
+  (literal "/dev/urandom")
+  (literal "/dev/random")
+  (literal "/dev/null")
+  (subpath "/System/Library/Fonts")
+  (subpath "/Library/Fonts"))
+(allow file-write-data (literal "/dev/null"))
+(allow file-read* file-write* (subpath "/jail/run"))
+(allow process-exec* file-read* file-map-executable (literal "/deploy/engine-cli"))
+"#;
+
+    fn provider(closures: &[&str], service: Option<&str>) -> ProviderJail {
+        ProviderJail {
+            closures: closures.iter().map(PathBuf::from).collect(),
+            service_prefix: service.map(str::to_string),
+            temp_env: None,
+        }
+    }
+
+    #[test]
+    fn the_provider_profile_template_is_pinned_to_its_own_bytes() {
+        // The profile is a measured artifact, not a convenience. Its
+        // bytes are pinned here so an edit fails this test and has to
+        // be measured and approved rather than shipped quietly.
+        assert_eq!(
+            crate::hash::hash_bytes(PROVIDER_PROFILE_TEMPLATE.as_bytes()),
+            "fdce10dadcf9d41b2cb12346d0ab8bf13590dae2b88b807d357d19f1800cee68"
+        );
+    }
+
+    #[test]
+    fn a_wired_provider_renders_the_measured_profile_byte_for_byte() {
+        let rendered = render_with(
+            &["/deploy/engine-cli"],
+            &[],
+            RuntimeProfile::Provider,
+            Some(&provider(&["/deploy/closure"], Some(r"^ex\.ample\."))),
+        )
+        .expect("the fixed paths render");
+        assert_eq!(rendered, PROVIDER_0_7_0, "{rendered}");
+        // The class carries no allowance measured for a different
+        // engine: the device pair the accelerator class emits is not
+        // this profile's, and the scoped user-client class never
+        // appears here.
+        assert!(!rendered.contains("iokit-get-properties"), "{rendered}");
+        assert!(!rendered.contains("iokit-user-client-class"), "{rendered}");
+        assert!(!rendered.contains("file-read-data"), "{rendered}");
+    }
+
+    #[test]
+    fn the_provider_profile_omits_what_the_deployment_did_not_configure() {
+        // No service namespace configured means no registration
+        // allowance at all, and no closure means no subpath grant: the
+        // profile grants what was measured and nothing by default.
+        let rendered = render_with(
+            &["/deploy/engine-cli"],
+            &[],
+            RuntimeProfile::Provider,
+            Some(&provider(&[], None)),
+        )
+        .expect("the fixed paths render");
+        assert!(!rendered.contains("mach-register"), "{rendered}");
+        assert!(!rendered.contains("subpath \"/deploy"), "{rendered}");
+        // The jail, the worker, and the literal grant are still there.
+        assert!(rendered.contains("(subpath \"/jail/run\")"), "{rendered}");
+        assert!(rendered.contains("/deploy/engine-cli"), "{rendered}");
+    }
+
+    #[test]
+    fn the_provider_class_renders_nothing_without_a_wired_provider() {
+        // The class is the authorization and the wiring is the
+        // necessity. Neither alone renders the widened profile: with
+        // no provider parameters, or with no executable grant, the
+        // backend refuses instead of falling back to something else.
+        let error = render_with(&["/deploy/engine-cli"], &[], RuntimeProfile::Provider, None)
+            .expect_err("an unwired provider class must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+        let error = render_with(
+            &[],
+            &[],
+            RuntimeProfile::Provider,
+            Some(&provider(&["/deploy/closure"], None)),
+        )
+        .expect_err("a grant-free provider class must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+    }
+
+    #[test]
+    fn a_provider_path_that_cannot_be_quoted_refuses_the_run() {
+        for closure in ["/deploy/quote\"mark", "/deploy/back\\slash"] {
+            let error = render_with(
+                &["/deploy/engine-cli"],
+                &[],
+                RuntimeProfile::Provider,
+                Some(&provider(&[closure], None)),
+            )
+            .expect_err("an unquotable closure must refuse");
+            assert_eq!(error.code, "sandbox_unavailable");
+        }
+        let error = render_with(
+            &["/deploy/engine-cli"],
+            &[],
+            RuntimeProfile::Provider,
+            Some(&provider(&["/deploy/closure"], Some("bad\"expression"))),
+        )
+        .expect_err("an unquotable service expression must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
     }
 
     #[test]

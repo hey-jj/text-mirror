@@ -24,7 +24,7 @@ use landlock::{
 use nix::libc;
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
 
-use super::jail::{JailBackend, SpawnSpec};
+use super::jail::{JailBackend, RuntimeProfile, SpawnSpec};
 use super::{Runner, RunnerError};
 
 /// The Landlock ABI this backend requires in full.
@@ -56,6 +56,17 @@ impl JailBackend for NamespaceJail {
     }
 
     fn command(&self, spec: &SpawnSpec<'_>) -> Result<Command, RunnerError> {
+        // The provider jail is a measured macOS profile. No provider
+        // profile has been measured for this platform, so the class is
+        // refused here rather than silently running the external
+        // components under the base policy.
+        if spec.runtime_profile == RuntimeProfile::Provider {
+            return Err(RunnerError {
+                code: "sandbox_unavailable",
+                message: "no provider jail profile is measured for this platform, refusing the run"
+                    .to_string(),
+            });
+        }
         let mut command = Command::new(spec.worker);
         command
             .arg("sandbox-helper")

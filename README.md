@@ -42,9 +42,72 @@ A default build records a png, jpeg, or webp source as `unsupported` with reason
 |---|---|
 | png, jpeg, webp | In-jail pixel OCR through the `image-pixel-ocr` converter. The deployment supplies the engine. A build with `image-ocr` on decodes the raster and fails closed with `image-ocr-runtime-missing` until the engine is configured. |
 | heic | Fails closed with reason `no-jailed-rasterizer`. Decoding needs an external rasterizer, and the external-rasterizer provider is not built in this release. |
-| svg | The raw markup passes through as the text artifact. No pixel OCR runs. |
+| svg | The raw markup passes through as the text artifact. With the optional `svg-provider` feature built and a provider configured, the rendered form is additionally recognized and recorded as a visible child at `<source>.d/#image-ocr`. Without both, no OCR runs and nothing about the source's own artifact changes. |
 | ai | The PDF text layer is extracted through `pdf-subprocess`. A legacy PostScript-backed file has no PDF text layer and fails closed with a pdf-family reason. |
 | tiff | Recorded as `unsupported` with reason `engine-unpinned` until a rules bump pins a decoder. |
+
+### The svg provider
+
+Pixel OCR for a vector source needs something that can render it, and
+nothing in this crate can. The `svg-provider` feature, off by default
+and building on `image-ocr`, adds the leg that hands the source to two
+executables a deployment supplies: one that renders it to a raster and
+one that flattens that raster onto white. Both are named by generic
+role label, bound by BLAKE3 and exact version, and run inside a jail
+measured for them. The jailed worker repeats every assertion before
+each execution.
+
+```
+cargo build --release --features svg-provider
+text-mirror run <root> --mirror <mirror> --manifest <manifest> --division <name> \
+  --provider-config provider.toml
+```
+
+```toml
+schema = "text-mirror/provider@1"
+
+[providers.svg."raster-browser"]
+path = "/deployment/path/to/renderer"
+closure_root = "/deployment/path/to/renderer-closure"
+jail_service_prefix = "^com\\.example\\.Product\\."
+jail_temp_env = "EXAMPLE_TMPDIR"
+
+[providers.svg."raster-magick"]
+path = "/deployment/path/to/encoder"
+closure_root = "/deployment/path/to/encoder-closure"
+```
+
+The file carries paths and jail parameters only. What the worker
+asserts about each executable, its BLAKE3, its exact version, and the
+aggregate digest over its closure, is versioned rules data in the
+`[image_ocr.svg_provider]` section, pinned per role label like every
+other engine expectation this crate carries.
+
+The configuration also carries the two jail parameters the components
+need: the service namespace their runtime registers under, written as
+an anchored dotted prefix, and the name of an extra temp-directory
+variable. Both have closed shapes and a value outside them refuses the
+run before the walk starts. Both are part of the jail's identity: the
+profile was measured with one set of values, and supplying others
+gives a jail nobody has measured with them.
+
+The provider is opt-in twice: without the feature, and without a
+complete configuration, a vector source converts exactly as it does
+today and no child is written. A configured provider that cannot run
+records a failed child naming the role and the reason, one of
+`rasterizer-missing`, `rasterizer-hash-drift`,
+`rasterizer-version-drift`, `raster-exec-failed`,
+`raster-geometry-mismatch`, or `encoder-area-cap`, and leaves the
+source's own artifact untouched. Configuring a provider changes the
+effective rules version to `10+svg.<digest>` over what the
+configuration pins, so enabling or repinning one re-runs the affected
+sources and moving an identical installation does not.
+
+Recognition itself is the image-OCR path, so it needs that path's
+engine as well: with the provider wired and no engine configured, the
+child fails with `image-ocr-runtime-missing` after the rendering
+succeeds. heic is unaffected and stays deferred: this release carries
+no heic provider and the schema has no place to configure one.
 
 ## The audio feature
 

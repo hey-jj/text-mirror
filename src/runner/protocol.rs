@@ -600,6 +600,61 @@ pub mod bodies {
         pub duration_seconds: Option<f64>,
     }
 
+    /// One provider component the svg raster worker verifies
+    /// immediately before it executes: a generic role label, the
+    /// deployment-resolved path, the expected BLAKE3 and version, and,
+    /// when the deployment pinned one, the executable closure the
+    /// component loads its helpers from and that closure's aggregate
+    /// digest. The worker re-hashes everything itself, so a swap after
+    /// any parent-side validation still fails closed, and failures name
+    /// the role label only.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SvgRoleEntry {
+        /// Generic role label, such as `raster-browser`.
+        pub role: String,
+        /// Absolute path of the pinned executable.
+        pub path: String,
+        /// Expected lowercase hex BLAKE3 of the executable's bytes.
+        pub expected_blake3: String,
+        /// Exact version string the executable must report.
+        pub version: String,
+        /// Root of the executable closure this component loads from.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub closure_root: Option<String>,
+        /// Expected aggregate digest over that closure.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub closure_blake3: Option<String>,
+        /// An additional environment variable the worker points at the
+        /// jail's temp directory for this component.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub jail_temp_env: Option<String>,
+    }
+
+    /// Request body for the `svg-raster` adapter.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SvgRasterRequest {
+        /// Input file name inside the jail.
+        pub input: String,
+        /// The provider components, in verification order.
+        pub roles: Vec<SvgRoleEntry>,
+    }
+
+    /// Success body for the `svg-raster` adapter: the flattened raster
+    /// as lowercase hex, with the dimensions the geometry assertion
+    /// already accepted.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SvgRasterOk {
+        /// The flattened raster's bytes, lowercase hex.
+        pub raster_png_hex: String,
+        /// The flattened raster's width in pixels.
+        pub width: u32,
+        /// The flattened raster's height in pixels.
+        pub height: u32,
+    }
+
     /// Request body for the `video` adapter.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]

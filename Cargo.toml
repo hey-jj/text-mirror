@@ -58,6 +58,15 @@ audio-asr = ["dep:symphonia"]
 # it on so `cargo test` exercises the readers, exactly as it does the
 # records readers and the image decode path above.
 image-metadata = ["dep:kamadak-exif", "dep:png", "dep:img-parts"]
+# Compiles the svg raster provider: the leg that hands a vector source
+# to a deployment's pinned external rasterizer inside a jail measured
+# for it, then feeds the flattened raster to the in-jail pixel-OCR path
+# above. It builds on image-ocr, which owns the decode and the engine.
+# Off by default, and off is not the only gate: even a build that
+# carries it runs the leg only when a deployment supplies a complete
+# provider configuration at run time. Without both, a vector source
+# passes through as its own markup exactly as it always has.
+svg-provider = ["image-ocr"]
 
 [dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -147,4 +156,4 @@ landlock = "=0.4.7"
 seccompiler = "=0.5.0"
 
 [dev-dependencies]
-text-mirror = { path = ".", features = ["test-adapters", "records-worker", "image-ocr", "image-metadata", "audio-asr"] }
+text-mirror = { path = ".", features = ["test-adapters", "records-worker", "image-ocr", "image-metadata", "audio-asr", "svg-provider"] }

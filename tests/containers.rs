@@ -138,10 +138,11 @@ max_expanded_bytes = {max_expanded_bytes}
 max_member_size = {max_member_size}
 "#
     );
-    Rules {
-        table: FormatTable::parse(formats, "formats.toml").unwrap(),
-        registry: Registry::parse(&converters, "converters.toml").unwrap(),
-    }
+    Rules::from_parts(
+        FormatTable::parse(formats, "formats.toml").unwrap(),
+        Registry::parse(&converters, "converters.toml").unwrap(),
+    )
+    .unwrap()
 }
 
 fn docx_bytes() -> Vec<u8> {
@@ -605,10 +606,11 @@ max_children = 1000
 max_expanded_bytes = 8
 max_member_size = 1000
 "#;
-    let rules = Rules {
-        table: FormatTable::parse(formats, "formats.toml").unwrap(),
-        registry: Registry::parse(converters, "converters.toml").unwrap(),
-    };
+    let rules = Rules::from_parts(
+        FormatTable::parse(formats, "formats.toml").unwrap(),
+        Registry::parse(converters, "converters.toml").unwrap(),
+    )
+    .unwrap();
     let message = "From: a@example.com\r\n\
 Content-Type: text/plain\r\n\
 Content-Disposition: attachment; filename=\"big.txt\"\r\n\

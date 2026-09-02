@@ -10,6 +10,16 @@ Drives conversion runs with the `text-mirror` CLI. The agent sequences and repor
 4. `text-mirror bundle`: package the division for handoff once coverage is accepted.
 5. Report coverage: converted, failed, unsupported, and dedup counts against the true denominator from the manifest.
 
+## Optional provider
+
+`text-mirror run --provider-config <file>` wires the external
+rasterizer a deployment supplies. Only then does a vector source gain
+its recognized-text child; without the file, vector sources convert as
+raw markup and no child appears, which is not a failure to report.
+Configuring a provider changes the rules version, so the first run
+after enabling one re-converts every vector source rather than
+skipping it.
+
 ## Rules
 
 - Never treat a failed or unsupported record as done. Every source file ends as a text artifact or an explained manifest record.

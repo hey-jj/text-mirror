@@ -62,6 +62,14 @@ enum Command {
         /// jailed worker re-hashes every file before use.
         #[arg(long)]
         runtime_inventory: Option<PathBuf>,
+        /// A TOML file configuring an external conversion provider:
+        /// per generic role label, the absolute path of the executable
+        /// that fills it, the BLAKE3 the jailed worker re-hashes it
+        /// against, and the exact version it must report. Opt-in and
+        /// deployment-owned: with no file, no provider exists and the
+        /// formats that would use one keep their current handling.
+        #[arg(long)]
+        provider_config: Option<PathBuf>,
     },
     /// Coverage per division over terminal manifest records
     Status {
@@ -120,13 +128,21 @@ fn execute(command: Command) -> Result<String, text_mirror::Error> {
             manifest,
             division,
             runtime_inventory,
+            provider_config,
         } => {
-            let rules = match &runtime_inventory {
-                Some(path) => Rules::builtin_with_inventory(
-                    &text_mirror::convert::RuntimeInventory::load(path)?,
-                )?,
-                None => Rules::builtin()?,
+            // Both files are deployment data and both are validated
+            // before the walk starts, so a malformed or incomplete one
+            // refuses the run rather than surfacing as per-source
+            // failures halfway through a division.
+            let inventory = match &runtime_inventory {
+                Some(path) => text_mirror::convert::RuntimeInventory::load(path)?,
+                None => text_mirror::convert::RuntimeInventory::empty(),
             };
+            let provider = match &provider_config {
+                Some(path) => Some(text_mirror::convert::provider::ProviderConfig::load(path)?),
+                None => None,
+            };
+            let rules = Rules::builtin_with_runtime(&inventory, provider.as_ref())?;
             let report = pipeline::run(
                 &rules,
                 &RunOptions {

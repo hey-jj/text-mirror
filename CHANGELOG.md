@@ -8,6 +8,87 @@ Versioning.
 
 ### Added
 
+- An optional svg raster leg, gated behind a new `svg-provider`
+  feature that builds on `image-ocr`. A vector source keeps the
+  passthrough primary it has always had, and a deployment that
+  configures an external rasterizer additionally gets the recognized
+  text of the source's rendering as a visible derived child at
+  `<source>.d/#image-ocr`, attributed to `image-pixel-ocr` with
+  `artifact_kind: "ocr"` and spans labelled `source: "ocr"`. With no
+  provider configured there is no child, no child directory, and no
+  change of any kind to the source's own artifact, which is every
+  default run. A source whose rendering holds no readable text writes
+  no child either. `manifest@1` is unchanged: the child reuses the
+  derived-child record shape a container member already uses.
+- A deployment-owned provider configuration, supplied through the new
+  `--provider-config` flag on `text-mirror run` and the new
+  `ProviderConfig` type. It names, per generic role label, the
+  absolute path of the executable that fills it, the closure it loads
+  helpers from, and the two jail parameters its runtime needs: the
+  service namespace it registers under, written as an anchored dotted
+  prefix, and the name of an extra temp-directory variable. Both
+  parameters have closed shapes, and a value outside them refuses the
+  run with `provider-parameter-invalid` before the walk starts, so a
+  supplied value cannot widen the jail beyond the names under one
+  prefix. What the worker asserts about each executable, the BLAKE3,
+  the exact version, and the aggregate closure digest, is versioned
+  rules data in the new `[image_ocr.svg_provider]` section, pinned per
+  role label like every other engine expectation. The crate ships no
+  path and no default. The schema
+  is `text-mirror/provider@1`, carries exactly one provider with
+  exactly two roles, `raster-browser` and `raster-magick`, and refuses
+  unknown fields, so a configuration naming another provider or
+  another role is a run configuration error raised before the walk. It
+  is never a silently ignored table.
+- A provider jail class: a separate measured profile for the external
+  components, which spawn helper processes, load a larger runtime
+  closure, and register their own services. It shares nothing with the
+  accelerator class, and its allowances key on the class together with
+  the wired components, so no other worker mode can reach them. The
+  class holds every control the narrower classes hold: no egress on
+  any address family, no read or write outside the per-run jail, no
+  execution of an undeclared program, no inherited environment, no
+  process left behind at the deadline, and a fresh working root per
+  execution, which is where a component's profile state lives because
+  no profile flag is ever passed. Those controls are permanent tests
+  that run against a synthetic closure, so they hold wherever the
+  class is built, not only where an installation exists. The class is
+  refused on platforms with no measured profile for it.
+- The complete provider reason vocabulary, every value static and
+  naming a generic role label only: `rasterizer-missing`,
+  `rasterizer-hash-drift`, `rasterizer-version-drift`,
+  `raster-exec-failed`, `raster-geometry-mismatch`, and
+  `encoder-area-cap`. A configured provider that cannot run records a
+  failed child, never an unsupported one, and no path, product name,
+  version output, or host identity reaches a record.
+- Per-execution verification in the cold jailed worker: presence, a
+  fresh BLAKE3, the aggregate closure digest, and the exact version.
+  Each assertion runs before its own execution, not once for the pair,
+  so a component swapped between the two still fails closed. The rendered raster must then match the source's declared
+  aspect within one pixel on both cross-axis derivations and sit under
+  the encoder-input area cap before the flatten runs, and the
+  flattened raster must keep the dimensions the assertion accepted.
+  The flatten always carries the ordered options ending in the
+  metadata-chunk exclusion, without which the raster is not
+  byte-stable across cold starts.
+- Explicit geometry resolution for vector sources: the declared root
+  size in absolute units, or the view box, decides the render size.
+  Percentages and font- and viewport-relative units resolve against
+  nothing this leg has. They fail closed with
+  `raster-geometry-mismatch`, so no host default viewport ever decides
+  the render size.
+- The effective rules version. `Rules::version()` yields the numeric
+  rules version alone with no provider configured, and that version
+  plus a digest of the provider's identity with one, as
+  `10+svg.<digest>`. The digest covers provider presence, the generic
+  role labels, the rules-pinned hashes and versions, the adapter
+  version,
+  and the geometry and flatten options, and excludes every absolute
+  path, so enabling, disabling, or repinning a provider re-runs the
+  affected sources while moving an identical installation skips
+  nothing. `manifest@1` is unchanged: `rules_version` was already a
+  string field.
+
 - An in-jail audio transcription converter for wav, mp3, flac, and
   m4a, gated behind a new `audio-asr` feature. The source is decoded
   by the pure-Rust symphonia crate inside the subprocess sandbox into
@@ -99,6 +180,31 @@ Versioning.
 
 ### Changed
 
+- The `image-pixel-ocr` converter moves from 1.0.0 to 1.1.0: the same
+  converter gained the svg input route and the child-specific segment
+  source. Direct png, jpeg, and webp conversion is unchanged, spans
+  included, but the version is part of the checkpoint key, so every
+  existing raster OCR record re-runs once under this release.
+- A build without the `svg-provider` feature that is nonetheless given
+  a provider configuration records the warning
+  `svg-provider-not-built` on each vector source, so a deployment that
+  asked for the leg is told the binary cannot run it.
+- A source that previously ran an auxiliary derived-child leg and no
+  longer does now retires the child it used to own, the same way a
+  re-expanded container retires a member it no longer holds. Turning a
+  provider off removes its children instead of leaving them behind
+  with nothing to produce them.
+- The public `Rules` struct gained private fields, so it can no longer
+  be built with a struct literal. The new `Rules::from_parts`
+  constructor takes a format table and a registry and is the
+  replacement for that. The public jail `SpawnSpec` gained a
+  `provider` field and the public `RuntimeProfile` gained a `Provider`
+  variant, so external code that constructs the first exhaustively or
+  matches the second exhaustively must account for them. The
+  public `ImageOcrLimits` struct gained an `svg_provider` map of the
+  provider pins. The image-OCR ceilings `IMAGE_OCR_MAX_AREA_PX`,
+  `IMAGE_OCR_VALIDATED_LONG_EDGE`, and `IMAGE_OCR_DECODE_ALLOC` moved
+  up to the `convert` module, where the provider leg also reads them.
 - The rules version moves from 9 to 10. Every record whose format
   routing changed, the audio family above all, re-runs once under
   this release.

@@ -45,30 +45,15 @@ use image::{ExtendedColorType, ImageEncoder, ImageFormat, ImageReader, Limits, R
 
 use crate::runner::protocol::bodies::{InventoryEntry, OcrInput, OcrOk, OcrRequest, OcrSpan};
 
-/// The ruled encoder-input area cap: 1536 * 1536 = 2.36 MP, the
-/// validated-safe ceiling. Applied uniformly to every image fed to the
-/// engine, because the hazard is encoder-side and degenerates on
-/// oversized area, not on any single dimension.
-pub const IMAGE_OCR_MAX_AREA_PX: u64 = 2_359_296;
+use crate::convert::{
+    IMAGE_OCR_DECODE_ALLOC, IMAGE_OCR_MAX_AREA_PX, IMAGE_OCR_VALIDATED_LONG_EDGE,
+};
 
-/// The largest single edge the engine was validated against. An input
-/// under the area cap but with a longer edge is legal by area and must
-/// not fail; it logs one note for validation and proceeds.
-pub const IMAGE_OCR_VALIDATED_LONG_EDGE: u32 = 1600;
-
-/// Decode-time allocation guard: one layer of a layered containment,
-/// not a single invariant. Three independent limits bound this path.
-/// The parent's source-bytes ceiling bounds the bytes that stage into
-/// the jail; this guard bounds the decoder's working pixel buffers; and
-/// the area cap bounds the encoder input. This guard's job is only the
-/// middle layer: it caps the decoder against a decompression bomb whose
-/// declared dimensions the area preflight has not yet seen. The largest
-/// in-scope raster is the area cap at 4 bytes per pixel, about 9 MiB, so
-/// this value leaves room for the decoded buffer plus codec scratch
-/// while refusing a bomb demanding hundreds of megabytes. It is not the
-/// jail's address-space limit and not the area cap; each of the three
-/// fails closed on its own.
-pub const IMAGE_OCR_DECODE_ALLOC: u64 = 64 * 1024 * 1024;
+/// The square raster edge at which the fake recognition returns
+/// whitespace, so the content-free outcome is reachable deterministically
+/// from a fixture rather than from a real engine's silence.
+#[cfg(feature = "test-adapters")]
+const FAKE_BLANK_EDGE: u32 = 7;
 
 /// A recognition failure with a stable reason code. The message never
 /// embeds a path, host, endpoint, or device identity.
@@ -247,6 +232,16 @@ fn encode_png(rgb: &RgbImage) -> Result<Vec<u8>, ImageOcrError> {
 #[cfg(feature = "test-adapters")]
 fn recognize_pixels_fake(rgb: &RgbImage) -> Result<Vec<OcrSpan>, ImageOcrError> {
     let _canonical = encode_png(rgb)?;
+    // The deterministic blank response: a raster of exactly this square
+    // edge recognizes as whitespace, so a test can drive the
+    // well-formed-but-content-free outcome through the whole stack the
+    // way the audio fake drives its zero-segment response.
+    if rgb.width() == FAKE_BLANK_EDGE && rgb.height() == FAKE_BLANK_EDGE {
+        return Ok(vec![OcrSpan {
+            text: "   ".to_string(),
+            confidence: 0.99,
+        }]);
+    }
     let digest = crate::hash::hash_bytes(rgb.as_raw());
     Ok(vec![
         OcrSpan {
@@ -320,13 +315,12 @@ mod runtime {
     /// the provider build (see the provider-surface note below).
     pub(super) const CORE_ROLES: [&str; 5] = crate::convert::IMAGE_OCR_ROLE_LABELS;
 
-    // Provider-surface TODO (carried obligation): the gated external
-    // rasterizer build verifies eight roles, not five. It extends the
-    // inventory above with the three raster-provider roles `raster-ql`,
-    // `raster-magick`, and `raster-sips`, each a generic role label. The
-    // core ships no rasterizer, so it deliberately scopes verification to
-    // the five core roles; the provider build owns extending it to all
-    // eight.
+    // The external provider verifies its own roles, `raster-browser`
+    // and `raster-magick`, in its own worker and against its own
+    // configuration, because they are deployment data rather than
+    // pinned rules data. This inventory stays the five core roles: the
+    // direct raster path must never require a rasterizer it does not
+    // use.
 
     /// A short, scrub-clean marker for the one behavior this core does
     /// not yet carry: the live-engine recognition and the proof that it
@@ -807,9 +801,10 @@ mod tests {
 
     #[test]
     fn the_inventory_is_scoped_to_the_five_core_roles() {
-        // The core ships no rasterizer, so it verifies exactly the five
-        // core roles; the three raster-provider roles are the gated
-        // provider build's carried obligation.
+        // The direct raster path verifies exactly the five core roles.
+        // The external provider's own roles are verified by the
+        // provider worker against the deployment's configuration, and
+        // never required here.
         assert_eq!(CORE_ROLES.len(), 5);
         assert!(!CORE_ROLES.iter().any(|role| role.starts_with("raster-")));
     }
