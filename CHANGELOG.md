@@ -83,7 +83,8 @@ Versioning.
   unreadable. The jail profile a worker runs under is an explicit
   class on its spawn spec, and the allowances key on that class
   alone, never on grant presence, so an image worker carrying its own
-  engine grant keeps the base profile. The engine child's
+  engine grant keeps the base profile, and a grant-free jail of any
+  class keeps the base profile. The engine child's
   output streams land in jail-owned files, its home and temp
   directories point into the jail, and the process ceiling is
   applied as headroom above the user's pre-existing process count,

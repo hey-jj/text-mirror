@@ -88,13 +88,15 @@ fn profile(
     //
     // The accelerator allowances below belong to one worker mode, the
     // one that drives the pinned accelerator engine, and the spec
-    // names that class explicitly. All three key on the class ALONE,
-    // never on the presence of an executable grant: grant presence is
-    // what let allowances measured for one engine reach every other
-    // granted worker, so an image worker carrying its own engine
-    // grant renders the base profile plus its literal grant lines and
-    // nothing else.
-    let accelerator = runtime_profile == RuntimeProfile::Accelerator;
+    // names that class explicitly. The class is the authorization, an
+    // executable grant is the necessity; neither alone emits the
+    // allowances. Grant presence by itself is what let allowances
+    // measured for one engine reach every other granted worker, so an
+    // image worker carrying its own engine grant renders the base
+    // profile plus its literal grant lines and nothing else, and the
+    // authorized class with no engine wired has nothing to open and
+    // keeps the base profile too.
+    let accelerator = runtime_profile == RuntimeProfile::Accelerator && !exec_grants.is_empty();
     let mut grant_lines = String::new();
     for path in exec_grants {
         // Measured need: the pinned accelerator engine lists its own
@@ -290,8 +292,11 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_free_plain_jail_renders_the_0_6_0_profile_byte_for_byte() {
+    fn a_grant_free_jail_renders_the_0_6_0_profile_byte_for_byte() {
+        // Both classes: the authorized class with no engine wired has
+        // nothing to open, so it keeps the base profile as well.
         assert_eq!(render(&[], &[], RuntimeProfile::Plain), BASE_0_6_0);
+        assert_eq!(render(&[], &[], RuntimeProfile::Accelerator), BASE_0_6_0);
     }
 
     #[test]
