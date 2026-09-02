@@ -603,7 +603,7 @@ pub mod bodies {
     /// One provider component the svg raster worker verifies
     /// immediately before it executes: a generic role label, the
     /// deployment-resolved path, the expected BLAKE3 and version, and,
-    /// when the deployment pinned one, the executable closure the
+    /// when the deployment pinned one, the enumerated closure the
     /// component loads its helpers from and that closure's aggregate
     /// digest. The worker re-hashes everything itself, so a swap after
     /// any parent-side validation still fails closed, and failures name
@@ -619,7 +619,7 @@ pub mod bodies {
         pub expected_blake3: String,
         /// Exact version string the executable must report.
         pub version: String,
-        /// The enumerated executable closure this component loads
+        /// The enumerated closure this component loads
         /// from: directories and files, each granted as its own
         /// subpath.
         #[serde(skip_serializing_if = "Vec::is_empty", default)]

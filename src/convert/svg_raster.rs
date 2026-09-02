@@ -12,7 +12,7 @@
 //!    present as a regular file, re-hash to its pinned BLAKE3 in this
 //!    cold worker, report exactly its pinned version, and, when the
 //!    deployment pinned one, match the aggregate digest over its whole
-//!    executable closure. The closure digest is the integrity control
+//!    enumerated closure. The closure digest is the integrity control
 //!    that stands in for a finer jail grant: helper and framework
 //!    binaries are readable as a subpath, so the digest is what proves
 //!    they are the validated ones.
@@ -282,9 +282,14 @@ pub(crate) fn flatten_argv(input: &Path, output: &Path) -> Vec<String> {
 /// The aggregate closure digest over one enumerated closure.
 ///
 /// Each entry is digested on its own: a directory by the sorted
-/// relative path and BLAKE3 of every executable file beneath it, a
+/// relative path and BLAKE3 of every regular file beneath it, with a
+/// symlink covered by its relative path and the target it names, a
 /// single file by its own name and BLAKE3, with the pinned launcher
-/// excluded because it is verified separately. The per-entry digests
+/// excluded because it is verified separately. Every regular file is
+/// covered, not only the executables, because a component's policy,
+/// module registry, and resource files decide its behavior as much as
+/// its code does, and the digest is the integrity control over
+/// everything the grant makes reachable. The per-entry digests
 /// are then sorted and combined, so the value depends on the contents
 /// of the closure and not on where it is installed or the order it was
 /// written down in.
@@ -311,14 +316,17 @@ fn entry_digest(root: &Path, launcher: &Path) -> Result<String, SvgRasterError> 
     let unreadable = |detail: &'static str| SvgRasterError::new("rasterizer-hash-drift", detail);
     let metadata = std::fs::symlink_metadata(root)
         .map_err(|_| unreadable("a runtime closure entry cannot be read"))?;
-    let mut rows: Vec<(Vec<u8>, PathBuf)> = Vec::new();
+    let mut rows: Vec<(Vec<u8>, ClosureMember)> = Vec::new();
     if metadata.is_file() {
         // A single-file entry is named by its own file name, so the
         // digest survives the installation moving.
         let name = root
             .file_name()
             .ok_or_else(|| unreadable("a runtime closure entry has no name"))?;
-        rows.push((name.as_encoded_bytes().to_vec(), root.to_path_buf()));
+        rows.push((
+            name.as_encoded_bytes().to_vec(),
+            ClosureMember::File(root.to_path_buf()),
+        ));
     } else {
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -331,28 +339,27 @@ fn entry_digest(root: &Path, launcher: &Path) -> Result<String, SvgRasterError> 
                 let metadata = std::fs::symlink_metadata(&path)
                     .map_err(|_| unreadable("the runtime closure cannot be enumerated"))?;
                 let kind = metadata.file_type();
-                if kind.is_symlink() {
-                    // A symlink is a name, not a member: its target is
-                    // hashed on its own when it lies inside the closure.
-                    continue;
-                }
                 if kind.is_dir() {
                     stack.push(path);
                     continue;
                 }
-                if !kind.is_file() {
-                    continue;
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if metadata.permissions().mode() & 0o111 == 0 {
+                let member = if kind.is_symlink() {
+                    // A symlink is covered by the name it points at, so
+                    // retargeting one moves the digest. It is never
+                    // followed: a target inside the closure is hashed
+                    // as a member of its own, and one outside it is a
+                    // name the jail cannot reach.
+                    let target = std::fs::read_link(&path)
+                        .map_err(|_| unreadable("a runtime closure link cannot be read"))?;
+                    ClosureMember::Link(target.as_os_str().as_encoded_bytes().to_vec())
+                } else if kind.is_file() {
+                    if path == launcher {
                         continue;
                     }
-                }
-                if path == launcher {
+                    ClosureMember::File(path.clone())
+                } else {
                     continue;
-                }
+                };
                 if rows.len() >= MAX_CLOSURE_FILES {
                     return Err(unreadable(
                         "a runtime closure entry holds more files than expected",
@@ -364,24 +371,40 @@ fn entry_digest(root: &Path, launcher: &Path) -> Result<String, SvgRasterError> 
                     .as_os_str()
                     .as_encoded_bytes()
                     .to_vec();
-                rows.push((relative, path));
+                rows.push((relative, member));
             }
         }
     }
     rows.sort();
     let mut hasher = blake3::Hasher::new();
-    for (relative, path) in rows {
-        let hash = crate::hash::hash_file(&path)
-            .map_err(|_| unreadable("a runtime closure member cannot be read"))?;
+    for (relative, member) in rows {
         hasher.update(&relative);
         hasher.update(b"\n");
-        hasher.update(hash.as_bytes());
+        match member {
+            ClosureMember::File(path) => {
+                let hash = crate::hash::hash_file(&path)
+                    .map_err(|_| unreadable("a runtime closure member cannot be read"))?;
+                hasher.update(hash.as_bytes());
+            }
+            ClosureMember::Link(target) => {
+                hasher.update(b"link:");
+                hasher.update(&target);
+            }
+        }
         hasher.update(b"\n");
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// The per-exec assertion order/// The per-exec assertion order, run in this cold worker immediately
+/// A member of a closure entry: a regular file hashed by content, or a
+/// symlink covered by the target it names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ClosureMember {
+    File(PathBuf),
+    Link(Vec<u8>),
+}
+
+/// The per-exec assertion order, run in this cold worker immediately
 /// before every external execution: present, then hash, then closure
 /// digest, then version. Each step has its own named refusal, and the
 /// executable runs only after all of them pass.
@@ -1111,6 +1134,46 @@ mod tests {
         // Adding an entry changes the digest.
         let widened = vec![root.join("libs"), standalone, unrelated];
         assert_ne!(digest, closure_digest(&widened, &launcher).unwrap());
+    }
+
+    #[test]
+    fn every_regular_file_and_symlink_target_is_in_the_digest() {
+        // The digest is the integrity control standing in for grant
+        // granularity, so it covers what the grant makes reachable: a
+        // policy file nobody marked executable, and the target a
+        // symlink names, both move it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let launcher = root.join("launcher");
+        std::fs::write(&launcher, b"launcher").unwrap();
+        std::fs::create_dir_all(root.join("lib/versions/1")).unwrap();
+        let policy = root.join("lib/policy.xml");
+        std::fs::write(&policy, b"<policymap/>").unwrap();
+        let link = root.join("lib/versions/current");
+        std::os::unix::fs::symlink("1", &link).unwrap();
+        let roots = vec![root.join("lib")];
+        let first = closure_digest(&roots, &launcher).unwrap();
+        std::fs::write(&policy, b"<policymap><policy/></policymap>").unwrap();
+        let edited = closure_digest(&roots, &launcher).unwrap();
+        assert_ne!(first, edited);
+        std::fs::write(&policy, b"<policymap/>").unwrap();
+        assert_eq!(first, closure_digest(&roots, &launcher).unwrap());
+        // Retargeting the link, even to a name that does not exist,
+        // moves the digest, and the link is never followed.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("2", &link).unwrap();
+        assert_ne!(first, closure_digest(&roots, &launcher).unwrap());
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("1", &link).unwrap();
+        assert_eq!(first, closure_digest(&roots, &launcher).unwrap());
+        // A link to a tree outside the closure is a name, not a walk.
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("big"), vec![0u8; 1024]).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("lib/elsewhere")).unwrap();
+        let with_link = closure_digest(&roots, &launcher).unwrap();
+        std::fs::write(outside.join("big"), vec![1u8; 1024]).unwrap();
+        assert_eq!(with_link, closure_digest(&roots, &launcher).unwrap());
     }
 
     #[test]

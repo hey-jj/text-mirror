@@ -115,13 +115,14 @@ fn closure_digest(roots: &[PathBuf], launcher: &Path) -> String {
 }
 
 /// One closure entry: a file by its own name, a directory by every
-/// executable file beneath it except the launcher.
+/// regular file beneath it except the launcher, with a symlink covered
+/// by the target it names.
 fn entry_digest(root: &Path, launcher: &Path) -> String {
-    let mut rows: Vec<(Vec<u8>, PathBuf)> = Vec::new();
+    let mut rows: Vec<(Vec<u8>, Member)> = Vec::new();
     if fs::symlink_metadata(root).unwrap().is_file() {
         rows.push((
             root.file_name().unwrap().as_encoded_bytes().to_vec(),
-            root.to_path_buf(),
+            Member::File(root.to_path_buf()),
         ));
         return finish(rows);
     }
@@ -130,43 +131,57 @@ fn entry_digest(root: &Path, launcher: &Path) -> String {
         for entry in fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
             let metadata = fs::symlink_metadata(&path).unwrap();
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
             if metadata.is_dir() {
                 stack.push(path);
                 continue;
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o111 == 0 {
+            let member = if metadata.file_type().is_symlink() {
+                Member::Link(
+                    fs::read_link(&path)
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_vec(),
+                )
+            } else {
+                if path == launcher {
                     continue;
                 }
-            }
-            if path == launcher {
-                continue;
-            }
+                Member::File(path.clone())
+            };
             let relative = path
                 .strip_prefix(root)
                 .unwrap()
                 .as_os_str()
                 .as_encoded_bytes()
                 .to_vec();
-            rows.push((relative, path));
+            rows.push((relative, member));
         }
     }
     finish(rows)
 }
 
-fn finish(mut rows: Vec<(Vec<u8>, PathBuf)>) -> String {
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Member {
+    File(PathBuf),
+    Link(Vec<u8>),
+}
+
+fn finish(mut rows: Vec<(Vec<u8>, Member)>) -> String {
     rows.sort();
     let mut hasher = blake3::Hasher::new();
-    for (relative, path) in rows {
-        let hash = text_mirror::hash::hash_file(&path).unwrap();
+    for (relative, member) in rows {
         hasher.update(&relative);
         hasher.update(b"\n");
-        hasher.update(hash.as_bytes());
+        match member {
+            Member::File(path) => {
+                hasher.update(text_mirror::hash::hash_file(&path).unwrap().as_bytes());
+            }
+            Member::Link(target) => {
+                hasher.update(b"link:");
+                hasher.update(&target);
+            }
+        }
         hasher.update(b"\n");
     }
     hasher.finalize().to_hex().to_string()

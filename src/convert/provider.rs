@@ -2,7 +2,7 @@
 //! wires an external rasterizer into the svg leg.
 //!
 //! Two halves meet here. The expectations, a BLAKE3, an exact version
-//! string, and an aggregate digest over the executable closure, are
+//! string, and an aggregate digest over the enumerated closure, are
 //! versioned rules data, pinned per generic role label in the
 //! `[image_ocr.svg_provider]` section exactly as the audio and image
 //! runtimes pin theirs. The paths are deployment data: a deployment
@@ -79,9 +79,11 @@ pub struct ProviderPin {
     /// output never leaves the worker.
     pub version: String,
     /// Aggregate closure digest over the role's enumerated closure: for
-    /// each entry, the sorted relative path and BLAKE3 of every
-    /// executable file under it with the pinned launcher excluded, then
-    /// the sorted per-entry digests combined. Asserted before every
+    /// each entry, the sorted relative path and BLAKE3 of every regular
+    /// file under it with the pinned launcher excluded, a symlink by
+    /// the target it names, then the sorted per-entry digests combined.
+    /// Every regular file counts, not only the executables, because a
+    /// policy file or a resource decides behavior as much as code does. Asserted before every
     /// execution beside the launcher hash, so a dependency that drifts
     /// while the launcher stands still is refused. Required for any
     /// role whose configuration enumerates a closure.
@@ -99,7 +101,7 @@ pub struct ProviderRole {
     /// data: it never enters the versioned rules, a manifest record, an
     /// error message, or the effective rules version.
     pub path: PathBuf,
-    /// The executable closure this role additionally needs to read and
+    /// The closure this role additionally needs to read and
     /// execute, enumerated: the helper and framework tree beside a
     /// launcher, or the specific library directories and files an
     /// encoder loads. Each entry is granted as its own subpath in the

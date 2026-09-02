@@ -38,7 +38,8 @@ Versioning.
   enumerates a closure must have that closure pinned or the run is
   refused at registry construction. What the worker asserts about each
   executable, the BLAKE3, the exact version, and the aggregate closure
-  digest, is versioned
+  digest over every regular file and symlink target under each
+  enumerated entry, is versioned
   rules data in the new `[image_ocr.svg_provider]` section, pinned per
   role label like every other engine expectation. The crate ships no
   path and no default. The schema

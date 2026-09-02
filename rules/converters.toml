@@ -359,9 +359,10 @@ max_output_bytes = 16777216
 # two jail parameters through the provider configuration; these are the
 # expectations the cold jailed worker re-asserts against each supplied
 # file immediately before every execution: the BLAKE3 of the file, the
-# exact version it reports, and for the rasterizer the aggregate digest
-# over its executable closure, so a helper that drifts while the
-# launcher stands still is refused. A role whose configuration
+# exact version it reports, and the aggregate digest over its
+# enumerated closure, every regular file under each entry and the
+# target of every symlink, so a helper, a policy file, or a resource
+# that drifts while the launcher stands still is refused. A role whose configuration
 # enumerates a closure must be pinned here, or registry construction
 # refuses the run: everything under an enumerated entry is readable and
 # executable inside the jail, so the digest is what makes that grant
@@ -373,9 +374,9 @@ max_output_bytes = 16777216
 [image_ocr.svg_provider."raster-browser"]
 blake3 = "e6cd1c439c4d7f64982c4bb07ffaa4f75ae444d3d1fd25bf44fd30d5af4a8c45"
 version = "151.0.7922.174"
-closure_blake3 = "2b7821bd08e11527984779716cd209218b97abb04a9e406220faaed6c60fcae6"
+closure_blake3 = "241a60ef9aedeb164a3e1ec8b30e7eb9ad9450c97cd9bfe2df6f4ea2afd65cf0"
 
 [image_ocr.svg_provider."raster-magick"]
 blake3 = "42829b87e0ff08d07c551254eb4b83abbd033bc13c574a7f05cec51d0dba5440"
 version = "7.1.2-29"
-closure_blake3 = "44d39985b16d493ac23e398007ebe4b56a15c35a2123792252e4e5e396b6a855"
+closure_blake3 = "8ebb14404dc8be27df3acd5c70c6092d443f27836a589d82960008825e999c9e"

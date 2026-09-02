@@ -100,7 +100,7 @@ pub struct ImageOcrLimits {
     pub inventory: std::collections::BTreeMap<String, String>,
     /// The svg provider pins, keyed by the two provider role labels:
     /// the expected BLAKE3, the exact version, and, for the rasterizer,
-    /// the aggregate digest over its executable closure. Rules data,
+    /// the aggregate digest over its enumerated closure. Rules data,
     /// like every other pinned expectation; the deployment supplies only
     /// paths and jail parameters through the provider configuration.
     /// Empty when the rules pin no provider, which leaves the svg leg
