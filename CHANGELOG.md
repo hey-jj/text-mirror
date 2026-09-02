@@ -40,8 +40,8 @@ Versioning.
   `asr-duration-exceeded`, `asr-decoded-too-large`, `asr-no-speech`,
   `empty_output`, `asr-runtime-missing`, `asr-runtime-mismatch`,
   `asr-backend-unavailable`, and `asr-protocol-error` on records,
-  plus the runner codes `worker-memory-exceeded` and
-  `memory-monitor-failed`.
+  plus the runner codes `worker-memory-exceeded`,
+  `memory-monitor-failed`, and `process-count-unavailable`.
 - m4a admission for the low-complexity AAC profile only, decided by a
   first-party bounded reader over the track's decoder configuration:
   spectral-band replication signaled on the flag bit (the sync word
@@ -85,7 +85,9 @@ Versioning.
   directories point into the jail, and the process ceiling is
   applied as headroom above the user's pre-existing process count,
   so the spawn budget the rules bound stays enforceable on a busy
-  host. The cold worker re-hashes every file against its pinned hash
+  host. A count the host will not answer refuses the spawn with
+  `process-count-unavailable`, never a substituted baseline standing
+  in for the number being bounded. The cold worker re-hashes every file against its pinned hash
   right before preflight and execution, so a swap after parent-side
   validation still fails closed. Failures name role labels only.
 - A flac row in the format table, so flac detects as its own format

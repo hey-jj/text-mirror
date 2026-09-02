@@ -66,12 +66,15 @@ pub struct Limits {
     /// inside the jail. Stdout is a pipe, so the response cap above
     /// is enforced by the parent instead.
     pub file_size_bytes: u64,
-    /// RLIMIT_NPROC for the child. An absolute cap on the process and
-    /// thread count of the mapped real user id, so a compromised
-    /// adapter cannot fork-bomb the host. The default is a modest
-    /// absolute value: the shipped adapter spawns nothing, so on a
-    /// host where the user already runs more tasks than the cap,
-    /// every fork from the adapter fails, which is the intent.
+    /// RLIMIT_NPROC for the child: this invocation's spawn budget, so
+    /// a compromised adapter cannot fork-bomb the host. The limit
+    /// counts every process of the mapped real user id, not just this
+    /// invocation's descendants, so the helper applies the number as
+    /// headroom above the count that already exists at spawn, clamped
+    /// to the hard limit. The semantic is defined there once and
+    /// holds for every profile. A count the host will not answer
+    /// refuses the run with `process-count-unavailable`, never a
+    /// substituted baseline.
     pub max_processes: u64,
     /// Parent-side ceiling on the aggregate resident bytes of the
     /// child's whole process group, engine descendants included. The
@@ -105,8 +108,8 @@ impl Default for Limits {
 /// `worker_not_found`, `adapter_spawn_error`, `adapter_timeout`,
 /// `adapter_frame_oversized`, `adapter_output_overflow`,
 /// `adapter_protocol_error`, `adapter_drain_timeout`,
-/// `adapter_crash`, `worker-memory-exceeded`, and
-/// `memory-monitor-failed`.
+/// `adapter_crash`, `worker-memory-exceeded`,
+/// `memory-monitor-failed`, and `process-count-unavailable`.
 #[derive(Debug, Clone)]
 pub struct RunnerError {
     /// Stable reason code.
@@ -129,6 +132,11 @@ pub const WORKER_BINARY: &str = "text-mirror-worker";
 /// Exit code the sandbox helper uses when jail setup fails, so the
 /// parent can tell a refused jail from an adapter crash.
 pub const SANDBOX_SETUP_EXIT: i32 = 71;
+
+/// Exit code the sandbox helper uses when the real user id's process
+/// count cannot be measured, so the parent can name that refusal
+/// rather than folding it into every other setup failure.
+pub const PROCESS_COUNT_EXIT: i32 = 72;
 
 /// Locates the worker binary beside the current executable, or one
 /// directory up, which covers an installed layout and a build tree.
@@ -560,14 +568,11 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         let stderr_text = String::from_utf8_lossy(&stderr_kept);
         let stderr_text = stderr_text.trim();
         #[cfg(unix)]
-        let setup_failed = status.code() == Some(SANDBOX_SETUP_EXIT);
+        let refusal = helper_refusal(status.code(), stderr_text);
         #[cfg(not(unix))]
-        let setup_failed = false;
-        if setup_failed {
-            return Err(RunnerError {
-                code: "sandbox_unavailable",
-                message: format!("the sandbox helper refused to engage the jail: {stderr_text}"),
-            });
+        let refusal = None;
+        if let Some(error) = refusal {
+            return Err(error);
         }
         return Err(RunnerError {
             code: "adapter_crash",
@@ -609,6 +614,27 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         message: detail,
     })?;
     Ok(response)
+}
+
+/// Interprets a helper exit code that refused before any adapter ran.
+/// A failed jail setup is `sandbox_unavailable`. A process count the
+/// host would not answer is `process-count-unavailable`, kept apart
+/// because a spawn budget whose baseline is unknown is refused, not
+/// guessed at. Any other exit code is the adapter's own.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn helper_refusal(exit: Option<i32>, stderr_text: &str) -> Option<RunnerError> {
+    let (code, refused) = match exit? {
+        SANDBOX_SETUP_EXIT => ("sandbox_unavailable", "refused to engage the jail"),
+        PROCESS_COUNT_EXIT => (
+            "process-count-unavailable",
+            "could not measure the user's process count and refused the spawn",
+        ),
+        _ => return None,
+    };
+    Some(RunnerError {
+        code,
+        message: format!("the sandbox helper {refused}: {stderr_text}"),
+    })
 }
 
 /// Interprets one resident-memory measurement against the ceiling.
@@ -678,6 +704,26 @@ fn exit_detail(status: &std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_helper_refusal_is_named_and_never_folded_into_a_crash() {
+        // A failed jail setup keeps the code it always had.
+        let setup =
+            helper_refusal(Some(SANDBOX_SETUP_EXIT), "detail").expect("a setup exit is a refusal");
+        assert_eq!(setup.code, "sandbox_unavailable");
+        // An unmeasurable process count is named on its own, so the
+        // manifest says why the spawn never happened.
+        let count = helper_refusal(Some(PROCESS_COUNT_EXIT), "the listing is unavailable")
+            .expect("a count exit is a refusal");
+        assert_eq!(count.code, "process-count-unavailable");
+        assert!(
+            count.message.contains("the listing is unavailable"),
+            "{count}"
+        );
+        // Everything else is the adapter's own exit, not a refusal.
+        assert!(helper_refusal(Some(1), "detail").is_none());
+        assert!(helper_refusal(None, "detail").is_none());
+    }
 
     #[test]
     fn the_memory_verdict_kills_over_the_ceiling_and_fails_closed_on_a_query_error() {

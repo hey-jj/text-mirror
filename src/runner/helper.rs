@@ -7,8 +7,11 @@
 //! then execs the requested adapter mode of the same binary. Any
 //! setup failure writes one diagnostic line to stderr and exits with
 //! [`super::SANDBOX_SETUP_EXIT`], which the parent reports as
-//! `sandbox_unavailable`. The helper never runs adapter code before
-//! the jail is fully engaged.
+//! `sandbox_unavailable`. The one refusal with its own exit code is a
+//! process count the host will not answer,
+//! [`super::PROCESS_COUNT_EXIT`], reported as
+//! `process-count-unavailable`. The helper never runs adapter code
+//! before the jail is fully engaged.
 //!
 //! Order on Linux: namespaces and ID maps, resource limits,
 //! descriptor hygiene, Landlock, seccomp, exec. Descriptor hygiene
@@ -21,7 +24,25 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use super::{SANDBOX_SETUP_EXIT, WORKER_BINARY};
+use super::{PROCESS_COUNT_EXIT, SANDBOX_SETUP_EXIT, WORKER_BINARY};
+
+/// A refused setup: one line of stderr detail and the exit code the
+/// parent maps back to a named runner reason. Every refusal that is
+/// not called out by its own code is a jail setup failure.
+#[derive(Debug)]
+struct Refusal {
+    detail: String,
+    exit: i32,
+}
+
+impl From<String> for Refusal {
+    fn from(detail: String) -> Refusal {
+        Refusal {
+            detail,
+            exit: SANDBOX_SETUP_EXIT,
+        }
+    }
+}
 
 /// Parsed helper arguments.
 pub struct HelperConfig {
@@ -118,23 +139,23 @@ fn parse_number(flag: &str, value: &str) -> Result<u64, String> {
 pub fn helper_main(args: &[String]) -> ! {
     let config = match parse_args(args) {
         Ok(config) => config,
-        Err(detail) => die(&detail),
+        Err(detail) => die(&detail, SANDBOX_SETUP_EXIT),
     };
-    if let Err(detail) = engage(&config) {
-        die(&detail);
+    if let Err(refusal) = engage(&config) {
+        die(&refusal.detail, refusal.exit);
     }
     // exec only returns on failure.
     let error = exec_adapter(&config);
-    die(&error)
+    die(&error, SANDBOX_SETUP_EXIT)
 }
 
-fn die(detail: &str) -> ! {
+fn die(detail: &str, exit: i32) -> ! {
     eprintln!("sandbox_setup_failed: {detail}");
-    std::process::exit(SANDBOX_SETUP_EXIT)
+    std::process::exit(exit)
 }
 
 #[cfg(target_os = "linux")]
-fn engage(config: &HelperConfig) -> Result<(), String> {
+fn engage(config: &HelperConfig) -> Result<(), Refusal> {
     super::linux::unshare_namespaces()?;
     apply_rlimits(config)?;
     close_extra_fds()?;
@@ -151,7 +172,7 @@ fn engage(config: &HelperConfig) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn engage(config: &HelperConfig) -> Result<(), String> {
+fn engage(config: &HelperConfig) -> Result<(), Refusal> {
     // The Seatbelt profile is already applied by sandbox-exec.
     apply_rlimits(config)?;
     close_extra_fds()?;
@@ -159,8 +180,10 @@ fn engage(config: &HelperConfig) -> Result<(), String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn engage(_config: &HelperConfig) -> Result<(), String> {
-    Err("no jail backend exists for this platform".to_string())
+fn engage(_config: &HelperConfig) -> Result<(), Refusal> {
+    Err("no jail backend exists for this platform"
+        .to_string()
+        .into())
 }
 
 /// Sets the address-space, CPU, file-size, process-count, and core
@@ -177,7 +200,7 @@ fn engage(_config: &HelperConfig) -> Result<(), String> {
 /// abort. The CPU, file-size, process-count, and core limits hold on
 /// every platform, and the macOS backend is development containment
 /// where the wall-clock and output caps are the bounds that hold.
-fn apply_rlimits(config: &HelperConfig) -> Result<(), String> {
+fn apply_rlimits(config: &HelperConfig) -> Result<(), Refusal> {
     use rlimit::{Resource, setrlimit};
     let apply = |resource: Resource, name: &str, value: u64| {
         setrlimit(resource, value, value).map_err(|e| format!("setrlimit {name} failed: {e}"))
@@ -208,48 +231,80 @@ fn apply_rlimits(config: &HelperConfig) -> Result<(), String> {
 /// its engine child. The configured number's intent is the
 /// invocation's spawn budget, so it is applied on top of the load
 /// that already exists: this invocation may add at most that many
-/// processes, and the fork-bomb bound is preserved. A failed count
-/// falls back to the absolute value, which only ever narrows.
-fn nproc_limit(configured: u64) -> Result<u64, String> {
+/// processes, and the fork-bomb bound is preserved. A count the host
+/// cannot supply fails the run closed with the named reason
+/// `process-count-unavailable` and nothing is exec'd, because the
+/// headroom the budget rides on is unknown and a substituted
+/// baseline is a guess at the very number being bounded.
+fn nproc_limit(configured: u64) -> Result<u64, Refusal> {
     use rlimit::{Resource, getrlimit};
     let (_, hard) =
         getrlimit(Resource::NPROC).map_err(|e| format!("getrlimit RLIMIT_NPROC failed: {e}"))?;
-    let base = current_uid_process_count().unwrap_or(0);
+    headroom_limit(configured, hard, current_uid_process_count)
+}
+
+/// The headroom arithmetic over one count query, separated so the
+/// unmeasurable case is exercised without a host that can fail.
+fn headroom_limit(
+    configured: u64,
+    hard: u64,
+    count: impl Fn() -> std::io::Result<u64>,
+) -> Result<u64, Refusal> {
+    let base = count().map_err(|e| Refusal {
+        detail: format!(
+            "the real user id's process count could not be measured, so the headroom this limit rides on is unknown: {e}"
+        ),
+        exit: PROCESS_COUNT_EXIT,
+    })?;
     Ok(base.saturating_add(configured).min(hard))
 }
 
 /// The real user id's current process count, from the platform's
-/// process listing.
+/// process listing. A listing the host refuses is an error, never a
+/// count of zero: the caller must be able to tell an idle user from
+/// an unanswerable question.
 #[cfg(target_os = "macos")]
-fn current_uid_process_count() -> Option<u64> {
+fn current_uid_process_count() -> std::io::Result<u64> {
     use libproc::processes::{ProcFilter, pids_by_type};
     let uid = nix::unistd::getuid().as_raw();
-    let pids = pids_by_type(ProcFilter::ByUID { uid }).ok()?;
-    Some(pids.len() as u64)
+    let pids = pids_by_type(ProcFilter::ByUID { uid }).map_err(std::io::Error::other)?;
+    Ok(pids.len() as u64)
 }
 
 /// The real user id's current process count, from the `/proc` view.
+/// A record that vanished between the listing and the read is an
+/// ordinary exit and is skipped; every other read failure fails the
+/// count, because a view the host will not answer is not a count.
 #[cfg(target_os = "linux")]
-fn current_uid_process_count() -> Option<u64> {
+fn current_uid_process_count() -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
     let uid = u32::from(nix::unistd::getuid().as_raw());
-    let entries = std::fs::read_dir("/proc").ok()?;
     let mut count: u64 = 0;
-    for entry in entries.flatten() {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
         let name = entry.file_name();
         if name.to_str().is_none_or(|n| n.parse::<u32>().is_err()) {
             continue;
         }
-        if entry.metadata().is_ok_and(|m| m.uid() == uid) {
-            count += 1;
+        match entry.metadata() {
+            Ok(metadata) => {
+                if metadata.uid() == uid {
+                    count += 1;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
         }
     }
-    Some(count)
+    Ok(count)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn current_uid_process_count() -> Option<u64> {
-    None
+fn current_uid_process_count() -> std::io::Result<u64> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no process listing exists for this platform",
+    ))
 }
 
 /// Closes every descriptor above stderr, with no fixed ceiling. The
@@ -300,5 +355,50 @@ fn exec_adapter(config: &HelperConfig) -> String {
     match nix::unistd::execv(&path, &[argv0.as_c_str(), mode.as_c_str()]) {
         Ok(infallible) => match infallible {},
         Err(e) => format!("exec of the adapter mode failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_process_limit_rides_on_the_measured_count_and_clamps() {
+        // The budget is added to the count the host reported.
+        let limit = headroom_limit(64, 4096, || Ok(609)).expect("a measured count computes");
+        assert_eq!(limit, 673);
+        // The hard limit is still the ceiling.
+        let clamped = headroom_limit(64, 650, || Ok(609)).expect("a measured count computes");
+        assert_eq!(clamped, 650);
+        // An idle user is a real answer, not a missing one.
+        let idle = headroom_limit(64, 4096, || Ok(0)).expect("a measured count computes");
+        assert_eq!(idle, 64);
+    }
+
+    #[test]
+    fn a_count_the_host_cannot_supply_refuses_the_run() {
+        // The refusal carries the exit code the parent reports as
+        // `process-count-unavailable`, so nothing is exec'd and no
+        // substituted baseline stands in for the real count.
+        let refusal = headroom_limit(64, 4096, || {
+            Err(std::io::Error::other("the listing is unavailable"))
+        })
+        .expect_err("an unmeasurable count must refuse the run");
+        assert_eq!(refusal.exit, PROCESS_COUNT_EXIT);
+        assert_ne!(refusal.exit, SANDBOX_SETUP_EXIT);
+        assert!(
+            refusal.detail.contains("the listing is unavailable"),
+            "{}",
+            refusal.detail
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn this_host_can_be_counted() {
+        // This test process belongs to the real user id, so a working
+        // listing counts at least one.
+        let count = current_uid_process_count().expect("the host answers its own process listing");
+        assert!(count > 0, "the count was {count}");
     }
 }

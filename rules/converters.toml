@@ -253,9 +253,10 @@ file_size_bytes = 67108864
 # The GPU driver spins its own threads, so 64 gives room over the
 # default 16. This is a spawn budget, not an absolute ceiling: the
 # helper applies it as headroom above the real uid's pre-existing
-# process count at spawn, clamped to the hard limit. A failed count
-# falls back to the absolute value and uid growth after the count
-# consumes the budget, so both drift cases only narrow.
+# process count at spawn, clamped to the hard limit. A count the host
+# will not answer refuses the run with process-count-unavailable and
+# nothing is started; uid growth after the count consumes the budget,
+# which only narrows.
 max_processes = 64
 
 # Speech-transcription jail limit profile, versioned with the rest of
@@ -293,9 +294,9 @@ file_size_bytes = 1207959552
 # The accelerator driver spins its own threads. This is a spawn
 # budget, not an absolute ceiling: the helper applies it as headroom
 # above the real uid's pre-existing process count at spawn, clamped
-# to the hard limit. A failed count falls back to the absolute value
-# and uid growth after the count consumes the budget, so both drift
-# cases only narrow.
+# to the hard limit. A count the host will not answer refuses the run
+# with process-count-unavailable and nothing is started; uid growth
+# after the count consumes the budget, which only narrows.
 max_processes = 64
 # The pinned transcription language. The adapter sends it on every
 # request and honors a request language only when equal to it.
