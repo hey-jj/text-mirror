@@ -50,6 +50,7 @@ fn forbidden() -> Vec<Forbidden> {
         ("ffongis", false),
         ("gnilur", false),
         ("fitar", false),
+        ("tacidujda", false),
         ("detag-renwo", false),
         ("gel weiver", false),
         ("a gel", true),

@@ -873,7 +873,7 @@ mod tests {
         std::fs::read(path).unwrap()
     }
 
-    // --- adjudicated boundary battery ---------------------------------
+    // --- boundary battery ---------------------------------------------
 
     #[test]
     fn the_extended_object_type_escape_is_parsed_and_fenced() {
