@@ -23,15 +23,22 @@ Versioning.
 - A deployment-owned provider configuration, supplied through the new
   `--provider-config` flag on `text-mirror run` and the new
   `ProviderConfig` type. It names, per generic role label, the
-  absolute path of the executable that fills it, the closure it loads
-  helpers from, and the two jail parameters its runtime needs: the
+  absolute path of the executable that fills it, the enumerated
+  closure it loads its dependencies from, and the two jail parameters
+  its runtime needs: the
   service namespace it registers under, written as an anchored dotted
   prefix, and the name of an extra temp-directory variable. Both
   parameters have closed shapes, and a value outside them refuses the
   run with `provider-parameter-invalid` before the walk starts, so a
   supplied value cannot widen the jail beyond the names under one
-  prefix. What the worker asserts about each executable, the BLAKE3,
-  the exact version, and the aggregate closure digest, is versioned
+  prefix. A closure is enumerated, never a shared root: each entry is
+  granted its own subpath in the jail, a configuration naming a
+  package store, an application directory, or any other directory
+  many unrelated programs live in is refused, and a role that
+  enumerates a closure must have that closure pinned or the run is
+  refused at registry construction. What the worker asserts about each
+  executable, the BLAKE3, the exact version, and the aggregate closure
+  digest, is versioned
   rules data in the new `[image_ocr.svg_provider]` section, pinned per
   role label like every other engine expectation. The crate ships no
   path and no default. The schema
@@ -62,7 +69,8 @@ Versioning.
   failed child, never an unsupported one, and no path, product name,
   version output, or host identity reaches a record.
 - Per-execution verification in the cold jailed worker: presence, a
-  fresh BLAKE3, the aggregate closure digest, and the exact version.
+  fresh BLAKE3, the aggregate digest over the enumerated closure, and
+  the exact version.
   Each assertion runs before its own execution, not once for the pair,
   so a component swapped between the two still fails closed. The rendered raster must then match the source's declared
   aspect within one pixel on both cross-axis derivations and sit under
@@ -85,8 +93,8 @@ Versioning.
   version,
   and the geometry and flatten options, and excludes every absolute
   path, so enabling, disabling, or repinning a provider re-runs the
-  affected sources while moving an identical installation skips
-  nothing. `manifest@1` is unchanged: `rules_version` was already a
+  affected sources, while moving an identical installation to another
+  path re-runs nothing. `manifest@1` is unchanged: `rules_version` was already a
   string field.
 
 - An in-jail audio transcription converter for wav, mp3, flac, and
@@ -202,7 +210,11 @@ Versioning.
   variant, so external code that constructs the first exhaustively or
   matches the second exhaustively must account for them. The
   public `ImageOcrLimits` struct gained an `svg_provider` map of the
-  provider pins. The image-OCR ceilings `IMAGE_OCR_MAX_AREA_PX`,
+  provider pins. The jail's `ProviderJail` parameters have private
+  fields and one validating constructor, so the closed grammar the
+  configuration enforces is enforced at the render boundary too, and
+  no caller can hand the renderer a value the configuration would have
+  refused. The image-OCR ceilings `IMAGE_OCR_MAX_AREA_PX`,
   `IMAGE_OCR_VALIDATED_LONG_EDGE`, and `IMAGE_OCR_DECODE_ALLOC` moved
   up to the `convert` module, where the provider leg also reads them.
 - The rules version moves from 9 to 10. Every record whose format

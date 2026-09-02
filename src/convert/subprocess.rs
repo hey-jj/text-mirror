@@ -606,10 +606,11 @@ mod imp {
                     path: role.path.display().to_string(),
                     expected_blake3: pin.map(|pin| pin.blake3.clone()).unwrap_or_default(),
                     version: pin.map(|pin| pin.version.clone()).unwrap_or_default(),
-                    closure_root: role
-                        .closure_root
-                        .as_ref()
-                        .map(|path| path.display().to_string()),
+                    closure_roots: role
+                        .closure_roots
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect(),
                     closure_blake3: pin.and_then(|pin| pin.closure_blake3.clone()),
                     jail_temp_env: role.jail_temp_env.clone(),
                 }
@@ -631,20 +632,21 @@ mod imp {
             let exec_grants = vec![provider.raster.path.clone(), provider.encoder.path.clone()];
             let mut closures = Vec::new();
             for role in [&provider.raster, &provider.encoder] {
-                if let Some(root) = &role.closure_root {
-                    closures.push(root.clone());
-                }
+                closures.extend(role.closure_roots.iter().cloned());
             }
-            let jail = crate::runner::jail::ProviderJail {
-                closures,
-                service_prefix: provider.raster.jail_service_prefix.clone(),
-                temp_env: provider.raster.jail_temp_env.clone(),
-            };
             let mut provider_limits = image_runner_limits(&limits);
             provider_limits.max_response_bytes = PROVIDER_MAX_RESPONSE_BYTES;
-            let runner = crate::runner::jail::platform_backend().and_then(|backend| {
+            // The parameters go through the same validating constructor
+            // any caller must use, so the configuration layer and the
+            // render boundary enforce one grammar.
+            let runner = crate::runner::jail::ProviderJail::new(
+                closures,
+                provider.raster.jail_service_prefix.clone(),
+                provider.raster.jail_temp_env.clone(),
+            )
+            .and_then(|jail| {
                 Ok(Runner::with_provider_jail(
-                    backend,
+                    crate::runner::jail::platform_backend()?,
                     crate::runner::locate_worker()?,
                     provider_limits,
                     exec_grants,
@@ -1410,13 +1412,14 @@ mod imp {
             };
             let raster = make("raster");
             let encoder = make("encoder");
-            let closure = root.join("closure");
-            std::fs::create_dir_all(&closure).unwrap();
+            // The closure holds the executable, as every enumerated
+            // closure must.
+            let closure = root.clone();
             let text = format!(
                 "schema = \"{schema}\"\n\n\
                  [providers.svg.\"{raster_role}\"]\n\
                  path = \"{raster}\"\n\
-                 closure_root = \"{closure}\"\n\
+                 closure_roots = [\"{closure}\"]\n\
                  jail_service_prefix = \"^ex\\\\.ample\\\\.\"\n\
                  jail_temp_env = \"EXAMPLE_TMPDIR\"\n\n\
                  [providers.svg.\"{encoder_role}\"]\n\
@@ -1462,9 +1465,10 @@ mod imp {
                 crate::runner::jail::RuntimeProfile::Provider
             );
             let jail = runner.provider_jail().expect("the provider parameters");
-            assert_eq!(jail.closures, vec![closure]);
-            assert_eq!(jail.service_prefix.as_deref(), Some(r"^ex\.ample\."));
-            assert_eq!(jail.temp_env.as_deref(), Some("EXAMPLE_TMPDIR"));
+            assert_eq!(jail.closures(), std::slice::from_ref(&closure));
+            let _ = &encoder;
+            assert_eq!(jail.service_prefix(), Some(r"^ex\.ample\."));
+            assert_eq!(jail.temp_env(), Some("EXAMPLE_TMPDIR"));
             // The role entries the worker re-verifies carry the pins
             // and never a product name of their own.
             let roles: Vec<&str> = leg.roles.iter().map(|entry| entry.role.as_str()).collect();

@@ -106,25 +106,65 @@ fn forbidden_products() -> Vec<Forbidden> {
         .collect()
 }
 
-/// The one file exempt from the product set: a bundled license text
-/// legitimately names its copyright holders.
+/// The one file exempt from the product set: the bundled license text
+/// at the crate root legitimately names its copyright holders. The
+/// carveout is that exact path, not any file of that name.
 const LEGAL_NOTICE: &str = "THIRD-PARTY-NOTICES.md";
 
-/// Directory names skipped: build output and VCS metadata. Every other
-/// file is in scope, including this battery itself.
+/// Every text file the public tree tracks. Tracked files come from
+/// version control, so nothing generated or ignored is in scope and
+/// nothing tracked is out of it; a file whose head holds a NUL byte is
+/// a binary fixture and is skipped by content, never by name. Without
+/// version control the walk below stands in, with the same sniff.
+fn tracked_text_files(root: &Path) -> Vec<PathBuf> {
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+                .map(|name| root.join(String::from_utf8_lossy(name).as_ref()))
+                .collect::<Vec<PathBuf>>()
+        });
+    let candidates = match listed {
+        Some(files) if !files.is_empty() => files,
+        _ => {
+            let mut files = Vec::new();
+            collect(root, &mut files);
+            files
+        }
+    };
+    candidates
+        .into_iter()
+        .filter(|path| path.is_file() && is_text(path))
+        .collect()
+}
+
+/// Whether a file's first bytes look like text.
+fn is_text(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 8192];
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    !head[..read].contains(&0)
+}
+
+/// Directory names skipped by the fallback walk: build output and VCS
+/// metadata.
 fn is_skipped(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|n| n.to_str()),
         Some("target") | Some(".git")
-    )
-}
-
-/// Whether a file's bytes are in scope for the scrub: source, tests,
-/// rules, and the outbound prose files.
-fn in_scope(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("rs") | Some("toml") | Some("md")
     )
 }
 
@@ -139,7 +179,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
         }
         if path.is_dir() {
             collect(&path, out);
-        } else if in_scope(&path) {
+        } else {
             out.push(path);
         }
     }
@@ -187,37 +227,40 @@ fn scan_with(label: &str, text: &str, tokens: &[Forbidden], violations: &mut Vec
 #[test]
 fn no_forbidden_token_appears_in_the_crate() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    for sub in ["src", "tests", "rules", "docs", "skills"] {
-        collect(&root.join(sub), &mut files);
-    }
-    for top in [
-        "Cargo.toml",
-        "CHANGELOG.md",
+    let files = tracked_text_files(&root);
+    assert!(
+        files.len() > 40,
+        "the scrub found too few files: {}",
+        files.len()
+    );
+    // Every surface class is in scope: source, tests, rules, prose,
+    // manifests, and anything else tracked.
+    for expected in [
+        "src/lib.rs",
+        "rules/converters.toml",
         "README.md",
-        "THIRD-PARTY-NOTICES.md",
+        "Cargo.toml",
     ] {
-        let path = root.join(top);
-        if path.is_file() {
-            files.push(path);
-        }
+        assert!(
+            files.iter().any(|f| f.ends_with(expected)),
+            "{expected} is not in the scrub scope"
+        );
     }
-    assert!(!files.is_empty(), "the scrub found no files to scan");
 
     let mut violations = Vec::new();
     let base = forbidden();
     let products = forbidden_products();
+    let notice = root.join(LEGAL_NOTICE);
     for file in &files {
         let Ok(text) = fs::read_to_string(file) else {
             continue;
         };
         let label = file.display().to_string();
         scan_with(&label, &text, &base, &mut violations);
-        // The legal-notice carveout: a bundled license may name its
-        // copyright holders, and the fix for a hit there is never to
-        // edit the notice.
-        let legal = file.file_name().and_then(|n| n.to_str()) == Some(LEGAL_NOTICE);
-        if !legal {
+        // The legal-notice carveout: the bundled license at the crate
+        // root may name its copyright holders, and the fix for a hit
+        // there is never to edit the notice. It is that one path.
+        if *file != notice {
             scan_with(&label, &text, &products, &mut violations);
         }
     }
@@ -228,16 +271,20 @@ fn no_forbidden_token_appears_in_the_crate() {
     );
 }
 
-/// The whole-word tokens match a bare word and not a longer word that
-/// merely begins with one, so the sweep cannot fire on ordinary prose.
 /// The legal-notice carveout is exactly one file wide and covers only
 /// the product set: the process vocabulary is forbidden there too, and
 /// every other file is held to both sets.
 #[test]
 fn the_legal_notice_carveout_is_narrow() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(LEGAL_NOTICE);
-    assert!(root.is_file(), "the legal notice ships with the crate");
-    let text = fs::read_to_string(&root).unwrap();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let notice = root.join(LEGAL_NOTICE);
+    assert!(notice.is_file(), "the legal notice ships with the crate");
+    let text = fs::read_to_string(&notice).unwrap();
+    // The carveout is the root path alone: a file of the same name
+    // anywhere else is scanned like everything else.
+    let elsewhere = root.join("docs").join(LEGAL_NOTICE);
+    assert_ne!(elsewhere, notice);
+    assert!(tracked_text_files(&root).iter().all(|f| *f != elsewhere));
     // It is scanned against the process vocabulary like anything else.
     let mut violations = Vec::new();
     scan_with("notice", &text, &forbidden(), &mut violations);

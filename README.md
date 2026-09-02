@@ -68,13 +68,16 @@ schema = "text-mirror/provider@1"
 
 [providers.svg."raster-browser"]
 path = "/deployment/path/to/renderer"
-closure_root = "/deployment/path/to/renderer-closure"
+closure_roots = ["/deployment/path/to/renderer-closure"]
 jail_service_prefix = "^com\\.example\\.Product\\."
 jail_temp_env = "EXAMPLE_TMPDIR"
 
 [providers.svg."raster-magick"]
 path = "/deployment/path/to/encoder"
-closure_root = "/deployment/path/to/encoder-closure"
+closure_roots = [
+  "/deployment/path/to/encoder-installation",
+  "/deployment/path/to/a-dependency.dylib",
+]
 ```
 
 The file carries paths and jail parameters only. What the worker
@@ -82,6 +85,16 @@ asserts about each executable, its BLAKE3, its exact version, and the
 aggregate digest over its closure, is versioned rules data in the
 `[image_ocr.svg_provider]` section, pinned per role label like every
 other engine expectation this crate carries.
+
+Enumerate a closure, and enumerate it narrowly. Everything under each
+entry is readable and executable inside the jail, so name the measured
+dependencies: the installation directory and the specific libraries it
+loads. A package store, an application directory, or any other
+directory many programs share is refused, because granting one would
+put every unrelated program, and every other version of the pinned
+component, inside the boundary. A role that enumerates a closure must
+have that closure pinned in the rules, or the run is refused before it
+starts.
 
 The configuration also carries the two jail parameters the components
 need: the service namespace their runtime registers under, written as
@@ -99,9 +112,10 @@ records a failed child naming the role and the reason, one of
 `rasterizer-version-drift`, `raster-exec-failed`,
 `raster-geometry-mismatch`, or `encoder-area-cap`, and leaves the
 source's own artifact untouched. Configuring a provider changes the
-effective rules version to `10+svg.<digest>` over what the
-configuration pins, so enabling or repinning one re-runs the affected
-sources and moving an identical installation does not.
+effective rules version to `10+svg.<digest>` over what the rules pin
+and the jail parameters the configuration supplies, so enabling,
+repinning, or re-parameterizing one re-runs the affected sources and
+moving an identical installation to another path re-runs nothing.
 
 Recognition itself is the image-OCR path, so it needs that path's
 engine as well: with the provider wired and no engine configured, the

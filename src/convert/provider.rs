@@ -78,12 +78,13 @@ pub struct ProviderPin {
     /// equality against a token of its own version output; the raw
     /// output never leaves the worker.
     pub version: String,
-    /// Aggregate closure digest: BLAKE3 over the sorted relative path
-    /// and BLAKE3 of every executable file under the role's closure
-    /// root, excluding the pinned launcher itself. Asserted before every
-    /// execution beside the launcher hash, so a helper that drifts while
-    /// the launcher stands still is refused. Absent for a role whose
-    /// closure the rules do not pin.
+    /// Aggregate closure digest over the role's enumerated closure: for
+    /// each entry, the sorted relative path and BLAKE3 of every
+    /// executable file under it with the pinned launcher excluded, then
+    /// the sorted per-entry digests combined. Asserted before every
+    /// execution beside the launcher hash, so a dependency that drifts
+    /// while the launcher stands still is refused. Required for any
+    /// role whose configuration enumerates a closure.
     #[serde(default)]
     pub closure_blake3: Option<String>,
 }
@@ -98,14 +99,22 @@ pub struct ProviderRole {
     /// data: it never enters the versioned rules, a manifest record, an
     /// error message, or the effective rules version.
     pub path: PathBuf,
-    /// Root of the executable closure this role additionally needs to
-    /// read and execute: the helper and framework tree beside a
-    /// launcher, or the library store an encoder loads from. Granted as
-    /// a subpath in the provider jail, so the rules-pinned aggregate
-    /// digest is the integrity control that stands in for finer
-    /// granularity.
+    /// The executable closure this role additionally needs to read and
+    /// execute, enumerated: the helper and framework tree beside a
+    /// launcher, or the specific library directories and files an
+    /// encoder loads. Each entry is granted as its own subpath in the
+    /// provider jail, so a directory grants its subtree and a file
+    /// grants itself.
+    ///
+    /// Enumerate the measured dependencies, never a package store or
+    /// any other shared root: everything under an entry is readable and
+    /// executable inside the jail, and a shared root would put every
+    /// unrelated package, and every other version of this one, inside
+    /// the boundary. The rules-pinned aggregate digest over these
+    /// entries is the integrity control that stands in for finer
+    /// granularity, and it is required whenever this list is non-empty.
     #[serde(default)]
-    pub closure_root: Option<PathBuf>,
+    pub closure_roots: Vec<PathBuf>,
     /// The service namespace the provider jail scopes registration to,
     /// when the role's runtime registers any. Deployment data, because
     /// the namespace names the installed product. Its shape is a closed
@@ -218,6 +227,60 @@ pub fn is_service_namespace(value: &str) -> bool {
     })
 }
 
+/// The directories many unrelated programs live in. Granting one whole
+/// would put every one of them, and every other version of the pinned
+/// component, inside the jail, which is the opposite of an enumerated
+/// closure. A configuration naming one is refused before the walk.
+///
+/// The list is not a security boundary on its own: the boundary is the
+/// enumeration a deployment writes down and the aggregate digest the
+/// rules pin over it. This refuses the mistakes that would make both
+/// meaningless.
+const SHARED_ROOTS: &[&str] = &[
+    "/",
+    "/Applications",
+    "/Library",
+    "/System",
+    "/Users",
+    "/bin",
+    "/etc",
+    "/home",
+    "/nix/store",
+    "/opt",
+    "/opt/homebrew",
+    "/opt/homebrew/Cellar",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/lib",
+    "/opt/homebrew/opt",
+    "/private/tmp",
+    "/private/var",
+    "/sbin",
+    "/tmp",
+    "/usr",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/local",
+    "/usr/local/bin",
+    "/usr/local/lib",
+    "/usr/sbin",
+    "/usr/share",
+    "/var",
+];
+
+/// Whether a closure entry names one of those shared roots, or is so
+/// shallow it can only be one.
+pub fn is_shared_root(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches('/');
+    let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+    if SHARED_ROOTS.contains(&normalized) {
+        return true;
+    }
+    // A single top-level directory nobody listed is still a shared root
+    // by shape.
+    path.components().count() < 3
+}
+
 /// Whether an environment variable name is a bounded identifier: an
 /// upper-case letter or underscore, then up to sixty-three upper-case
 /// letters, digits, or underscores.
@@ -253,6 +316,28 @@ impl ProviderPin {
             ));
         }
         Ok(())
+    }
+}
+
+/// Checks one configured role against its rules pin: the enumerated
+/// closure and its pinned digest are a pair. A closure with no digest
+/// would grant a subtree nothing asserts the contents of, and a digest
+/// with no closure asserts nothing at all.
+pub(crate) fn check_closure_is_pinned(
+    role: &str,
+    configured: &ProviderRole,
+    pin: Option<&ProviderPin>,
+) -> std::result::Result<(), String> {
+    let pinned = pin.and_then(|pin| pin.closure_blake3.as_ref()).is_some();
+    let enumerated = !configured.closure_roots.is_empty();
+    match (enumerated, pinned) {
+        (true, false) => Err(format!(
+            "provider role {role:?} enumerates a closure that [image_ocr.svg_provider] does not pin"
+        )),
+        (false, true) => Err(format!(
+            "provider role {role:?} has a pinned closure digest but enumerates no closure to compute it over"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -294,11 +379,31 @@ impl ProviderRole {
                 "provider role {role:?} needs an absolute path"
             )));
         }
-        if let Some(root) = &self.closure_root
-            && !root.is_absolute()
+        for root in &self.closure_roots {
+            if !root.is_absolute() {
+                return Err(rules_error(format!(
+                    "provider role {role:?} needs absolute closure_roots"
+                )));
+            }
+            if is_shared_root(root) {
+                return Err(rules_error(format!(
+                    "provider role {role:?} closure_roots entry {} is a shared root: enumerate the measured dependencies instead",
+                    root.display()
+                )));
+            }
+        }
+        // A role that enumerates a closure must sit inside it: the
+        // executable is what the closure exists for, and an executable
+        // outside every entry would be authorized by its literal grant
+        // alone while its own tree stays unmeasured.
+        if !self.closure_roots.is_empty()
+            && !self
+                .closure_roots
+                .iter()
+                .any(|root| self.path == *root || self.path.starts_with(root))
         {
             return Err(rules_error(format!(
-                "provider role {role:?} needs an absolute closure_root"
+                "provider role {role:?} executable lies outside every closure_roots entry"
             )));
         }
         if let Some(prefix) = &self.jail_service_prefix
@@ -379,12 +484,21 @@ impl ProviderConfig {
 
     /// The material the effective rules version digests for a configured
     /// provider: presence, the generic role labels, the rules-pinned
-    /// hashes and versions, the adapter version, and the geometry and
-    /// flatten options.
+    /// hashes and versions, the adapter version, the geometry and
+    /// flatten options, and the jail identity, which is the profile
+    /// template's BLAKE3 together with the two parameter values the
+    /// deployment supplied.
     ///
     /// Absolute paths are deliberately excluded, so moving an identical
-    /// pinned provider does not invalidate a single converted artifact.
-    pub fn digest_material(pins: &BTreeMap<String, ProviderPin>) -> Option<String> {
+    /// pinned provider to another path re-runs nothing. The parameter
+    /// values enter as digest material only, so they never appear in a
+    /// record: two runs under different values, or under an edited
+    /// template, are different effective versions and never checkpoint
+    /// against each other.
+    pub fn digest_material(
+        pins: &BTreeMap<String, ProviderPin>,
+        jail: &ProviderJailIdentity,
+    ) -> Option<String> {
         let mut material = String::from("provider=svg\n");
         for label in PROVIDER_ROLES {
             let pin = pins.get(label)?;
@@ -404,18 +518,59 @@ impl ProviderConfig {
             "area-cap={}\n",
             crate::convert::IMAGE_OCR_MAX_AREA_PX
         ));
+        material.push_str(&format!(
+            "template={}\n",
+            jail.template_blake3.as_deref().unwrap_or("none")
+        ));
+        material.push_str(&format!(
+            "service-prefix={}\n",
+            jail.service_prefix.as_deref().unwrap_or_default()
+        ));
+        material.push_str(&format!(
+            "temp-env={}\n",
+            jail.temp_env.as_deref().unwrap_or_default()
+        ));
         Some(material)
     }
 
     /// The effective-version suffix a configured provider contributes
-    /// under the given pins, or `None` when the pins are incomplete. The
-    /// form is `svg.<12 hex>`, appended to the numeric rules version
-    /// with a `+`.
-    pub fn version_suffix(pins: &BTreeMap<String, ProviderPin>) -> Option<String> {
-        let material = Self::digest_material(pins)?;
+    /// under the given pins and jail identity, or `None` when the pins
+    /// are incomplete. The form is `svg.<12 hex>`, appended to the
+    /// numeric rules version with a `+`.
+    pub fn version_suffix(
+        pins: &BTreeMap<String, ProviderPin>,
+        jail: &ProviderJailIdentity,
+    ) -> Option<String> {
+        let material = Self::digest_material(pins, jail)?;
         let digest = crate::hash::hash_bytes(material.as_bytes());
         Some(format!("svg.{}", &digest[..12]))
     }
+
+    /// The jail identity this configuration runs under: the profile
+    /// template's BLAKE3 on this platform and the two parameter values
+    /// the rasterizer role supplied.
+    pub fn jail_identity(&self) -> ProviderJailIdentity {
+        let raster = self.svg.as_ref().map(|svg| &svg.raster);
+        ProviderJailIdentity {
+            template_blake3: crate::runner_template_blake3(),
+            service_prefix: raster.and_then(|role| role.jail_service_prefix.clone()),
+            temp_env: raster.and_then(|role| role.jail_temp_env.clone()),
+        }
+    }
+}
+
+/// The parts of a provider's identity that come from the jail rather
+/// than the pins: which profile template renders it, and the two
+/// parameter values it was rendered with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderJailIdentity {
+    /// BLAKE3 of the provider profile template, `None` where no
+    /// provider profile is measured.
+    pub template_blake3: Option<String>,
+    /// The service namespace the deployment supplied.
+    pub service_prefix: Option<String>,
+    /// The temp-directory variable the deployment supplied.
+    pub temp_env: Option<String>,
 }
 
 #[cfg(test)]
@@ -430,14 +585,14 @@ mod tests {
         config(&format!(
             r#"
 [providers.svg."{PROVIDER_ROLE_RASTER}"]
-path = "/deploy/raster"
-closure_root = "/deploy/raster-closure"
+path = "/deploy/raster/bin/raster"
+closure_roots = ["/deploy/raster"]
 jail_service_prefix = "^ex\\.ample\\.Product\\."
 jail_temp_env = "EXAMPLE_TMPDIR"
 
 [providers.svg."{PROVIDER_ROLE_ENCODER}"]
-path = "/deploy/encoder"
-closure_root = "/deploy/store"
+path = "/deploy/encoder/bin/encoder"
+closure_roots = ["/deploy/encoder", "/deploy/dependency/lib/dep.dylib"]
 "#
         ))
     }
@@ -467,15 +622,18 @@ closure_root = "/deploy/store"
     fn a_complete_configuration_resolves_both_roles() {
         let parsed = ProviderConfig::parse(&complete()).unwrap();
         let svg = parsed.svg().expect("both roles present");
-        assert_eq!(svg.raster.path, PathBuf::from("/deploy/raster"));
+        assert_eq!(svg.raster.path, PathBuf::from("/deploy/raster/bin/raster"));
         assert_eq!(
             svg.raster.jail_service_prefix.as_deref(),
             Some(r"^ex\.ample\.Product\.")
         );
         assert_eq!(svg.raster.jail_temp_env.as_deref(), Some("EXAMPLE_TMPDIR"));
         assert_eq!(
-            svg.encoder.closure_root,
-            Some(PathBuf::from("/deploy/store"))
+            svg.encoder.closure_roots,
+            vec![
+                PathBuf::from("/deploy/encoder"),
+                PathBuf::from("/deploy/dependency/lib/dep.dylib")
+            ]
         );
         assert!(svg.encoder.jail_service_prefix.is_none());
     }
@@ -533,24 +691,92 @@ closure_root = "/deploy/store"
 
     #[test]
     fn paths_are_validated_before_a_run_starts() {
-        let relative =
-            complete().replace("path = \"/deploy/raster\"", "path = \"relative/raster\"");
+        let relative = complete().replace(
+            "path = \"/deploy/raster/bin/raster\"",
+            "path = \"relative/raster\"",
+        );
         assert!(
             ProviderConfig::parse(&relative)
                 .unwrap_err()
                 .to_string()
                 .contains("absolute path")
         );
-        let closure = complete().replace(
-            "closure_root = \"/deploy/store\"",
-            "closure_root = \"relative/store\"",
+        let relative_closure = complete().replace(
+            "closure_roots = [\"/deploy/encoder\", \"/deploy/dependency/lib/dep.dylib\"]",
+            "closure_roots = [\"relative/lib\"]",
         );
         assert!(
-            ProviderConfig::parse(&closure)
+            ProviderConfig::parse(&relative_closure)
                 .unwrap_err()
                 .to_string()
-                .contains("closure_root")
+                .contains("closure_roots")
         );
+        // A shared package or application root is refused: everything
+        // under an entry is readable and executable in the jail, so a
+        // store root would carry every unrelated package, and every
+        // other version of this one, inside the boundary.
+        for shared in [
+            "/",
+            "/opt",
+            "/opt/homebrew",
+            "/opt/homebrew/Cellar",
+            "/opt/homebrew/opt",
+            "/usr/lib",
+            "/usr/local/lib",
+            "/Applications",
+            "/Library",
+            "/System",
+            "/bin",
+            "/opt/homebrew/Cellar/",
+        ] {
+            let text = complete().replace(
+                "closure_roots = [\"/deploy/encoder\", \"/deploy/dependency/lib/dep.dylib\"]",
+                &format!("closure_roots = [\"{shared}\"]"),
+            );
+            let error = ProviderConfig::parse(&text).unwrap_err().to_string();
+            assert!(error.contains("shared root"), "{shared}: {error}");
+        }
+        // A specific versioned artifact under one of those roots is
+        // exactly what an enumeration should name, so it is accepted.
+        for named in [
+            "/opt/homebrew/Cellar/example/1.2.3",
+            "/opt/homebrew/Cellar/example/1.2.3/lib/libexample.dylib",
+            "/Applications/Example.app",
+        ] {
+            // The executable moves inside the named entry, so only the
+            // shape of the entry is under test here.
+            let text = complete()
+                .replace(
+                    "closure_roots = [\"/deploy/encoder\", \"/deploy/dependency/lib/dep.dylib\"]",
+                    &format!("closure_roots = [\"{named}\"]"),
+                )
+                .replace(
+                    "path = \"/deploy/encoder/bin/encoder\"",
+                    &format!("path = \"{named}/bin/encoder\""),
+                );
+            assert!(ProviderConfig::parse(&text).is_ok(), "{named}");
+        }
+        // A configuration that enumerates a closure the rules do not
+        // pin is refused where the two meet, at registry construction.
+        let parsed = ProviderConfig::parse(&complete()).unwrap();
+        let svg = parsed.svg().unwrap();
+        assert!(
+            check_closure_is_pinned(
+                PROVIDER_ROLE_RASTER,
+                &svg.raster,
+                pins().get(PROVIDER_ROLE_RASTER)
+            )
+            .is_ok()
+        );
+        let unpinned = ProviderPin {
+            blake3: "a".repeat(64),
+            version: "1".to_string(),
+            closure_blake3: None,
+        };
+        let error = check_closure_is_pinned(PROVIDER_ROLE_RASTER, &svg.raster, Some(&unpinned))
+            .unwrap_err();
+        assert!(error.contains("does not pin"), "{error}");
+        assert!(check_closure_is_pinned(PROVIDER_ROLE_RASTER, &svg.raster, None).is_err());
     }
 
     #[test]
@@ -677,15 +903,23 @@ closure_root = "/deploy/store"
         );
     }
 
+    fn identity() -> ProviderJailIdentity {
+        ProviderJailIdentity {
+            template_blake3: Some("t".repeat(64)),
+            service_prefix: Some(r"^ex\.ample\.".to_string()),
+            temp_env: Some("EXAMPLE_TMPDIR".to_string()),
+        }
+    }
+
     #[test]
     fn the_effective_version_suffix_covers_identity_and_excludes_paths() {
-        let suffix = ProviderConfig::version_suffix(&pins()).expect("complete pins");
+        let suffix = ProviderConfig::version_suffix(&pins(), &identity()).expect("complete pins");
         assert!(suffix.starts_with("svg."), "{suffix}");
         assert_eq!(suffix.len(), "svg.".len() + 12, "{suffix}");
         // Incomplete pins yield no suffix at all.
         let mut one = pins();
         one.remove(PROVIDER_ROLE_ENCODER);
-        assert!(ProviderConfig::version_suffix(&one).is_none());
+        assert!(ProviderConfig::version_suffix(&one, &identity()).is_none());
         // Every pinned identity changes it.
         for mutate in [
             |p: &mut BTreeMap<String, ProviderPin>| {
@@ -704,18 +938,97 @@ closure_root = "/deploy/store"
             let mut changed = pins();
             mutate(&mut changed);
             assert_ne!(
-                ProviderConfig::version_suffix(&changed),
+                ProviderConfig::version_suffix(&changed, &identity()),
                 Some(suffix.clone())
             );
         }
         // The material names the generic labels, the adapter version,
-        // and the geometry and flatten options, and no path at all.
-        let material = ProviderConfig::digest_material(&pins()).unwrap();
+        // the geometry and flatten options, the template, and the
+        // parameters, and no path at all.
+        let material = ProviderConfig::digest_material(&pins(), &identity()).unwrap();
         assert!(material.contains(PROVIDER_ROLE_RASTER));
         assert!(material.contains(PROVIDER_ROLE_ENCODER));
         assert!(material.contains(PROVIDER_ADAPTER_VERSION));
         assert!(material.contains("png:exclude-chunks=date,time"));
         assert!(material.contains("geometry-tolerance-px=1"));
+        assert!(material.contains(&"t".repeat(64)));
+        assert!(material.contains("EXAMPLE_TMPDIR"));
         assert!(!material.contains('/'), "{material}");
+    }
+
+    #[test]
+    fn the_jail_identity_is_part_of_the_effective_version() {
+        // The approved identity is the template plus the two parameter
+        // values, so a different value for either, or an edited
+        // template, is a different effective version: two such runs
+        // never checkpoint against each other.
+        let base = ProviderConfig::version_suffix(&pins(), &identity()).unwrap();
+        let mut other_namespace = identity();
+        other_namespace.service_prefix = Some(r"^an\.other\.".to_string());
+        assert_ne!(
+            ProviderConfig::version_suffix(&pins(), &other_namespace),
+            Some(base.clone())
+        );
+        let mut other_variable = identity();
+        other_variable.temp_env = Some("OTHER_TMPDIR".to_string());
+        assert_ne!(
+            ProviderConfig::version_suffix(&pins(), &other_variable),
+            Some(base.clone())
+        );
+        let mut edited_template = identity();
+        edited_template.template_blake3 = Some("u".repeat(64));
+        assert_ne!(
+            ProviderConfig::version_suffix(&pins(), &edited_template),
+            Some(base.clone())
+        );
+        let mut no_parameters = identity();
+        no_parameters.service_prefix = None;
+        no_parameters.temp_env = None;
+        assert_ne!(
+            ProviderConfig::version_suffix(&pins(), &no_parameters),
+            Some(base.clone())
+        );
+        // And the same identity yields the same version, so the digest
+        // is a function of what was supplied and nothing else.
+        assert_eq!(
+            ProviderConfig::version_suffix(&pins(), &identity()),
+            Some(base)
+        );
+        // A configuration's own identity carries its parameters.
+        let parsed = ProviderConfig::parse(&complete()).unwrap();
+        let identity = parsed.jail_identity();
+        assert_eq!(
+            identity.service_prefix.as_deref(),
+            Some(r"^ex\.ample\.Product\.")
+        );
+        assert_eq!(identity.temp_env.as_deref(), Some("EXAMPLE_TMPDIR"));
+    }
+
+    #[test]
+    fn an_executable_outside_its_own_closure_is_refused() {
+        // A role that enumerates a closure must sit inside it, or its
+        // literal grant would authorize an executable whose own tree is
+        // unmeasured.
+        let outside = complete().replace(
+            "closure_roots = [\"/deploy/raster\"]",
+            "closure_roots = [\"/deploy/elsewhere\"]",
+        );
+        let error = ProviderConfig::parse(&outside).unwrap_err().to_string();
+        assert!(error.contains("outside every closure_roots"), "{error}");
+        // Inside as a subtree member, or as the entry itself, is fine.
+        let as_entry = complete().replace(
+            "closure_roots = [\"/deploy/raster\"]",
+            "closure_roots = [\"/deploy/raster/bin/raster\"]",
+        );
+        assert!(ProviderConfig::parse(&as_entry).is_ok());
+        let among = complete().replace(
+            "closure_roots = [\"/deploy/raster\"]",
+            "closure_roots = [\"/deploy/elsewhere\", \"/deploy/raster\"]",
+        );
+        assert!(ProviderConfig::parse(&among).is_ok());
+        // With no closure at all, the executable stands on its literal
+        // grant alone, which is the shape of a self-contained component.
+        let none = complete().replace("closure_roots = [\"/deploy/raster\"]\n", "");
+        assert!(ProviderConfig::parse(&none).is_ok());
     }
 }

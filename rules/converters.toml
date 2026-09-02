@@ -361,15 +361,21 @@ max_output_bytes = 16777216
 # file immediately before every execution: the BLAKE3 of the file, the
 # exact version it reports, and for the rasterizer the aggregate digest
 # over its executable closure, so a helper that drifts while the
-# launcher stands still is refused. The jail parameters a deployment
-# supplies are part of the jail's identity; the profile was measured
+# launcher stands still is refused. A role whose configuration
+# enumerates a closure must be pinned here, or registry construction
+# refuses the run: everything under an enumerated entry is readable and
+# executable inside the jail, so the digest is what makes that grant
+# accountable. Enumerate the measured dependencies, never a package
+# store or any other shared root. The jail parameters a deployment
+# supplies are part of the jail's identity too. The profile was measured
 # with one specific set of values, and a deployment supplying others
 # runs a jail that has not been measured with them.
 [image_ocr.svg_provider."raster-browser"]
 blake3 = "e6cd1c439c4d7f64982c4bb07ffaa4f75ae444d3d1fd25bf44fd30d5af4a8c45"
 version = "151.0.7922.174"
-closure_blake3 = "7dfffd4611da494caab161a2c9d598679bb62115265e59151a8ba45c39346649"
+closure_blake3 = "2b7821bd08e11527984779716cd209218b97abb04a9e406220faaed6c60fcae6"
 
 [image_ocr.svg_provider."raster-magick"]
 blake3 = "42829b87e0ff08d07c551254eb4b83abbd033bc13c574a7f05cec51d0dba5440"
 version = "7.1.2-29"
+closure_blake3 = "44d39985b16d493ac23e398007ebe4b56a15c35a2123792252e4e5e396b6a855"

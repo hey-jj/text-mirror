@@ -126,6 +126,20 @@ impl std::fmt::Display for RunnerError {
 
 impl std::error::Error for RunnerError {}
 
+/// The BLAKE3 of the provider jail profile template on this platform,
+/// or `None` where no provider profile is measured. Part of the
+/// effective rules version whenever a provider is configured.
+pub fn provider_profile_template_blake3() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(macos::provider_profile_template_blake3())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// File name of the worker binary this crate ships.
 pub const WORKER_BINARY: &str = "text-mirror-worker";
 

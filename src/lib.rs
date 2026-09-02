@@ -66,6 +66,19 @@ pub mod runner_bodies {
     }
 }
 
+/// The BLAKE3 of the provider jail profile template on this platform,
+/// or `None` where no provider profile is measured.
+pub(crate) fn runner_template_blake3() -> Option<String> {
+    #[cfg(unix)]
+    {
+        runner::provider_profile_template_blake3()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// Errors returned by this library.
 ///
 /// Conversion failures are not errors. They are recorded outcomes in

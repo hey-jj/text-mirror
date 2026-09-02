@@ -105,6 +105,15 @@ impl Rules {
         Self::assemble(table, registry, None, false)
     }
 
+    /// Rules in the shape a build without the provider feature takes
+    /// when it is handed a provider configuration: nothing wired, the
+    /// numeric version, and every vector source marked as unable to
+    /// run the leg. Exists so the feature-off checkpoint arm can be
+    /// exercised from a build that carries the feature.
+    pub fn from_parts_provider_not_built(table: FormatTable, registry: Registry) -> Result<Self> {
+        Self::assemble(table, registry, None, true)
+    }
+
     /// Rules over an explicit table and registry with the provider
     /// configuration the registry was built against, so the effective
     /// version carries the provider's identity exactly as the built-in
@@ -166,6 +175,7 @@ impl Rules {
             config.svg()?;
             convert::provider::ProviderConfig::version_suffix(
                 &registry.image_ocr_limits().svg_provider,
+                &config.jail_identity(),
             )
         });
         let effective_version = match suffix {
@@ -802,7 +812,37 @@ impl Expander<'_> {
                     .warnings
                     .iter()
                     .any(|w| w == convert::image_metadata::IMAGE_METADATA_NOT_BUILT);
-            if key_matches && has_text && !leg_never_ran {
+            // The not-built marking on a vector source is part of the
+            // key in both directions. A prior record carrying it skips
+            // only when this run still cannot run a configured
+            // provider, and a prior record without it skips only when
+            // this run has no configured provider either, so the
+            // marking is recorded on the way in and retired on the way
+            // out instead of going stale.
+            let previous_not_built = previous
+                .warnings
+                .iter()
+                .any(|w| w == convert::SVG_PROVIDER_NOT_BUILT);
+            let current_not_built =
+                meta.detection.detected == "svg" && self.rules.provider_not_built();
+            let not_built_moved = previous_not_built != current_not_built;
+            // A failed child of the provider leg has no text and no
+            // artifact, so the descendant check below would pass over
+            // it. The parent is not skippable while that child stands:
+            // the leg re-runs every run until it converts or the source
+            // changes, so a recoverable refusal is never frozen into
+            // the checkpoint.
+            let failed_provider_child = leg == Some(ChildLeg::SvgOcr)
+                && self
+                    .terminal
+                    .get(&svg_ocr_child_path(&meta.source_path))
+                    .is_some_and(|child| child.status == Status::Failed);
+            if key_matches
+                && has_text
+                && !leg_never_ran
+                && !not_built_moved
+                && !failed_provider_child
+            {
                 let intact = match (&previous.text_path, &previous.text_hash) {
                     (Some(text_path), Some(text_hash)) => {
                         mirror::resolve_recorded_path(self.mirror_root, text_path).is_ok_and(

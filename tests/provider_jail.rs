@@ -51,14 +51,17 @@ fn provider_runner(provider: &FakeProvider, limits: Limits) -> Runner {
             provider.encoder_path().to_path_buf(),
         ],
         Vec::new(),
-        ProviderJail {
-            closures: vec![
+        ProviderJail::new(
+            vec![
                 provider.raster_path().parent().unwrap().to_path_buf(),
-                PathBuf::from("/bin"),
+                PathBuf::from("/bin/sh"),
+                PathBuf::from("/bin/bash"),
+                PathBuf::from("/bin/cp"),
             ],
-            service_prefix: Some("^ex\\.ample\\.".to_string()),
-            temp_env: None,
-        },
+            Some("^ex\\.ample\\.".to_string()),
+            None,
+        )
+        .expect("the synthetic parameters fit the grammar"),
     )
 }
 
@@ -116,6 +119,209 @@ fn the_provider_jail_refuses_reads_and_writes_outside_itself() {
     assert!(read.contains("denied"), "read escaped: {read}");
     assert!(write.contains("denied"), "write escaped: {write}");
     assert!(list.contains("denied"), "listing escaped: {list}");
+}
+
+/// The real home directory, from the account database rather than the
+/// environment, so a redirected `HOME` cannot stand in for it.
+fn real_home() -> PathBuf {
+    let output = std::process::Command::new("/usr/bin/dscl")
+        .args([
+            ".",
+            "-read",
+            &format!("/Users/{}", whoami()),
+            "NFSHomeDirectory",
+        ])
+        .output()
+        .expect("the account database answers");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let home = text
+        .split_whitespace()
+        .last()
+        .expect("a home directory")
+        .to_string();
+    PathBuf::from(home)
+}
+
+fn whoami() -> String {
+    let output = std::process::Command::new("/usr/bin/id")
+        .arg("-un")
+        .output()
+        .expect("the user name");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A file in the real home that exists, for the shell-profile control:
+/// the first of the usual profile names, or a marker the test writes
+/// itself so the denial is never a missing file.
+fn shell_profile(home: &Path) -> PathBuf {
+    for name in [
+        ".zshenv",
+        ".zshrc",
+        ".zprofile",
+        ".bash_profile",
+        ".profile",
+    ] {
+        let path = home.join(name);
+        if path.is_file() {
+            return path;
+        }
+    }
+    let marker = home.join(".text-mirror-control-profile");
+    fs::write(&marker, b"marker").unwrap();
+    marker
+}
+
+#[test]
+fn every_escape_control_is_denied_by_name_under_the_provider_jail() {
+    // The ten controls the bar names, each asserted on its own against
+    // an absolute host target that exists, plus the in-jail write that
+    // proves the jail itself is live. This runs under the synthetic
+    // provider, so it is permanent and needs no installed tuple.
+    let provider = FakeProvider::new(&[(64, 48)]);
+    let runner = provider_runner(&provider, brisk_limits());
+    let home = real_home();
+    assert!(home.is_dir(), "{}", home.display());
+    let cache_root = home.join("Library/Caches");
+    assert!(cache_root.is_dir(), "{}", cache_root.display());
+    let profile_dir = home.join("Library/Application Support");
+    assert!(profile_dir.is_dir(), "{}", profile_dir.display());
+    let profile = shell_profile(&home);
+    let privileged = "/etc/sudoers";
+    assert!(Path::new(privileged).exists());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let loopback = listener.local_addr().unwrap().to_string();
+
+    let response = runner
+        .run(
+            "harness-controls",
+            serde_json::json!({
+                "temp_root": "/tmp",
+                "home": home.to_str().unwrap(),
+                "cache_root": cache_root.to_str().unwrap(),
+                "outbound": "1.1.1.1:443",
+                "loopback": loopback,
+                "shell_profile": profile.to_str().unwrap(),
+                "profile_dir": profile_dir.to_str().unwrap(),
+                "privileged": privileged,
+                "program": "/bin/echo",
+            }),
+            &[],
+        )
+        .expect("the provider jail runs the controls");
+    let ok = response.ok.expect("harness-controls succeeds");
+    let outcome = |name: &str| {
+        ok.get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("missing")
+            .to_string()
+    };
+    for control in [
+        "write-temp-root",
+        "write-home",
+        "write-cache-root",
+        "tcp-outbound",
+        "tcp-loopback-connect",
+        "tcp-listen",
+        "read-shell-profile",
+        "read-profile-dir",
+        "read-privileged",
+        "exec-undeclared",
+    ] {
+        let seen = outcome(control);
+        assert!(seen.starts_with("denied"), "{control}: {seen}");
+    }
+    assert_eq!(outcome("write-inside-jail"), "allowed");
+    drop(listener);
+    // No control left a mark on the host.
+    for marker in [
+        PathBuf::from("/tmp/text-mirror-control"),
+        home.join("text-mirror-control"),
+        cache_root.join("text-mirror-control"),
+    ] {
+        assert!(!marker.exists(), "{} was written", marker.display());
+    }
+    let _ = fs::remove_file(home.join(".text-mirror-control-profile"));
+}
+
+#[test]
+fn a_descendant_of_a_provider_component_inherits_the_jail() {
+    // The provider profile permits spawning, so a component's helpers
+    // are real descendants. The profile is inherited by the kernel: a
+    // child spawned inside the jail is denied the same host writes and
+    // reads its parent is, and can still write inside the jail.
+    let provider = FakeProvider::new(&[(64, 48)]);
+    let runner = provider_runner(&provider, brisk_limits());
+    let worker = worker_path();
+    let response = runner
+        .run(
+            "harness-spawn-probe",
+            serde_json::json!({
+                "program": worker.to_str().unwrap(),
+                "temp_root": "/tmp",
+                "privileged": "/etc/sudoers",
+            }),
+            &[],
+        )
+        .expect("the provider jail runs the spawn probe");
+    let ok = response.ok.expect("harness-spawn-probe succeeds");
+    assert_eq!(
+        ok.get("descendant_exited_cleanly")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    let report = ok.get("report").expect("the descendant reported");
+    let field = |name: &str| {
+        report
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("missing")
+            .to_string()
+    };
+    assert!(field("write-temp-root").starts_with("denied"), "{report}");
+    assert!(field("read-privileged").starts_with("denied"), "{report}");
+    assert_eq!(field("write-inside-jail"), "allowed", "{report}");
+    assert!(!Path::new("/tmp/text-mirror-descendant").exists());
+}
+
+#[test]
+fn a_descendant_that_outlives_its_leader_is_killed_with_the_group() {
+    // The provider profile permits spawning, so a helper can outlive
+    // the component that started it. The runner's unconditional group
+    // kill on the normal-exit path is what ends it, and this proves it
+    // does under the widened profile.
+    let provider = FakeProvider::new(&[(64, 48)]);
+    let runner = provider_runner(&provider, brisk_limits());
+    let worker = worker_path();
+    let response = runner
+        .run(
+            "harness-survivor",
+            serde_json::json!({ "program": worker.to_str().unwrap() }),
+            &[],
+        )
+        .expect("the provider jail runs the survivor probe");
+    let ok = response.ok.expect("harness-survivor succeeds");
+    let pid = ok
+        .get("survivor_pid")
+        .and_then(|v| v.as_u64())
+        .expect("survivor pid reported") as i32;
+    let mut alive = true;
+    for _ in 0..50 {
+        let listing = std::process::Command::new("/bin/ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        let state = String::from_utf8_lossy(&listing.stdout);
+        let state = state.trim();
+        if state.is_empty() || state.starts_with('Z') {
+            alive = false;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !alive,
+        "a descendant outlived the invocation under the provider jail (pid {pid})"
+    );
 }
 
 #[test]
@@ -344,6 +550,122 @@ fn convert_one(
     (dir, mirror, manifest)
 }
 
+/// The closure a substituted executable belongs to: its application
+/// bundle when it sits in one, otherwise its own directory.
+fn enclosing_closure(executable: &Path) -> PathBuf {
+    executable
+        .ancestors()
+        .find(|ancestor| {
+            ancestor
+                .extension()
+                .is_some_and(|extension| extension == "app")
+        })
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| executable.parent().unwrap().to_path_buf())
+}
+
+/// A runner over the configured provider exactly as the converter
+/// builds one: the configured executables as literal grants, the
+/// enumerated closure as the jail's subpaths.
+fn runner_from(config: &text_mirror::convert::provider::ProviderConfig) -> Runner {
+    let svg = config.svg().expect("a complete provider");
+    let mut closures = Vec::new();
+    for role in [&svg.raster, &svg.encoder] {
+        closures.extend(role.closure_roots.iter().cloned());
+    }
+    Runner::with_provider_jail(
+        platform_backend().unwrap(),
+        worker_path(),
+        brisk_limits(),
+        vec![svg.raster.path.clone(), svg.encoder.path.clone()],
+        Vec::new(),
+        ProviderJail::new(
+            closures,
+            svg.raster.jail_service_prefix.clone(),
+            svg.raster.jail_temp_env.clone(),
+        )
+        .expect("the configured parameters fit the grammar"),
+    )
+}
+
+#[test]
+fn the_provider_jail_reaches_the_enumerated_closure_and_nothing_around_it() {
+    // The closure is enumerated, so the jail reaches the dependencies a
+    // deployment measured and nothing else that shares their parent. A
+    // package store, an application directory, or any other shared root
+    // would put every unrelated program and every other version of the
+    // pinned one inside the boundary, which is what the enumeration and
+    // its pinned digest exist to prevent.
+    let Some((_, config)) = pinned_config() else {
+        eprintln!(
+            "skipped: TEXT_MIRROR_SVG_PROVIDER_CONFIG is not set, no pinned provider on this host"
+        );
+        return;
+    };
+    let svg = config.svg().expect("a complete provider");
+    let runner = runner_from(&config);
+
+    // Positive control: a file inside the enumerated closure is
+    // readable, so a denial below is the boundary and not an empty
+    // grant.
+    let inside = svg.encoder.path.to_str().unwrap().to_string();
+    let response = runner
+        .run(
+            "harness-escape",
+            serde_json::json!({ "read_path": inside }),
+            &[],
+        )
+        .expect("the provider jail runs the escape probe");
+    let ok = response.ok.expect("harness-escape succeeds");
+    let read = ok.get("read").and_then(|v| v.as_str()).unwrap_or_default();
+    assert!(
+        read.contains("succeeded"),
+        "the enumerated closure must be readable: {read}"
+    );
+
+    // A file in a neighbouring installation nobody enumerated.
+    match std::env::var("TEXT_MIRROR_SVG_PROVIDER_UNRELATED_FILE") {
+        Ok(path) if Path::new(&path).is_file() => {
+            let response = runner
+                .run(
+                    "harness-escape",
+                    serde_json::json!({ "read_path": path, "list_path": path }),
+                    &[],
+                )
+                .expect("the provider jail runs the escape probe");
+            let ok = response.ok.expect("harness-escape succeeds");
+            let read = ok.get("read").and_then(|v| v.as_str()).unwrap_or_default();
+            assert!(
+                read.contains("denied"),
+                "a neighbouring installation was readable: {read}"
+            );
+        }
+        _ => eprintln!(
+            "note: TEXT_MIRROR_SVG_PROVIDER_UNRELATED_FILE is unset, the neighbouring-read control is not exercised"
+        ),
+    }
+
+    // A program in a neighbouring installation nobody enumerated.
+    match std::env::var("TEXT_MIRROR_SVG_PROVIDER_UNDECLARED_BINARY") {
+        Ok(path) if Path::new(&path).is_file() => {
+            let response = runner
+                .run(
+                    "harness-survivor",
+                    serde_json::json!({ "program": path }),
+                    &[],
+                )
+                .expect("the provider jail runs the spawn probe");
+            let error = response
+                .error
+                .expect("an undeclared neighbouring program must not run");
+            assert_eq!(error.code, "spawn_failed", "{error:?}");
+        }
+        _ => eprintln!(
+            "note: TEXT_MIRROR_SVG_PROVIDER_UNDECLARED_BINARY is unset, the neighbouring-exec control is not exercised"
+        ),
+    }
+}
+
 #[test]
 fn the_pinned_provider_renders_identically_across_cold_processes() {
     // The determinism gate, run against the real installation when one
@@ -440,16 +762,29 @@ fn a_substituted_pinned_component_is_refused_by_its_hash() {
 
     for (planted_role, planting, swap_to) in plantings {
         let role_block = |label: &str, role: &text_mirror::convert::provider::ProviderRole| {
-            let path = match (&swap_to, label == planted_role) {
+            let swapped = swap_to.is_some() && label == planted_role;
+            let path = match (&swap_to, swapped) {
                 (Some(swap), true) => swap.display().to_string(),
                 _ => role.path.display().to_string(),
             };
-            // The closure and the jail parameters travel unchanged, so
-            // the only difference from a working configuration is the
-            // planted fault.
-            let closure = match &role.closure_root {
-                Some(root) => format!("closure_root = \"{}\"\n", root.display()),
-                None => String::new(),
+            // A substituted executable must sit inside an enumerated
+            // closure to be configurable at all, which is what a real
+            // substitution at an installed location looks like: the
+            // closure moves with it, so the refusal comes from the
+            // executable's own hash and nothing earlier. The jail
+            // parameters travel unchanged.
+            let closure_roots: Vec<PathBuf> = match (&swap_to, swapped) {
+                (Some(swap), true) => vec![enclosing_closure(swap)],
+                _ => role.closure_roots.clone(),
+            };
+            let closure = if closure_roots.is_empty() {
+                String::new()
+            } else {
+                let entries: Vec<String> = closure_roots
+                    .iter()
+                    .map(|root| format!("\"{}\"", root.display()))
+                    .collect();
+                format!("closure_roots = [{}]\n", entries.join(", "))
             };
             let mut jail = String::new();
             if let Some(prefix) = &role.jail_service_prefix {

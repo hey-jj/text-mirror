@@ -1124,6 +1124,28 @@ impl Registry {
                                     message: "a provider is configured but [image_ocr.svg_provider] pins no expectations for it".to_string(),
                                 });
                             }
+                            // A role that enumerates a closure must
+                            // have that closure pinned. Without the
+                            // digest the jail would grant a subtree
+                            // nothing asserts the contents of, which is
+                            // the one thing the aggregate digest exists
+                            // to prevent.
+                            for (label, role) in [
+                                (provider::PROVIDER_ROLE_RASTER, &svg.raster),
+                                (provider::PROVIDER_ROLE_ENCODER, &svg.encoder),
+                            ] {
+                                provider::check_closure_is_pinned(
+                                    label,
+                                    role,
+                                    image_ocr_limits.svg_provider.get(label),
+                                )
+                                .map_err(|message| {
+                                    Error::Rules {
+                                        name: name.to_string(),
+                                        message,
+                                    }
+                                })?;
+                            }
                             Box::new(subprocess::ImagePixelOcr::with_svg_provider(
                                 image_ocr_limits.clone(),
                                 inventory,

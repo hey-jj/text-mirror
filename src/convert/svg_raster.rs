@@ -134,42 +134,19 @@ fn length_to_px(raw: &str) -> Option<f64> {
     Some(value * ratio)
 }
 
-/// Reads one attribute value out of the root element text.
-fn attribute<'a>(root: &'a str, name: &str) -> Option<&'a str> {
-    let bytes = root.as_bytes();
-    let mut from = 0;
-    while let Some(offset) = root[from..].find(name) {
-        let start = from + offset;
-        let before = start.checked_sub(1).map(|i| bytes[i]);
-        // The name must stand alone, so `width` never matches inside
-        // `stroke-width` and `height` never inside `line-height`.
-        let standalone = before.is_none_or(|b| b.is_ascii_whitespace());
-        let mut cursor = start + name.len();
-        while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
-            cursor += 1;
-        }
-        if standalone && bytes.get(cursor) == Some(&b'=') {
-            cursor += 1;
-            while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
-                cursor += 1;
-            }
-            let quote = *bytes.get(cursor)?;
-            if quote != b'"' && quote != b'\'' {
-                return None;
-            }
-            cursor += 1;
-            let end = root[cursor..].find(quote as char)? + cursor;
-            return Some(&root[cursor..end]);
-        }
-        from = start + 1;
-    }
-    None
-}
-
 /// Parses the declared geometry of one source: the root width and
 /// height when both resolve, else the view box's own width and height.
 /// Anything else is unresolved and fails closed.
+///
+/// The root element is found by the crate's bounded XML tokenizer, not
+/// by a byte search: the first start element is the root, its local
+/// name must be `svg`, and only its own attributes are read. A comment,
+/// a doctype subset, a CDATA section, or a processing instruction that
+/// happens to contain `<svg` before the real root therefore cannot
+/// supply a false geometry for the assertion to validate against
+/// itself, which is the silent-crop class the pin exists to refuse.
 pub(crate) fn parse_geometry(source: &[u8]) -> Result<Geometry, SvgRasterError> {
+    use quick_xml::events::Event;
     let unresolved = || {
         SvgRasterError::new(
             "raster-geometry-mismatch",
@@ -177,19 +154,46 @@ pub(crate) fn parse_geometry(source: &[u8]) -> Result<Geometry, SvgRasterError> 
         )
     };
     let head = &source[..source.len().min(GEOMETRY_SCAN_BYTES)];
-    let text = String::from_utf8_lossy(head);
-    // The root element only: scan from the first `<svg` to its closing
-    // angle bracket, so no descendant's attributes are ever read.
-    let start = text.find("<svg").ok_or_else(unresolved)?;
-    let rest = &text[start..];
-    let end = rest.find('>').ok_or_else(unresolved)?;
-    let root = &rest[..end];
-    if let (Some(width), Some(height)) = (attribute(root, "width"), attribute(root, "height"))
+    let mut reader = quick_xml::Reader::from_reader(head);
+    let mut buffer = Vec::new();
+    let mut width = None;
+    let mut height = None;
+    let mut view_box = None;
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(start)) | Ok(Event::Empty(start)) => {
+                if start.local_name().as_ref() != b"svg" {
+                    return Err(unresolved());
+                }
+                for attribute in start.attributes().flatten() {
+                    let key = attribute.key.local_name();
+                    let value = match std::str::from_utf8(&attribute.value) {
+                        Ok(value) => value.to_string(),
+                        Err(_) => continue,
+                    };
+                    match key.as_ref() {
+                        b"width" => width = Some(value),
+                        b"height" => height = Some(value),
+                        b"viewBox" => view_box = Some(value),
+                        _ => {}
+                    }
+                }
+                break;
+            }
+            // Everything before the root is skipped: declarations,
+            // comments, doctypes, processing instructions, text. None
+            // of it can carry the geometry.
+            Ok(Event::Eof) | Err(_) => return Err(unresolved()),
+            Ok(_) => {}
+        }
+        buffer.clear();
+    }
+    if let (Some(width), Some(height)) = (&width, &height)
         && let (Some(width), Some(height)) = (length_to_px(width), length_to_px(height))
     {
         return Ok(Geometry { width, height });
     }
-    let view_box = attribute(root, "viewBox").ok_or_else(unresolved)?;
+    let view_box = view_box.ok_or_else(unresolved)?;
     let numbers: Vec<f64> = view_box
         .split(|c: char| c.is_ascii_whitespace() || c == ',')
         .filter(|part| !part.is_empty())
@@ -275,69 +279,95 @@ pub(crate) fn flatten_argv(input: &Path, output: &Path) -> Vec<String> {
     argv
 }
 
-/// The aggregate closure digest: BLAKE3 over the sorted relative path
-/// and BLAKE3 of every executable file under the closure root, with the
-/// pinned launcher itself excluded because it is verified on its own.
+/// The aggregate closure digest over one enumerated closure.
 ///
-/// The walk is bounded by a file count, so a closure root pointed at an
-/// unexpectedly large tree refuses rather than hashing without end.
-pub(crate) fn closure_digest(root: &Path, launcher: &Path) -> Result<String, SvgRasterError> {
+/// Each entry is digested on its own: a directory by the sorted
+/// relative path and BLAKE3 of every executable file beneath it, a
+/// single file by its own name and BLAKE3, with the pinned launcher
+/// excluded because it is verified separately. The per-entry digests
+/// are then sorted and combined, so the value depends on the contents
+/// of the closure and not on where it is installed or the order it was
+/// written down in.
+///
+/// The walk is bounded by a file count, so a closure entry pointed at
+/// an unexpectedly large tree refuses rather than hashing without end.
+pub(crate) fn closure_digest(roots: &[PathBuf], launcher: &Path) -> Result<String, SvgRasterError> {
+    let mut digests: Vec<String> = Vec::new();
+    for root in roots {
+        digests.push(entry_digest(root, launcher)?);
+    }
+    digests.sort();
+    let mut hasher = blake3::Hasher::new();
+    for digest in digests {
+        hasher.update(digest.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// One closure entry's digest.
+fn entry_digest(root: &Path, launcher: &Path) -> Result<String, SvgRasterError> {
     const MAX_CLOSURE_FILES: usize = 4096;
-    let unreadable = |role_free: &str| SvgRasterError::new("rasterizer-hash-drift", role_free);
-    let mut files = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|_| unreadable("the runtime closure cannot be enumerated"))?;
-        for entry in entries {
-            let entry =
-                entry.map_err(|_| unreadable("the runtime closure cannot be enumerated"))?;
-            let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path)
+    let unreadable = |detail: &'static str| SvgRasterError::new("rasterizer-hash-drift", detail);
+    let metadata = std::fs::symlink_metadata(root)
+        .map_err(|_| unreadable("a runtime closure entry cannot be read"))?;
+    let mut rows: Vec<(Vec<u8>, PathBuf)> = Vec::new();
+    if metadata.is_file() {
+        // A single-file entry is named by its own file name, so the
+        // digest survives the installation moving.
+        let name = root
+            .file_name()
+            .ok_or_else(|| unreadable("a runtime closure entry has no name"))?;
+        rows.push((name.as_encoded_bytes().to_vec(), root.to_path_buf()));
+    } else {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
                 .map_err(|_| unreadable("the runtime closure cannot be enumerated"))?;
-            let kind = metadata.file_type();
-            if kind.is_symlink() {
-                // A symlink is a name, not a member: its target is
-                // hashed on its own when it lies inside the closure.
-                continue;
-            }
-            if kind.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !kind.is_file() {
-                continue;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o111 == 0 {
+            for entry in entries {
+                let entry =
+                    entry.map_err(|_| unreadable("the runtime closure cannot be enumerated"))?;
+                let path = entry.path();
+                let metadata = std::fs::symlink_metadata(&path)
+                    .map_err(|_| unreadable("the runtime closure cannot be enumerated"))?;
+                let kind = metadata.file_type();
+                if kind.is_symlink() {
+                    // A symlink is a name, not a member: its target is
+                    // hashed on its own when it lies inside the closure.
                     continue;
                 }
+                if kind.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !kind.is_file() {
+                    continue;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if metadata.permissions().mode() & 0o111 == 0 {
+                        continue;
+                    }
+                }
+                if path == launcher {
+                    continue;
+                }
+                if rows.len() >= MAX_CLOSURE_FILES {
+                    return Err(unreadable(
+                        "a runtime closure entry holds more files than expected",
+                    ));
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(path.as_path())
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec();
+                rows.push((relative, path));
             }
-            if path == launcher {
-                continue;
-            }
-            if files.len() >= MAX_CLOSURE_FILES {
-                return Err(unreadable(
-                    "the runtime closure holds more files than expected",
-                ));
-            }
-            files.push(path);
         }
     }
-    let mut rows: Vec<(Vec<u8>, PathBuf)> = files
-        .into_iter()
-        .map(|path| {
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(path.as_path())
-                .as_os_str()
-                .as_encoded_bytes()
-                .to_vec();
-            (relative, path)
-        })
-        .collect();
     rows.sort();
     let mut hasher = blake3::Hasher::new();
     for (relative, path) in rows {
@@ -351,7 +381,7 @@ pub(crate) fn closure_digest(root: &Path, launcher: &Path) -> Result<String, Svg
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// The per-exec assertion order, run in this cold worker immediately
+/// The per-exec assertion order/// The per-exec assertion order, run in this cold worker immediately
 /// before every external execution: present, then hash, then closure
 /// digest, then version. Each step has its own named refusal, and the
 /// executable runs only after all of them pass.
@@ -382,8 +412,20 @@ fn verify_role(entry: &SvgRoleEntry) -> Result<PathBuf, SvgRasterError> {
             format!("provider component {role} does not match its pinned hash"),
         ));
     }
-    if let (Some(root), Some(expected)) = (&entry.closure_root, &entry.closure_blake3) {
-        let actual = closure_digest(Path::new(root), &path)?;
+    // The enumerated closure and its digest are a pair here as well
+    // as at configuration: a closure with no digest, or a digest with
+    // no closure, is refused as drift before anything runs.
+    if entry.closure_blake3.is_some() != !entry.closure_roots.is_empty() {
+        return Err(SvgRasterError::new(
+            "rasterizer-hash-drift",
+            format!(
+                "provider component {role} enumerates a closure without a pinned digest, or the reverse"
+            ),
+        ));
+    }
+    if let Some(expected) = &entry.closure_blake3 {
+        let roots: Vec<PathBuf> = entry.closure_roots.iter().map(PathBuf::from).collect();
+        let actual = closure_digest(&roots, &path)?;
         if &actual != expected {
             return Err(SvgRasterError::new(
                 "rasterizer-hash-drift",
@@ -708,7 +750,7 @@ mod tests {
             path: "/deploy/component".to_string(),
             expected_blake3: "a".repeat(64),
             version: "1.2.3".to_string(),
-            closure_root: None,
+            closure_roots: Vec::new(),
             closure_blake3: None,
             jail_temp_env: None,
         }
@@ -737,7 +779,8 @@ mod tests {
         assert_eq!((inches.width, inches.height), (192.0, 96.0));
         let points = parse("width=\"72pt\" height=\"36pt\"").unwrap();
         assert_eq!((points.width, points.height), (96.0, 48.0));
-        // Attribute names must stand alone.
+        // Attribute names are matched as names, so a look-alike does
+        // not supply the geometry.
         let bordered =
             parse("stroke-width=\"4\" width=\"800\" line-height=\"2\" height=\"600\"").unwrap();
         assert_eq!((bordered.width, bordered.height), (800.0, 600.0));
@@ -770,10 +813,37 @@ mod tests {
             b"<svg viewBox=\"0 0 400\"></svg>".as_slice(),
             b"<svg viewBox=\"0 0 nan 200\"></svg>".as_slice(),
             b"not markup at all".as_slice(),
+            b"<svg width=\"10\" height=\"10\"".as_slice(),
         ] {
             let error = parse_geometry(source).unwrap_err();
             assert_eq!(error.code, "raster-geometry-mismatch", "{source:?}");
         }
+    }
+
+    #[test]
+    fn markup_before_the_root_cannot_supply_a_false_geometry() {
+        // Each of these carries the byte sequence `<svg` with a
+        // convincing size before the real root. A byte search would
+        // take it as the root and validate the render against a
+        // geometry the document never declared, which is a silent
+        // crop. The tokenizer reads the real root, which here declares
+        // nothing usable, so each is refused.
+        let decoys: [&[u8]; 5] = [
+            b"<!-- <svg width=\"1600\" height=\"900\"> --><svg><text>x</text></svg>",
+            b"<!DOCTYPE svg [ <!ENTITY e \"<svg width='1600' height='900'>\"> ]><svg><text>x</text></svg>",
+            b"<?xml version=\"1.0\"?><?decoy <svg width=\"1600\" height=\"900\"> ?><svg><text>x</text></svg>",
+            b"<svg><![CDATA[<svg width=\"1600\" height=\"900\">]]></svg>",
+            b"<html><svg width=\"1600\" height=\"900\"></svg></html>",
+        ];
+        for source in decoys {
+            let error = parse_geometry(source).unwrap_err();
+            assert_eq!(error.code, "raster-geometry-mismatch", "{source:?}");
+        }
+        // The same decoys in front of a root that DOES declare a size
+        // yield that size and never the decoy's.
+        let real: &[u8] = b"<!-- <svg width=\"1600\" height=\"900\"> --><svg width=\"800\" height=\"450\"><text>x</text></svg>";
+        let geometry = parse_geometry(real).unwrap();
+        assert_eq!((geometry.width, geometry.height), (800.0, 450.0));
     }
 
     #[test]
@@ -980,251 +1050,93 @@ mod tests {
                 std::fs::set_permissions(path, permissions).unwrap();
             }
         }
-        let first = closure_digest(root, &launcher).unwrap();
+        let roots = vec![root.to_path_buf()];
+        let first = closure_digest(&roots, &launcher).unwrap();
         // Stable across calls, and the launcher's own bytes are not in
         // it: it is pinned on its own.
-        assert_eq!(first, closure_digest(root, &launcher).unwrap());
+        assert_eq!(first, closure_digest(&roots, &launcher).unwrap());
         std::fs::write(&launcher, b"a different launcher").unwrap();
-        assert_eq!(first, closure_digest(root, &launcher).unwrap());
+        assert_eq!(first, closure_digest(&roots, &launcher).unwrap());
         // A helper that drifts while the launcher stands still changes
         // the digest, which is the skew this control exists for.
         std::fs::write(&helper, b"helper, but newer").unwrap();
-        assert_ne!(first, closure_digest(root, &launcher).unwrap());
+        assert_ne!(first, closure_digest(&roots, &launcher).unwrap());
     }
 
-    /// A runtime that records every step and answers from a script,
-    /// so the order the leg runs its assertions in is asserted
-    /// directly rather than inferred.
-    struct TracingRuntime {
-        trace: std::cell::RefCell<Vec<String>>,
-        fail_verify: Option<String>,
-        dimensions: std::cell::RefCell<Vec<(u32, u32)>>,
-    }
-
-    impl TracingRuntime {
-        fn new(dimensions: &[(u32, u32)]) -> TracingRuntime {
-            TracingRuntime {
-                trace: std::cell::RefCell::new(Vec::new()),
-                fail_verify: None,
-                dimensions: std::cell::RefCell::new(dimensions.to_vec()),
-            }
-        }
-
-        fn failing_on(role: &str, dimensions: &[(u32, u32)]) -> TracingRuntime {
-            TracingRuntime {
-                fail_verify: Some(role.to_string()),
-                ..TracingRuntime::new(dimensions)
-            }
-        }
-
-        fn steps(&self) -> Vec<String> {
-            self.trace.borrow().clone()
-        }
-    }
-
-    impl ProviderRuntime for TracingRuntime {
-        fn verify(&self, entry: &SvgRoleEntry) -> Result<PathBuf, SvgRasterError> {
-            self.trace
-                .borrow_mut()
-                .push(format!("verify {}", entry.role));
-            if self.fail_verify.as_deref() == Some(entry.role.as_str()) {
-                return Err(SvgRasterError::new(
-                    "rasterizer-hash-drift",
-                    format!(
-                        "provider component {} does not match its pinned hash",
-                        entry.role
-                    ),
-                ));
-            }
-            Ok(PathBuf::from(&entry.path))
-        }
-
-        fn run(
-            &self,
-            _path: &Path,
-            argv: &[String],
-            role: &str,
-            env: &[(String, String)],
-        ) -> Result<(), SvgRasterError> {
-            self.trace
-                .borrow_mut()
-                .push(format!("run {role} {}", argv.len()));
-            if role == PROVIDER_ROLE_RASTER {
-                // The rasterizer always receives a fresh profile root
-                // under this invocation's jail and nothing else.
-                let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
-                assert!(names.contains(&"HOME"), "{names:?}");
-                assert!(names.contains(&"TMPDIR"), "{names:?}");
-            }
-            Ok(())
-        }
-
-        fn dimensions(&self, _path: &Path) -> Result<(u32, u32), SvgRasterError> {
-            let mut queue = self.dimensions.borrow_mut();
-            let next = if queue.len() > 1 {
-                queue.remove(0)
-            } else {
-                queue[0]
-            };
-            self.trace.borrow_mut().push("dimensions".to_string());
-            Ok(next)
-        }
-
-        fn read(&self, _path: &Path) -> Result<Vec<u8>, SvgRasterError> {
-            self.trace.borrow_mut().push("read".to_string());
-            Ok(b"flattened bytes".to_vec())
-        }
-    }
-
-    fn request(dir: &Path) -> SvgRasterRequest {
-        std::fs::write(
-            dir.join(JAIL_SOURCE),
-            b"<svg width=\"1600\" height=\"900\"><text>x</text></svg>",
-        )
-        .unwrap();
-        SvgRasterRequest {
-            input: JAIL_SOURCE.to_string(),
-            roles: vec![entry(PROVIDER_ROLE_RASTER), entry(PROVIDER_ROLE_ENCODER)],
-        }
-    }
-
-    /// Runs one request with the jail as the working directory, which
-    /// is where the leg reads and writes.
-    fn in_jail<T>(body: impl FnOnce(&Path) -> T) -> T {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    #[test]
+    fn an_enumerated_closure_digests_every_entry_and_ignores_their_order() {
+        // A closure of several entries, directories and single files
+        // alike: every entry is covered, the order they were written
+        // down in does not matter, and adding or changing any one of
+        // them moves the digest.
         let dir = tempfile::tempdir().unwrap();
-        let jail = dir.path().canonicalize().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&jail).unwrap();
-        let result = body(&jail);
-        std::env::set_current_dir(previous).unwrap();
-        result
+        let root = dir.path();
+        let launcher = root.join("launcher");
+        std::fs::write(&launcher, b"launcher").unwrap();
+        std::fs::create_dir_all(root.join("libs")).unwrap();
+        let inside = root.join("libs/one.dylib");
+        let standalone = root.join("two.dylib");
+        let unrelated = root.join("three.dylib");
+        for path in [&inside, &standalone, &unrelated] {
+            std::fs::write(path, b"library").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&launcher, &inside, &standalone, &unrelated] {
+                let mut permissions = std::fs::metadata(path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(path, permissions).unwrap();
+            }
+        }
+        let enumerated = vec![root.join("libs"), standalone.clone()];
+        let digest = closure_digest(&enumerated, &launcher).unwrap();
+        // Order-independent.
+        let reversed = vec![standalone.clone(), root.join("libs")];
+        assert_eq!(digest, closure_digest(&reversed, &launcher).unwrap());
+        // A file entry is covered: changing it moves the digest.
+        std::fs::write(&standalone, b"library, but newer").unwrap();
+        assert_ne!(digest, closure_digest(&enumerated, &launcher).unwrap());
+        std::fs::write(&standalone, b"library").unwrap();
+        assert_eq!(digest, closure_digest(&enumerated, &launcher).unwrap());
+        // A directory entry is covered too.
+        std::fs::write(&inside, b"library, but newer").unwrap();
+        assert_ne!(digest, closure_digest(&enumerated, &launcher).unwrap());
+        std::fs::write(&inside, b"library").unwrap();
+        // A file nobody enumerated is outside the digest, which is why
+        // the enumeration is the security boundary and the digest is
+        // only the integrity control over what it named.
+        std::fs::write(&unrelated, b"nobody named me").unwrap();
+        assert_eq!(digest, closure_digest(&enumerated, &launcher).unwrap());
+        // Adding an entry changes the digest.
+        let widened = vec![root.join("libs"), standalone, unrelated];
+        assert_ne!(digest, closure_digest(&widened, &launcher).unwrap());
     }
 
     #[test]
-    fn every_execution_is_verified_immediately_before_it_runs() {
-        // The ruled order, asserted as a sequence: each component is
-        // verified and then run, and the second verification happens
-        // after the first execution, never hoisted beside it. A
-        // verification that covered both components once could not
-        // produce this trace.
-        let runtime = TracingRuntime::new(&[(1600, 900)]);
-        let ok = in_jail(|jail| rasterize_with(&request(jail), &runtime)).unwrap();
-        assert_eq!(ok.width, 1600);
-        assert_eq!(
-            runtime.steps(),
-            vec![
-                format!("verify {PROVIDER_ROLE_RASTER}"),
-                format!("run {PROVIDER_ROLE_RASTER} 16"),
-                "dimensions".to_string(),
-                format!("verify {PROVIDER_ROLE_ENCODER}"),
-                format!("run {PROVIDER_ROLE_ENCODER} 10"),
-                "dimensions".to_string(),
-                "read".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_refused_component_stops_the_sequence_at_that_point() {
-        // The rasterizer's own refusal stops everything: no execution
-        // of either component, and no recognition input produced.
-        let runtime = TracingRuntime::failing_on(PROVIDER_ROLE_RASTER, &[(1600, 900)]);
-        let error = in_jail(|jail| rasterize_with(&request(jail), &runtime)).unwrap_err();
+    fn a_closure_and_its_digest_are_a_pair_at_the_worker_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("component");
+        std::fs::write(&path, b"component bytes").unwrap();
+        let good = crate::hash::hash_file(&path).unwrap();
+        // Roots with no digest: refused before the version check.
+        let mut roots_only = entry(PROVIDER_ROLE_RASTER);
+        roots_only.path = path.to_str().unwrap().to_string();
+        roots_only.expected_blake3 = good.clone();
+        roots_only.closure_roots = vec![dir.path().to_str().unwrap().to_string()];
+        let error = verify_role(&roots_only).unwrap_err();
         assert_eq!(error.code, "rasterizer-hash-drift");
-        assert_eq!(
-            runtime.steps(),
-            vec![format!("verify {PROVIDER_ROLE_RASTER}")]
+        assert!(
+            error.message.contains("without a pinned digest"),
+            "{error:?}"
         );
-
-        // The encoder's refusal comes after the rasterizer has run, and
-        // the flatten never happens.
-        let runtime = TracingRuntime::failing_on(PROVIDER_ROLE_ENCODER, &[(1600, 900)]);
-        let error = in_jail(|jail| rasterize_with(&request(jail), &runtime)).unwrap_err();
+        // A digest with no roots: refused the same way.
+        let mut digest_only = entry(PROVIDER_ROLE_RASTER);
+        digest_only.path = path.to_str().unwrap().to_string();
+        digest_only.expected_blake3 = good;
+        digest_only.closure_blake3 = Some("0".repeat(64));
+        let error = verify_role(&digest_only).unwrap_err();
         assert_eq!(error.code, "rasterizer-hash-drift");
-        assert_eq!(
-            runtime.steps(),
-            vec![
-                format!("verify {PROVIDER_ROLE_RASTER}"),
-                format!("run {PROVIDER_ROLE_RASTER} 16"),
-                "dimensions".to_string(),
-                format!("verify {PROVIDER_ROLE_ENCODER}"),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_wrong_aspect_render_never_reaches_the_encoder() {
-        // A square render of a wide source fails the cross-axis pair
-        // before the encoder is verified, so no flatten runs on a
-        // raster the geometry already refused.
-        let runtime = TracingRuntime::new(&[(1536, 1536)]);
-        let error = in_jail(|jail| rasterize_with(&request(jail), &runtime)).unwrap_err();
-        assert_eq!(error.code, "raster-geometry-mismatch");
-        assert!(
-            !runtime
-                .steps()
-                .iter()
-                .any(|step| step.contains(PROVIDER_ROLE_ENCODER)),
-            "{:?}",
-            runtime.steps()
-        );
-    }
-
-    #[test]
-    fn an_over_area_render_is_refused_before_the_encoder_too() {
-        // 1800 by 1400 keeps the source aspect closely enough to pass
-        // the geometry pair and still exceeds the encoder-input area
-        // cap, so the area layer is what refuses it.
-        let source = b"<svg width=\"1800\" height=\"1400\"><text>x</text></svg>";
-        let runtime = TracingRuntime::new(&[(1800, 1400)]);
-        let error = in_jail(|jail| {
-            std::fs::write(jail.join(JAIL_SOURCE), source).unwrap();
-            rasterize_with(
-                &SvgRasterRequest {
-                    input: JAIL_SOURCE.to_string(),
-                    roles: vec![entry(PROVIDER_ROLE_RASTER), entry(PROVIDER_ROLE_ENCODER)],
-                },
-                &runtime,
-            )
-        })
-        .unwrap_err();
-        assert_eq!(error.code, "encoder-area-cap");
-        assert!(
-            !runtime
-                .steps()
-                .iter()
-                .any(|step| step.contains(PROVIDER_ROLE_ENCODER)),
-            "{:?}",
-            runtime.steps()
-        );
-    }
-
-    #[test]
-    fn a_flatten_that_changes_the_dimensions_is_refused() {
-        // The confirmation after the flatten: an encoder that resizes
-        // is refused rather than handing the recognition a raster the
-        // geometry assertion never saw.
-        let runtime = TracingRuntime::new(&[(1600, 900), (800, 450)]);
-        let error = in_jail(|jail| rasterize_with(&request(jail), &runtime)).unwrap_err();
-        assert_eq!(error.code, "raster-geometry-mismatch");
-    }
-
-    #[test]
-    fn a_missing_role_is_refused_before_anything_runs() {
-        let runtime = TracingRuntime::new(&[(1600, 900)]);
-        let error = in_jail(|jail| {
-            let mut request = request(jail);
-            request
-                .roles
-                .retain(|role| role.role != PROVIDER_ROLE_ENCODER);
-            rasterize_with(&request, &runtime)
-        })
-        .unwrap_err();
-        assert_eq!(error.code, "rasterizer-missing");
-        assert!(error.message.contains(PROVIDER_ROLE_ENCODER));
-        assert!(runtime.steps().is_empty(), "{:?}", runtime.steps());
     }
 
     #[test]

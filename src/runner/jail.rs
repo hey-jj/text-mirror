@@ -63,25 +63,88 @@ impl RuntimeProfile {
 }
 
 /// The provider jail's measured parameters: the executable closures the
-/// pinned components load from, and the service namespace their runtime
-/// registers under.
+/// pinned components load from, the service namespace their runtime
+/// registers under, and the temp-directory variable it reads.
 ///
-/// Both are deployment data, so neither is a literal in this crate. The
-/// closures are granted as subpaths, which is wider than a literal file
-/// grant and is why the worker asserts an aggregate digest over each
-/// closure before every execution.
+/// All three are deployment data, so none is a literal in this crate.
+/// The fields are private and the only constructor validates: the
+/// closures must not be shared roots, the namespace must fit the one
+/// closed grammar the profile accepts, and the variable must be a
+/// bounded identifier. A caller inside or outside the crate cannot
+/// hand the renderer a value the configuration layer would have
+/// refused, so the render boundary and the configuration boundary
+/// enforce the same shapes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderJail {
-    /// Roots granted read and execute as subpaths.
-    pub closures: Vec<std::path::PathBuf>,
-    /// The namespace service registration is scoped to, when the
-    /// runtime registers any. `None` grants no registration at all.
-    pub service_prefix: Option<String>,
-    /// The additional temp-directory variable the worker sets for the
-    /// runtime, when it reads one. Not rendered into the profile, but
-    /// part of this jail's identity all the same, so the probe pass is
-    /// keyed on every parameter the deployment supplied.
-    pub temp_env: Option<String>,
+    closures: Vec<std::path::PathBuf>,
+    service_prefix: Option<String>,
+    temp_env: Option<String>,
+}
+
+impl ProviderJail {
+    /// Validates and builds the parameters. Every refusal is
+    /// `sandbox_unavailable`, because a jail that cannot be rendered
+    /// as measured is a jail that must not run.
+    pub fn new(
+        closures: Vec<std::path::PathBuf>,
+        service_prefix: Option<String>,
+        temp_env: Option<String>,
+    ) -> Result<ProviderJail, RunnerError> {
+        let refuse = |message: String| RunnerError {
+            code: "sandbox_unavailable",
+            message,
+        };
+        for closure in &closures {
+            if !closure.is_absolute() {
+                return Err(refuse(format!(
+                    "closure entry {} is not absolute",
+                    closure.display()
+                )));
+            }
+            if crate::convert::provider::is_shared_root(closure) {
+                return Err(refuse(format!(
+                    "closure entry {} is a shared root, not a measured dependency",
+                    closure.display()
+                )));
+            }
+        }
+        if let Some(prefix) = &service_prefix
+            && !crate::convert::provider::is_service_namespace(prefix)
+        {
+            return Err(refuse(
+                "the service namespace is not an anchored dotted prefix".to_string(),
+            ));
+        }
+        if let Some(name) = &temp_env
+            && !crate::convert::provider::is_env_name(name)
+        {
+            return Err(refuse(
+                "the temp-directory variable is not a bounded identifier".to_string(),
+            ));
+        }
+        Ok(ProviderJail {
+            closures,
+            service_prefix,
+            temp_env,
+        })
+    }
+
+    /// The enumerated closure entries, each granted on its own.
+    pub fn closures(&self) -> &[std::path::PathBuf] {
+        &self.closures
+    }
+
+    /// The service namespace, when the runtime registers any.
+    pub fn service_prefix(&self) -> Option<&str> {
+        self.service_prefix.as_deref()
+    }
+
+    /// The additional temp-directory variable, when the runtime reads
+    /// one. Not rendered into the profile, but part of this jail's
+    /// identity all the same.
+    pub fn temp_env(&self) -> Option<&str> {
+        self.temp_env.as_deref()
+    }
 }
 
 /// What one adapter invocation needs from a backend.
@@ -197,8 +260,8 @@ pub(super) fn policy_digest(
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
                 .join(","),
-            provider.service_prefix.clone().unwrap_or_default(),
-            provider.temp_env.clone().unwrap_or_default()
+            provider.service_prefix().unwrap_or_default(),
+            provider.temp_env().unwrap_or_default()
         ),
         None => String::new(),
     };

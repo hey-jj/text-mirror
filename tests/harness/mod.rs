@@ -43,6 +43,15 @@ pub fn png_bytes(width: u32, height: u32) -> Vec<u8> {
     out
 }
 
+/// The interpreter and helpers the synthetic programs depend on, each
+/// enumerated as a single file, the shape a measured dependency takes
+/// when it is not a directory. The shell re-executes a variant of
+/// itself on this platform, so the variant is part of the measured set:
+/// enumerating a dependency means enumerating what it actually loads
+/// and runs, which is the whole point of measuring instead of granting
+/// the directory they share.
+const CLOSURE_FILES: [&str; 3] = ["/bin/sh", "/bin/bash", "/bin/cp"];
+
 /// The version each synthetic component reports.
 const RASTER_VERSION: &str = "3.1.4";
 const ENCODER_VERSION: &str = "9.9.9";
@@ -59,10 +68,22 @@ pub struct FakeProvider {
     raster_blake3: String,
     encoder_blake3: String,
     closure_blake3: String,
+    encoder_closure_blake3: String,
     raster_version: String,
     encoder_version: String,
     raster_present: bool,
     encoder_present: bool,
+    jail_service_prefix: Option<String>,
+    jail_temp_env: Option<String>,
+}
+
+/// The synthetic encoder's enumerated closure: the program itself and
+/// the three files it depends on. An executable must lie inside its
+/// own closure, and for a single-file component the entry is the file.
+fn encoder_closure(encoder: &Path) -> Vec<PathBuf> {
+    std::iter::once(encoder.to_path_buf())
+        .chain(CLOSURE_FILES.iter().map(PathBuf::from))
+        .collect()
 }
 
 fn write_program(path: &Path, body: &str) {
@@ -76,11 +97,34 @@ fn write_program(path: &Path, body: &str) {
     }
 }
 
-/// The aggregate closure digest over a directory, computed the way the
-/// worker computes it: every executable file except the launcher, by
-/// sorted relative path and content hash.
-fn closure_digest(root: &Path, launcher: &Path) -> String {
+/// The aggregate digest over an enumerated closure, computed the way
+/// the worker computes it: each entry digested on its own, the entry
+/// digests then sorted and combined.
+fn closure_digest(roots: &[PathBuf], launcher: &Path) -> String {
+    let mut digests: Vec<String> = roots
+        .iter()
+        .map(|root| entry_digest(root, launcher))
+        .collect();
+    digests.sort();
+    let mut hasher = blake3::Hasher::new();
+    for digest in digests {
+        hasher.update(digest.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// One closure entry: a file by its own name, a directory by every
+/// executable file beneath it except the launcher.
+fn entry_digest(root: &Path, launcher: &Path) -> String {
     let mut rows: Vec<(Vec<u8>, PathBuf)> = Vec::new();
+    if fs::symlink_metadata(root).unwrap().is_file() {
+        rows.push((
+            root.file_name().unwrap().as_encoded_bytes().to_vec(),
+            root.to_path_buf(),
+        ));
+        return finish(rows);
+    }
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).unwrap() {
@@ -112,6 +156,10 @@ fn closure_digest(root: &Path, launcher: &Path) -> String {
             rows.push((relative, path));
         }
     }
+    finish(rows)
+}
+
+fn finish(mut rows: Vec<(Vec<u8>, PathBuf)>) -> String {
     rows.sort();
     let mut hasher = blake3::Hasher::new();
     for (relative, path) in rows {
@@ -145,11 +193,14 @@ impl FakeProvider {
         FakeProvider {
             raster_blake3: text_mirror::hash::hash_file(&raster).unwrap(),
             encoder_blake3: text_mirror::hash::hash_file(&encoder).unwrap(),
-            closure_blake3: closure_digest(&root, &raster),
+            closure_blake3: closure_digest(std::slice::from_ref(&root), &raster),
+            encoder_closure_blake3: closure_digest(&encoder_closure(&encoder), &encoder),
             raster_version: RASTER_VERSION.to_string(),
             encoder_version: ENCODER_VERSION.to_string(),
             raster_present: true,
             encoder_present: true,
+            jail_service_prefix: None,
+            jail_temp_env: None,
             raster,
             encoder,
             dir,
@@ -227,13 +278,35 @@ impl FakeProvider {
             "schema = \"{schema}\"\n\n\
              [providers.svg.\"{raster_role}\"]\n\
              path = \"{raster}\"\n\
-             closure_root = \"{root}\"\n\n\
+             closure_roots = [\"{root}\"]\n\
+             {parameters}\n\
              [providers.svg.\"{encoder_role}\"]\n\
              path = \"{encoder}\"\n\
-             closure_root = \"/bin\"\n",
+             closure_roots = [\"{encoder}\", {closure}]\n",
             raster = self.raster.display(),
             root = root.display(),
+            parameters = {
+                let mut lines = String::new();
+                if let Some(prefix) = &self.jail_service_prefix {
+                    lines.push_str(&format!(
+                        "jail_service_prefix = \"{}\"\n",
+                        prefix.replace('\\', "\\\\")
+                    ));
+                }
+                if let Some(name) = &self.jail_temp_env {
+                    lines.push_str(&format!("jail_temp_env = \"{name}\"\n"));
+                }
+                lines
+            },
             encoder = self.encoder.display(),
+            // The synthetic programs are interpreted, so their measured
+            // dependencies are the interpreter, its variant, and the
+            // one helper they call, each enumerated as itself.
+            closure = CLOSURE_FILES
+                .iter()
+                .map(|path| format!("\"{path}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
         )
     }
 
@@ -258,12 +331,14 @@ impl FakeProvider {
              closure_blake3 = \"{closure}\"\n\n\
              [image_ocr.svg_provider.\"{encoder_role}\"]\n\
              blake3 = \"{encoder_hash}\"\n\
-             version = \"{encoder_version}\"\n",
+             version = \"{encoder_version}\"\n\
+             closure_blake3 = \"{encoder_closure}\"\n",
             raster_hash = self.raster_blake3,
             raster_version = self.raster_version,
             closure = self.closure_blake3,
             encoder_hash = self.encoder_blake3,
             encoder_version = self.encoder_version,
+            encoder_closure = self.encoder_closure_blake3,
         )
     }
 
@@ -311,15 +386,27 @@ impl FakeProvider {
         FakeProvider {
             raster_blake3: text_mirror::hash::hash_file(&raster).unwrap(),
             encoder_blake3: text_mirror::hash::hash_file(&encoder).unwrap(),
-            closure_blake3: closure_digest(&root, &raster),
+            closure_blake3: closure_digest(std::slice::from_ref(&root), &raster),
+            encoder_closure_blake3: closure_digest(&encoder_closure(&encoder), &encoder),
             raster_version: RASTER_VERSION.to_string(),
             encoder_version: ENCODER_VERSION.to_string(),
             raster_present: true,
             encoder_present: true,
+            jail_service_prefix: None,
+            jail_temp_env: None,
             raster,
             encoder,
             dir,
         }
+    }
+
+    /// The same provider with the two jail parameters supplied, so a
+    /// test can compare effective versions across parameter values.
+    pub fn with_jail_parameters(&self, service_prefix: &str, temp_env: &str) -> FakeProvider {
+        let mut copy = self.moved();
+        copy.jail_service_prefix = Some(service_prefix.to_string());
+        copy.jail_temp_env = Some(temp_env.to_string());
+        copy
     }
 
     /// The rasterizer's configured path, for the tests that plant a
@@ -339,6 +426,19 @@ impl FakeProvider {
     pub fn remove_raster(&mut self) {
         fs::remove_file(&self.raster).unwrap();
         self.raster_present = false;
+    }
+
+    /// The pinned executable is back, byte for byte, so every pin
+    /// holds again.
+    pub fn restore_raster(&mut self) {
+        let root = self.dir_root();
+        write_program(&self.raster, &Self::raster_body(&root, "render"));
+        assert_eq!(
+            text_mirror::hash::hash_file(&self.raster).unwrap(),
+            self.raster_blake3,
+            "the restored program must hash to its pin"
+        );
+        self.raster_present = true;
     }
 
     /// A different program stands at the configured path.
@@ -396,7 +496,7 @@ impl FakeProvider {
         let root = self.dir_root();
         write_program(&self.raster, &Self::raster_body(&root, mode));
         self.raster_blake3 = text_mirror::hash::hash_file(&self.raster).unwrap();
-        self.closure_blake3 = closure_digest(&root, &self.raster);
+        self.closure_blake3 = closure_digest(std::slice::from_ref(&root), &self.raster);
     }
 
     /// Rewrites the encoder and re-pins it, including the closure
@@ -406,6 +506,8 @@ impl FakeProvider {
         let root = self.dir_root();
         write_program(&self.encoder, &Self::encoder_body(&root, mode));
         self.encoder_blake3 = text_mirror::hash::hash_file(&self.encoder).unwrap();
-        self.closure_blake3 = closure_digest(&root, &self.raster);
+        self.closure_blake3 = closure_digest(std::slice::from_ref(&root), &self.raster);
+        self.encoder_closure_blake3 =
+            closure_digest(&encoder_closure(&self.encoder), &self.encoder);
     }
 }

@@ -619,10 +619,12 @@ pub mod bodies {
         pub expected_blake3: String,
         /// Exact version string the executable must report.
         pub version: String,
-        /// Root of the executable closure this component loads from.
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        pub closure_root: Option<String>,
-        /// Expected aggregate digest over that closure.
+        /// The enumerated executable closure this component loads
+        /// from: directories and files, each granted as its own
+        /// subpath.
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub closure_roots: Vec<String>,
+        /// Expected aggregate digest over that whole closure.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub closure_blake3: Option<String>,
         /// An additional environment variable the worker points at the

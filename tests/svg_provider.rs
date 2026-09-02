@@ -164,7 +164,7 @@ fn a_configured_provider_adds_a_visible_child_and_leaves_the_primary_alone() {
 
     // The child is the recognized text of the rendering.
     let child = terminal(&setup, &child_of("chart.svg")).expect("ocr child record");
-    assert_eq!(child.status, Status::Converted);
+    assert_eq!(child.status, Status::Converted, "{:?}", child.error);
     assert_eq!(child.converter_id.as_deref(), Some("image-pixel-ocr"));
     assert_eq!(child.converter_version.as_deref(), Some("1.1.0"));
     assert_eq!(child.artifact_kind, Some(ArtifactKind::Ocr));
@@ -615,6 +615,120 @@ fn a_prior_record_from_a_build_without_the_provider_feature_says_so() {
     let rules = Rules::builtin_with_runtime(&RuntimeInventory::empty(), Some(&config)).unwrap();
     assert!(!rules.provider_not_built());
     assert!(rules.version().starts_with("10+svg."));
+}
+
+#[test]
+fn a_failed_provider_child_keeps_its_parent_from_skipping() {
+    // A recoverable refusal on the first run, the pinned component
+    // restored before the second. The parent's own record and artifact
+    // are unchanged and would skip on their own, but a failed child of
+    // the leg keeps the parent live until the child converts, so the
+    // refusal is never frozen into the checkpoint.
+    let mut provider = FakeProvider::new(&[(1600, 900)]);
+    provider.remove_raster();
+    let setup = setup();
+    fs::write(setup.root.join("later.svg"), svg_bytes(1600, 900, "text")).unwrap();
+    run_with(&setup, &provider_rules(&provider));
+    let child = terminal(&setup, &child_of("later.svg")).expect("a failed child");
+    assert_eq!(child.status, Status::Failed);
+    assert!(
+        child
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("rasterizer-missing")),
+        "{:?}",
+        child.error
+    );
+
+    provider.restore_raster();
+    let second = run_with(&setup, &provider_rules(&provider));
+
+    assert_eq!(second.counts.skipped_unchanged, 0, "{second:?}");
+    let child = terminal(&setup, &child_of("later.svg")).expect("the child");
+    assert_eq!(child.status, Status::Converted, "{:?}", child.error);
+    assert!(!artifact(&setup, &child_of("later.svg")).is_empty());
+
+    // And once converted, the source skips again on the next run.
+    let third = run_with(&setup, &provider_rules(&provider));
+    assert_eq!(third.counts.skipped_unchanged, 1, "{third:?}");
+}
+
+/// Rules in the shape a build without the provider feature takes when
+/// it is handed a configuration: nothing wired, the numeric version,
+/// and every vector source marked as unable to run the leg.
+fn not_built_rules() -> Rules {
+    let mut rules = Rules::from_parts_provider_not_built(
+        text_mirror::detect::FormatTable::builtin().unwrap(),
+        text_mirror::convert::Registry::builtin().unwrap(),
+    )
+    .unwrap();
+    rules.registry.use_fake_image_ocr();
+    rules
+}
+
+#[test]
+fn the_not_built_marking_moves_the_checkpoint_in_both_directions() {
+    // Both feature-off states share the numeric rules version, so the
+    // marking itself is what the checkpoint keys on. A prior record
+    // without it does not skip once a configuration this build cannot
+    // run arrives, so the marking is recorded; a prior record with it
+    // does not skip once the configuration is gone, so the marking is
+    // retired; and with the state unchanged the source skips.
+    let setup = setup();
+    fs::write(setup.root.join("art.svg"), svg_bytes(1600, 900, "text")).unwrap();
+    let plain = plain_rules();
+    let not_built = not_built_rules();
+    assert_eq!(plain.version(), not_built.version());
+
+    // No configuration, then a configuration this build cannot run.
+    run_with(&setup, &plain);
+    assert!(terminal(&setup, "art.svg").unwrap().warnings.is_empty());
+    let report = run_with(&setup, &not_built);
+    assert_eq!(report.counts.skipped_unchanged, 0, "{report:?}");
+    let marked = terminal(&setup, "art.svg").unwrap();
+    assert_eq!(marked.status, Status::Converted);
+    assert!(
+        marked
+            .warnings
+            .iter()
+            .any(|w| w == "svg-provider-not-built"),
+        "{:?}",
+        marked.warnings
+    );
+
+    // Unchanged state: the source skips.
+    let report = run_with(&setup, &not_built);
+    assert_eq!(report.counts.skipped_unchanged, 1, "{report:?}");
+
+    // The configuration removed again: the marking is retired.
+    let report = run_with(&setup, &plain);
+    assert_eq!(report.counts.skipped_unchanged, 0, "{report:?}");
+    let cleared = terminal(&setup, "art.svg").unwrap();
+    assert_eq!(cleared.status, Status::Converted);
+    assert!(cleared.warnings.is_empty(), "{:?}", cleared.warnings);
+}
+
+#[test]
+fn different_jail_parameters_are_a_different_effective_version() {
+    // The same pins under two valid parameter sets never checkpoint
+    // against each other: the second run re-runs the source.
+    let provider = FakeProvider::new(&[(1600, 900)]);
+    let setup = setup();
+    fs::write(setup.root.join("art.svg"), svg_bytes(1600, 900, "text")).unwrap();
+    let first_rules = provider.rules();
+    run_with(&setup, &first_rules);
+    let first_version = terminal(&setup, "art.svg").unwrap().rules_version;
+
+    let parameterized = provider.with_jail_parameters(r"^ex\.ample\.", "EXAMPLE_TMPDIR");
+    let second_rules = parameterized.rules();
+    assert_ne!(first_rules.version(), second_rules.version());
+    let report = run_with(&setup, &second_rules);
+    assert_eq!(report.counts.skipped_unchanged, 0, "{report:?}");
+    let second_version = terminal(&setup, "art.svg").unwrap().rules_version;
+    assert_ne!(first_version, second_version);
+    // The parameter values themselves never reach a record.
+    assert!(!second_version.contains("ample"));
+    assert!(!second_version.contains("TMPDIR"));
 }
 
 // --- dedup, collisions, and containers --------------------------------

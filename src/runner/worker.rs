@@ -136,6 +136,12 @@ fn run_mode(mode: &str) -> Result<Response, HardExit> {
         // guard's exit-race test. Reads no request frame.
         #[cfg(feature = "test-adapters")]
         "harness-hold-balloon" => harness::hold_balloon(),
+        // A descendant that runs the escape controls from inside a
+        // spawned child and writes its findings into the jail, so a
+        // test can prove a helper inherits the leader's profile. Reads
+        // no request frame.
+        #[cfg(feature = "test-adapters")]
+        "harness-child-probe" => harness::child_probe(),
         #[cfg(feature = "test-adapters")]
         other => harness::run(other, read_request()?),
         #[cfg(not(feature = "test-adapters"))]
@@ -502,6 +508,8 @@ mod harness {
             "harness-balloon-survivor" => harness_balloon_survivor(request),
             "harness-spawn-storm" => harness_spawn_storm(request),
             "harness-fd-check" => harness_fd_check(request),
+            "harness-controls" => harness_controls(request),
+            "harness-spawn-probe" => harness_spawn_probe(request),
             other => {
                 eprintln!("worker_unknown_mode: {other}");
                 Err(HardExit(2))
@@ -750,6 +758,124 @@ mod harness {
             "failed": failed,
             "first_error": first_error,
         })))
+    }
+
+    /// The escape controls, each attempted and reported on its own so a
+    /// test can assert every one by name. Targets are absolute host
+    /// paths the test names, so a denial is the policy and never a
+    /// redirected home or a missing file.
+    fn harness_controls(request: Request) -> Result<Response, HardExit> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ControlsRequest {
+            /// The system temp root to attempt a write under.
+            temp_root: String,
+            /// The real home directory to attempt a write under.
+            home: String,
+            /// The per-user cache root to attempt a write under.
+            cache_root: String,
+            /// An outbound address to connect to.
+            outbound: String,
+            /// A loopback listener the parent holds outside the jail.
+            loopback: String,
+            /// A shell profile file in the real home to read.
+            shell_profile: String,
+            /// A resident profile directory to list.
+            profile_dir: String,
+            /// The privileged configuration file to read.
+            privileged: String,
+            /// An undeclared program to attempt to run.
+            program: String,
+        }
+        let body: ControlsRequest = parse(&request)?;
+        Ok(Response::ok(serde_json::json!({
+            "write-temp-root": attempt_write(&std::path::Path::new(&body.temp_root).join("text-mirror-control")),
+            "write-home": attempt_write(&std::path::Path::new(&body.home).join("text-mirror-control")),
+            "write-cache-root": attempt_write(&std::path::Path::new(&body.cache_root).join("text-mirror-control")),
+            "tcp-outbound": attempt_connect(&body.outbound),
+            "tcp-loopback-connect": attempt_connect(&body.loopback),
+            "tcp-listen": outcome(std::net::TcpListener::bind("127.0.0.1:0").map(|_| ())),
+            "read-shell-profile": outcome(std::fs::read(&body.shell_profile).map(|_| ())),
+            "read-profile-dir": outcome(std::fs::read_dir(&body.profile_dir).map(|_| ())),
+            "read-privileged": outcome(std::fs::read(&body.privileged).map(|_| ())),
+            "exec-undeclared": outcome(
+                std::process::Command::new(&body.program)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|_| ())
+            ),
+            "write-inside-jail": attempt_write(std::path::Path::new("control-inside-jail")),
+        })))
+    }
+
+    fn attempt_write(path: &std::path::Path) -> String {
+        outcome(std::fs::write(path, b"control").map(|_| ()))
+    }
+
+    fn attempt_connect(target: &str) -> String {
+        let Ok(address) = target.parse::<std::net::SocketAddr>() else {
+            return "invalid target".to_string();
+        };
+        outcome(
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(600))
+                .map(|_| ()),
+        )
+    }
+
+    fn outcome(result: std::io::Result<()>) -> String {
+        match result {
+            Ok(()) => "allowed".to_string(),
+            Err(e) => format!("denied: {e}"),
+        }
+    }
+
+    /// Spawns a descendant into the child-probe mode, waits for it,
+    /// and returns what the descendant reported through the jail. The
+    /// descendant's own denials prove it inherited the profile.
+    fn harness_spawn_probe(request: Request) -> Result<Response, HardExit> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SpawnProbeRequest {
+            program: String,
+            temp_root: String,
+            privileged: String,
+        }
+        let body: SpawnProbeRequest = parse(&request)?;
+        let status = std::process::Command::new(&body.program)
+            .arg("harness-child-probe")
+            .env("PROBE_TEMP_ROOT", &body.temp_root)
+            .env("PROBE_PRIVILEGED", &body.privileged)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let Ok(status) = status else {
+            return Ok(Response::err(
+                "spawn_failed",
+                "the descendant could not be spawned".to_string(),
+            ));
+        };
+        let report = std::fs::read_to_string("child-probe.json").unwrap_or_default();
+        Ok(Response::ok(serde_json::json!({
+            "descendant_exited_cleanly": status.success(),
+            "report": serde_json::from_str::<serde_json::Value>(&report).unwrap_or(serde_json::Value::Null),
+        })))
+    }
+
+    /// The descendant half of the spawn probe: attempts a write under
+    /// the named temp root and a read of the named privileged file,
+    /// writes the outcomes into the jail, and exits.
+    pub(super) fn child_probe() -> ! {
+        let temp_root = std::env::var("PROBE_TEMP_ROOT").unwrap_or_default();
+        let privileged = std::env::var("PROBE_PRIVILEGED").unwrap_or_default();
+        let report = serde_json::json!({
+            "write-temp-root": attempt_write(&std::path::Path::new(&temp_root).join("text-mirror-descendant")),
+            "read-privileged": outcome(std::fs::read(&privileged).map(|_| ())),
+            "write-inside-jail": attempt_write(std::path::Path::new("descendant-inside-jail")),
+        });
+        let _ = std::fs::write("child-probe.json", report.to_string());
+        std::process::exit(0)
     }
 
     /// Reports whether a numbered descriptor is open in this process,

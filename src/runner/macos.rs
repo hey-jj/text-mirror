@@ -50,12 +50,15 @@ const ACCELERATOR_PROPERTIES_LINE: &str = "(allow iokit-get-properties)\n";
 
 /// The provider jail profile, as one template whose only substitutions
 /// are the per-run jail, the worker binary, the deployment's measured
-/// closures, and the deployment's service namespace.
+/// closures, the deployment's service namespace, and the literal grant
+/// lines for the pinned executables. The rendered profile is the
+/// template and nothing else, so the template's BLAKE3 covers the whole
+/// text a jail runs under.
 ///
 /// This is the profile the provider spike measured, with three
 /// deliberate differences, each recorded with the pin:
 ///
-/// - The closure subpaths and the service expression are placeholders
+/// - The closure entries and the service expression are placeholders
 ///   filled from the deployment configuration, because both name an
 ///   installed product and this crate carries no product name.
 /// - The worker binary is granted execute and read, because the
@@ -108,7 +111,55 @@ const PROVIDER_PROFILE_TEMPLATE: &str = r#"(version 1)
   (subpath "/Library/Fonts"))
 (allow file-write-data (literal "/dev/null"))
 (allow file-read* file-write* (subpath "{jail}"))
-"#;
+{grants}"#;
+
+/// The BLAKE3 of the provider profile template: the identity of the
+/// jail every provider execution runs under, which the effective rules
+/// version digests so an edited template re-runs every provider-derived
+/// child.
+pub fn provider_profile_template_blake3() -> String {
+    crate::hash::hash_bytes(PROVIDER_PROFILE_TEMPLATE.as_bytes())
+}
+
+/// The five substitution points, in template order.
+const PLACEHOLDERS: [&str; 5] = ["{jail}", "{worker}", "{closures}", "{service}", "{grants}"];
+
+/// Substitutes each placeholder exactly once, from a map, so text a
+/// substitution inserts is never scanned for placeholders by another.
+/// Every value must be free of braces, which is asserted before the
+/// pass, so a value cannot carry template syntax at all.
+fn substitute(template: &str, values: &[(&str, &str)]) -> Result<String, RunnerError> {
+    for (name, value) in values {
+        if value.contains('{') || value.contains('}') {
+            return Err(RunnerError {
+                code: "sandbox_unavailable",
+                message: format!("the {name} value carries a brace and cannot be rendered"),
+            });
+        }
+    }
+    let mut out = String::with_capacity(template.len() * 2);
+    let mut rest = template;
+    loop {
+        // The next placeholder occurrence, whichever it is.
+        let next = PLACEHOLDERS
+            .iter()
+            .filter_map(|name| rest.find(name).map(|at| (at, *name)))
+            .min();
+        let Some((at, name)) = next else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..at]);
+        let value = values
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, value)| *value)
+            .unwrap_or_default();
+        out.push_str(value);
+        rest = &rest[at + name.len()..];
+    }
+    Ok(out)
+}
 
 /// Renders the provider profile for one invocation.
 fn provider_profile(
@@ -122,7 +173,7 @@ fn provider_profile(
         message,
     };
     let mut closures = Vec::new();
-    for path in &provider.closures {
+    for path in provider.closures() {
         let text = path
             .to_str()
             .ok_or_else(|| refuse(format!("closure path {} is not UTF-8", path.display())))?;
@@ -131,26 +182,37 @@ fn provider_profile(
                 "closure path {text:?} cannot be quoted in a jail profile"
             )));
         }
-        closures.push(format!("  (subpath \"{text}\")\n"));
+        // Both filter forms per entry, so one enumeration covers a
+        // directory and a single file alike: a subpath filter grants a
+        // tree, a literal filter grants a file, and neither form does
+        // the other's job.
+        closures.push(format!("  (subpath \"{text}\")\n  (literal \"{text}\")\n"));
     }
-    let service = match &provider.service_prefix {
+    let service = match provider.service_prefix() {
         Some(prefix) => {
-            if prefix.contains('"') || prefix.contains('\n') {
+            // The render boundary re-applies the configuration
+            // grammar: a value that is not an anchored dotted prefix
+            // never reaches a registration allowance, whatever
+            // constructed the parameters.
+            if !crate::convert::provider::is_service_namespace(prefix) {
                 return Err(refuse(
-                    "the provider service expression cannot be quoted in a jail profile"
-                        .to_string(),
+                    "the provider service namespace is not an anchored dotted prefix".to_string(),
                 ));
             }
             format!("(allow mach-register (global-name-regex #\"{prefix}\"))\n")
         }
         None => String::new(),
     };
-    let rendered = PROVIDER_PROFILE_TEMPLATE
-        .replace("{jail}", jail)
-        .replace("{worker}", worker)
-        .replace("{closures}", &closures.concat())
-        .replace("{service}", &service);
-    Ok(format!("{rendered}{grant_lines}"))
+    substitute(
+        PROVIDER_PROFILE_TEMPLATE,
+        &[
+            ("{jail}", jail),
+            ("{worker}", worker),
+            ("{closures}", &closures.concat()),
+            ("{service}", &service),
+            ("{grants}", grant_lines),
+        ],
+    )
 }
 
 fn profile(
@@ -434,6 +496,7 @@ mod tests {
 (allow process-exec*
   (literal "/opt/worker/text-mirror-worker")
   (subpath "/deploy/closure")
+  (literal "/deploy/closure")
 )
 (allow signal (target same-sandbox))
 (import "dyld-support.sb")
@@ -448,6 +511,7 @@ mod tests {
 (allow file-read* file-map-executable
   (literal "/opt/worker/text-mirror-worker")
   (subpath "/deploy/closure")
+  (literal "/deploy/closure")
   (subpath "/usr/lib")
   (subpath "/System")
   (subpath "/dev/fd"))
@@ -463,11 +527,12 @@ mod tests {
 "#;
 
     fn provider(closures: &[&str], service: Option<&str>) -> ProviderJail {
-        ProviderJail {
-            closures: closures.iter().map(PathBuf::from).collect(),
-            service_prefix: service.map(str::to_string),
-            temp_env: None,
-        }
+        ProviderJail::new(
+            closures.iter().map(PathBuf::from).collect(),
+            service.map(str::to_string),
+            None,
+        )
+        .expect("the test parameters fit the grammar")
     }
 
     #[test]
@@ -477,7 +542,7 @@ mod tests {
         // be measured and approved rather than shipped quietly.
         assert_eq!(
             crate::hash::hash_bytes(PROVIDER_PROFILE_TEMPLATE.as_bytes()),
-            "fdce10dadcf9d41b2cb12346d0ab8bf13590dae2b88b807d357d19f1800cee68"
+            "6cab9514f16c626cdd936e779a72845a9d72c2c04857c7eb4a6f25942e8ef5f2"
         );
     }
 
@@ -498,6 +563,102 @@ mod tests {
         assert!(!rendered.contains("iokit-get-properties"), "{rendered}");
         assert!(!rendered.contains("iokit-user-client-class"), "{rendered}");
         assert!(!rendered.contains("file-read-data"), "{rendered}");
+    }
+
+    #[test]
+    fn a_value_carrying_template_syntax_is_rendered_verbatim_or_refused() {
+        // Single-pass substitution: a closure path that happens to spell
+        // a placeholder is inserted as text and never re-scanned, so
+        // it cannot pull another value into itself.
+        let rendered = render_with(
+            &["/deploy/engine-cli"],
+            &[],
+            RuntimeProfile::Provider,
+            Some(&provider(&["/deploy/closure-jail"], None)),
+        )
+        .expect("a placeholder-looking path renders");
+        assert!(
+            rendered.contains("(subpath \"/deploy/closure-jail\")"),
+            "{rendered}"
+        );
+        // A path spelling `{worker}` inside a quoted string cannot be
+        // built, because braces are refused at the boundary: that is
+        // the guard, not a re-scan that would have expanded it.
+        let error = substitute(
+            PROVIDER_PROFILE_TEMPLATE,
+            &[
+                ("{jail}", "/jail/{worker}"),
+                ("{worker}", "/opt/worker"),
+                ("{closures}", ""),
+                ("{service}", ""),
+                ("{grants}", ""),
+            ],
+        )
+        .expect_err("a brace-bearing value must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+        // Every placeholder is substituted exactly once, and the
+        // values appear verbatim.
+        let rendered = substitute(
+            PROVIDER_PROFILE_TEMPLATE,
+            &[
+                ("{jail}", "/jail/one"),
+                ("{worker}", "/opt/worker"),
+                ("{closures}", "  (subpath \"/deploy/c\")\n"),
+                (
+                    "{service}",
+                    "(allow mach-register (global-name-regex #\"^a\\\\.\"))\n",
+                ),
+                (
+                    "{grants}",
+                    "(allow process-exec* (literal \"/deploy/x\"))\n",
+                ),
+            ],
+        )
+        .unwrap();
+        for name in PLACEHOLDERS {
+            assert!(
+                !rendered.contains(name),
+                "{name} survived rendering: {rendered}"
+            );
+        }
+        assert!(rendered.ends_with("(allow process-exec* (literal \"/deploy/x\"))\n"));
+    }
+
+    #[test]
+    fn the_render_boundary_holds_the_parameter_grammar() {
+        // The parameters can only be built through the validating
+        // constructor, and a value outside the closed grammar never
+        // becomes a registration allowance: a free expression, an
+        // unanchored prefix, a shared root as a closure, a malformed
+        // variable name.
+        for bad in [r"^.*", r"ex\.ample\.", r"^(a|b)\.", r"^a\.[a-z]+\."] {
+            let error = ProviderJail::new(
+                vec![PathBuf::from("/deploy/closure")],
+                Some(bad.to_string()),
+                None,
+            )
+            .expect_err("a non-conforming namespace must refuse");
+            assert_eq!(error.code, "sandbox_unavailable", "{bad}");
+        }
+        let error = ProviderJail::new(vec![PathBuf::from("/usr/lib")], None, None)
+            .expect_err("a shared root must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+        let error = ProviderJail::new(
+            vec![PathBuf::from("/deploy/closure")],
+            None,
+            Some("lowercase".to_string()),
+        )
+        .expect_err("a malformed variable name must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+        // The conforming shape builds and renders.
+        assert!(
+            ProviderJail::new(
+                vec![PathBuf::from("/deploy/closure")],
+                Some(r"^ex\.ample\.".to_string()),
+                Some("EXAMPLE_TMPDIR".to_string()),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -550,11 +711,13 @@ mod tests {
             .expect_err("an unquotable closure must refuse");
             assert_eq!(error.code, "sandbox_unavailable");
         }
-        let error = render_with(
-            &["/deploy/engine-cli"],
-            &[],
-            RuntimeProfile::Provider,
-            Some(&provider(&["/deploy/closure"], Some("bad\"expression"))),
+        // A service value that could break the profile's quoting never
+        // reaches the renderer: the parameters' own constructor refuses
+        // it under the grammar before any render happens.
+        let error = ProviderJail::new(
+            vec![PathBuf::from("/deploy/closure")],
+            Some("bad\"expression".to_string()),
+            None,
         )
         .expect_err("an unquotable service expression must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
