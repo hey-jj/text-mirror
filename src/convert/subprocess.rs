@@ -528,6 +528,9 @@ mod imp {
             ImagePixelOcr {
                 mode: "image-ocr",
                 inventory: entries,
+                // The image worker runs the base jail class: its own
+                // engine grant buys it no allowance measured for a
+                // different engine.
                 runner: build_image_runner(image_runner_limits(&limits), exec_grants, read_grants),
             }
         }
@@ -579,6 +582,7 @@ mod imp {
             limits,
             exec_grants,
             read_grants,
+            crate::runner::jail::RuntimeProfile::Plain,
         ))
     }
 
@@ -767,9 +771,18 @@ mod imp {
         ) -> AsrAdapter {
             let files = pinned_asr_runtime_files(&profile, inventory);
             let (exec_grants, read_grants) = asr_grant_lists(&files);
+            // This is the one production mode that drives the pinned
+            // accelerator engine, so it alone runs under the
+            // accelerator jail class. The fake mode below spawns no
+            // engine and runs under the base class.
             AsrAdapter {
                 mode: "asr",
-                runner: build_asr_runner(&profile, exec_grants, read_grants),
+                runner: build_asr_runner(
+                    &profile,
+                    exec_grants,
+                    read_grants,
+                    crate::runner::jail::RuntimeProfile::Accelerator,
+                ),
                 profile,
                 inventory: files,
             }
@@ -786,7 +799,12 @@ mod imp {
         pub fn new_fake(profile: crate::convert::AsrProfile) -> AsrAdapter {
             AsrAdapter {
                 mode: "asr-fake",
-                runner: build_asr_runner(&profile, Vec::new(), Vec::new()),
+                runner: build_asr_runner(
+                    &profile,
+                    Vec::new(),
+                    Vec::new(),
+                    crate::runner::jail::RuntimeProfile::Plain,
+                ),
                 profile,
                 inventory: Vec::new(),
             }
@@ -860,6 +878,7 @@ mod imp {
         profile: &crate::convert::AsrProfile,
         exec_grants: Vec<std::path::PathBuf>,
         read_grants: Vec<std::path::PathBuf>,
+        runtime_profile: crate::runner::jail::RuntimeProfile,
     ) -> Result<Runner, RunnerError> {
         Ok(Runner::with_grants(
             crate::runner::jail::platform_backend()?,
@@ -867,6 +886,7 @@ mod imp {
             asr_runner_limits(profile),
             exec_grants,
             read_grants,
+            runtime_profile,
         ))
     }
 
@@ -1111,6 +1131,76 @@ mod imp {
             assert_eq!(spec_exec, std::slice::from_ref(&cli));
             assert_eq!(spec_read, std::slice::from_ref(&weights));
             assert!(!spec_exec.contains(&probe) && !spec_read.contains(&probe));
+            // 128 test (c), audio half: the production transcription
+            // spec runs under the accelerator class.
+            assert_eq!(
+                runner.runtime_profile(),
+                crate::runner::jail::RuntimeProfile::Accelerator
+            );
+        }
+
+        // The fake transcription mode spawns no engine, so it never
+        // asks for the accelerator allowances.
+        #[cfg(feature = "test-adapters")]
+        #[test]
+        fn the_fake_transcription_mode_keeps_the_base_profile() {
+            let profile = crate::convert::AsrProfile {
+                max_duration_seconds: 3600,
+                wall_timeout_secs: 900,
+                cpu_seconds: 600,
+                max_resident_bytes: 6_442_450_944,
+                max_response_bytes: 4_194_304,
+                max_stderr_bytes: 4_194_304,
+                file_size_bytes: 1_207_959_552,
+                max_processes: 64,
+                language: "en".to_string(),
+                inventory: std::collections::BTreeMap::new(),
+            };
+            let adapter = AsrAdapter::new_fake(profile);
+            let runner = adapter
+                .runner
+                .as_ref()
+                .expect("this platform has a jail backend");
+            assert_eq!(
+                runner.runtime_profile(),
+                crate::runner::jail::RuntimeProfile::Plain
+            );
+        }
+    }
+
+    #[cfg(all(test, feature = "image-ocr"))]
+    mod image_grant_tests {
+        use super::*;
+
+        // The image worker may carry an executable grant for its own
+        // engine, and that grant alone must never buy the accelerator
+        // allowances: the flag stays off for this mode, so its jail
+        // renders the base profile plus its literal-file lines only.
+        #[test]
+        fn an_image_worker_with_an_engine_grant_never_asks_for_accelerator_allowances() {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = dir.path().join("engine");
+            std::fs::write(&engine, b"engine bytes").unwrap();
+            let engine = engine.canonicalize().unwrap();
+            let mut limits = crate::convert::ImageOcrLimits::default();
+            limits
+                .inventory
+                .insert("engine-cli".to_string(), "0".repeat(64));
+            let mut supplied = crate::convert::RuntimeInventory::empty();
+            supplied.set("engine-cli", engine.clone()).unwrap();
+            let adapter = ImagePixelOcr::new(limits, &supplied);
+            let runner = adapter
+                .runner
+                .as_ref()
+                .expect("this platform has a jail backend");
+            let (spec_exec, _) = runner.grant_lists();
+            assert_eq!(spec_exec, std::slice::from_ref(&engine));
+            // 128 test (c), image half: an executable grant of its own
+            // never moves this spec off the base class.
+            assert_eq!(
+                runner.runtime_profile(),
+                crate::runner::jail::RuntimeProfile::Plain
+            );
         }
     }
 }

@@ -25,6 +25,34 @@ use super::protocol::bodies::{ProbeNetRequest, ProbeReport};
 use super::{Limits, Runner, RunnerError};
 use crate::hash;
 
+/// Which measured jail profile a worker mode runs under.
+///
+/// The class is the authorization, not a convenience: the accelerator
+/// allowances were measured for one pinned engine driven by one
+/// worker mode, so only that mode may ask for them. A backend keys
+/// those allowances on this class alone and never on the presence of
+/// an executable grant, so a future granted worker inherits nothing
+/// unmeasured. The literal grant lines stay keyed on the grants
+/// themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeProfile {
+    /// The base profile every worker mode runs under.
+    Plain,
+    /// The base profile plus the device allowances measured for the
+    /// pinned accelerator engine. Only the audio worker mode.
+    Accelerator,
+}
+
+impl RuntimeProfile {
+    /// The stable name this class contributes to the policy digest.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            RuntimeProfile::Plain => "plain",
+            RuntimeProfile::Accelerator => "accelerator",
+        }
+    }
+}
+
 /// What one adapter invocation needs from a backend.
 pub struct SpawnSpec<'a> {
     /// Absolute path of the worker binary.
@@ -46,6 +74,8 @@ pub struct SpawnSpec<'a> {
     /// Literal files the jail additionally grants read on: the pinned
     /// weights and other read-only runtime files. Never a directory.
     pub read_grants: &'a [std::path::PathBuf],
+    /// The measured jail profile this worker mode is authorized for.
+    pub runtime_profile: RuntimeProfile,
 }
 
 /// A platform jail backend.
@@ -98,13 +128,16 @@ fn probe_cache() -> &'static Mutex<HashSet<String>> {
 }
 
 /// The digest a cached probe pass is keyed by: the backend policy,
-/// the worker path, the worker binary hash, and the literal grant
-/// paths, so a grant change invalidates every cached probe pass.
+/// the worker path, the worker binary hash, the literal grant paths,
+/// and the runtime profile class, so a grant or class change
+/// invalidates every cached probe pass and a probe result for one
+/// class never satisfies the other.
 pub(super) fn policy_digest(
     backend: &dyn JailBackend,
     worker: &Path,
     exec_grants: &[std::path::PathBuf],
     read_grants: &[std::path::PathBuf],
+    runtime_profile: RuntimeProfile,
 ) -> Result<String, RunnerError> {
     let worker_hash = hash::hash_file(worker).map_err(|e| RunnerError {
         code: "worker_not_found",
@@ -118,13 +151,14 @@ pub(super) fn policy_digest(
             .join("\n")
     };
     let material = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\nruntime-profile={}",
         backend.name(),
         backend.policy_material(),
         worker.display(),
         worker_hash,
         grant_lines("exec", exec_grants),
         grant_lines("read", read_grants),
+        runtime_profile.label(),
     );
     Ok(hash::hash_bytes(material.as_bytes()))
 }

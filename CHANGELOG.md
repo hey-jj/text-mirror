@@ -74,13 +74,16 @@ Versioning.
   wire entry, and the worker reports that role missing. The jail
   grants each qualifying file as a literal path, never a directory:
   directories and symlinks are refused when the inventory is
-  configured and again right before every spawn. A jail carrying
-  executable grants additionally receives the measured accelerator
-  allowances one real in-jail transcription required: device
-  property reads, device access scoped to the accelerator
-  user-client class, and a listing-only allowance on each granted
-  binary's own directory, whose sibling files stay unreadable. A
-  grant-free jail keeps the narrower profile. The engine child's
+  configured and again right before every spawn. The audio worker
+  mode alone, with its engine wired, additionally receives the
+  measured accelerator allowances one real in-jail transcription
+  required: device property reads, device access scoped to the
+  accelerator user-client class, and a listing-only allowance on
+  each granted binary's own directory, whose sibling files stay
+  unreadable. The jail profile a worker runs under is an explicit
+  class on its spawn spec, and the allowances key on that class
+  alone, never on grant presence, so an image worker carrying its own
+  engine grant keeps the base profile. The engine child's
   output streams land in jail-owned files, its home and temp
   directories point into the jail, and the process ceiling is
   applied as headroom above the user's pre-existing process count,

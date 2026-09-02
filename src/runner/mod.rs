@@ -42,7 +42,7 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
-use jail::{JailBackend, SpawnSpec};
+use jail::{JailBackend, RuntimeProfile, SpawnSpec};
 use protocol::{FrameRead, Request, RequestSchema, Response};
 
 /// Resource and output limits for one adapter class.
@@ -176,13 +176,21 @@ pub struct Runner {
     limits: Limits,
     exec_grants: Vec<PathBuf>,
     read_grants: Vec<PathBuf>,
+    runtime_profile: RuntimeProfile,
 }
 
 impl Runner {
     /// A runner over an explicit backend, worker, and limits, with no
     /// grants beyond the worker and the jail.
     pub fn new(backend: Box<dyn JailBackend>, worker: PathBuf, limits: Limits) -> Runner {
-        Runner::with_grants(backend, worker, limits, Vec::new(), Vec::new())
+        Runner::with_grants(
+            backend,
+            worker,
+            limits,
+            Vec::new(),
+            Vec::new(),
+            RuntimeProfile::Plain,
+        )
     }
 
     /// A runner whose jail additionally grants literal files: read and
@@ -190,12 +198,19 @@ impl Runner {
     /// how the pinned engine binaries and weights reach a jailed
     /// worker: literal files only, never a directory, and the worker
     /// still re-hashes each one against its pinned BLAKE3 before use.
+    ///
+    /// `runtime_profile` is the measured jail class this worker mode
+    /// is authorized for. Only the audio worker mode passes
+    /// [`RuntimeProfile::Accelerator`]; every other mode passes
+    /// [`RuntimeProfile::Plain`] whatever grants it carries, so no
+    /// worker inherits allowances measured for a different engine.
     pub fn with_grants(
         backend: Box<dyn JailBackend>,
         worker: PathBuf,
         limits: Limits,
         exec_grants: Vec<PathBuf>,
         read_grants: Vec<PathBuf>,
+        runtime_profile: RuntimeProfile,
     ) -> Runner {
         Runner {
             backend,
@@ -203,6 +218,7 @@ impl Runner {
             limits,
             exec_grants,
             read_grants,
+            runtime_profile,
         }
     }
 
@@ -233,6 +249,13 @@ impl Runner {
         (&self.exec_grants, &self.read_grants)
     }
 
+    /// Test-only view of the jail class, so a converter test can
+    /// prove which adapter modes ask for the device allowances.
+    #[cfg(test)]
+    pub(crate) fn runtime_profile(&self) -> RuntimeProfile {
+        self.runtime_profile
+    }
+
     /// The policy digest that keys this runner's probe cache entry.
     pub fn policy_digest(&self) -> Result<String, RunnerError> {
         jail::policy_digest(
@@ -240,6 +263,7 @@ impl Runner {
             &self.worker,
             &self.exec_grants,
             &self.read_grants,
+            self.runtime_profile,
         )
     }
 
@@ -320,6 +344,7 @@ impl Runner {
             seccomp,
             exec_grants: &self.exec_grants,
             read_grants: &self.read_grants,
+            runtime_profile: self.runtime_profile,
         };
         let mut command = self.backend.command(&spec)?;
         command

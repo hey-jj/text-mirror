@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use text_mirror::runner::jail::platform_backend;
+use text_mirror::runner::jail::{RuntimeProfile, platform_backend};
 use text_mirror::runner::{Limits, Runner, locate_worker};
 
 fn worker_path() -> std::path::PathBuf {
@@ -341,6 +341,7 @@ fn a_non_literal_grant_refuses_the_run_at_spawn() {
         brisk_limits(),
         vec![dir.path().to_path_buf()],
         Vec::new(),
+        RuntimeProfile::Plain,
     );
     let error = runner
         .run("harness-echo", serde_json::json!({}), &[])
@@ -359,6 +360,7 @@ fn a_non_literal_grant_refuses_the_run_at_spawn() {
         brisk_limits(),
         Vec::new(),
         vec![link],
+        RuntimeProfile::Plain,
     );
     let error = runner
         .run("harness-echo", serde_json::json!({}), &[])
@@ -388,6 +390,7 @@ fn a_granted_jail_keeps_the_negative_controls() {
         brisk_limits(),
         vec![engine_stub.canonicalize().unwrap()],
         vec![weights_stub.canonicalize().unwrap()],
+        RuntimeProfile::Accelerator,
     );
     let host_file = existing_host_file();
     let response = runner
@@ -521,5 +524,92 @@ fn a_high_inherited_descriptor_does_not_reach_the_adapter() {
     assert!(
         !open,
         "a high inherited descriptor reached the adapter, the sweep missed it"
+    );
+}
+
+#[test]
+fn the_accelerator_jail_lists_the_engine_directory_but_never_reads_a_sibling() {
+    // 128 #3. The audio-shaped jail: an executable grant for the
+    // engine stub under the accelerator class, which is the only
+    // shape that carries the parent-directory listing allowance.
+    // Both halves of that allowance are asserted here: the listing of
+    // the granted engine's own directory SUCCEEDS, which is the
+    // measured need, and a read of a sibling file sitting in that
+    // same directory is DENIED, which is what makes it listing-only
+    // rather than a subtree read. A widening of the rule to a subpath
+    // read flips the second assertion. run() gates on the capability
+    // probe for this policy digest, so a completing call also proves
+    // the network stays denied under this class.
+    let dir = tempfile::tempdir().unwrap();
+    let engine_stub = dir.path().join("engine-stub");
+    std::fs::write(&engine_stub, b"#!/bin/sh\nexit 0\n").unwrap();
+    let sibling = dir.path().join("sibling-secret");
+    std::fs::write(&sibling, b"must stay unreadable").unwrap();
+    let sibling = sibling.canonicalize().unwrap();
+    let parent = dir.path().canonicalize().unwrap();
+    let runner = Runner::with_grants(
+        platform_backend().unwrap(),
+        worker_path(),
+        brisk_limits(),
+        vec![engine_stub.canonicalize().unwrap()],
+        Vec::new(),
+        RuntimeProfile::Accelerator,
+    );
+    let response = runner
+        .run(
+            "harness-escape",
+            serde_json::json!({
+                "read_path": sibling.to_str().unwrap(),
+                "list_path": parent.to_str().unwrap(),
+            }),
+            &[],
+        )
+        .expect("the accelerator jail still probes clean and runs");
+    let ok = response.ok.expect("harness-escape succeeds");
+    let read = ok.get("read").and_then(|v| v.as_str()).unwrap_or("");
+    let write = ok.get("write").and_then(|v| v.as_str()).unwrap_or("");
+    let list = ok.get("list").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        list.contains("succeeded"),
+        "the granted engine's own directory must be listable: {list}"
+    );
+    assert!(
+        read.contains("denied"),
+        "a sibling beside the granted engine was readable: {read}"
+    );
+    assert!(
+        write.contains("denied"),
+        "accelerator-jail write escaped: {write}"
+    );
+}
+
+#[test]
+fn the_runtime_profile_class_is_part_of_the_policy_digest() {
+    // Two runners with identical grants under different classes render
+    // different profiles, so their probe-cache keys must differ: a
+    // pass under the base class can never satisfy the accelerator one.
+    let dir = tempfile::tempdir().unwrap();
+    let engine_stub = dir.path().join("engine-stub");
+    std::fs::write(&engine_stub, b"#!/bin/sh\nexit 0\n").unwrap();
+    let grant = engine_stub.canonicalize().unwrap();
+    let plain = Runner::with_grants(
+        platform_backend().unwrap(),
+        worker_path(),
+        brisk_limits(),
+        vec![grant.clone()],
+        Vec::new(),
+        RuntimeProfile::Plain,
+    );
+    let accelerator = Runner::with_grants(
+        platform_backend().unwrap(),
+        worker_path(),
+        brisk_limits(),
+        vec![grant],
+        Vec::new(),
+        RuntimeProfile::Accelerator,
+    );
+    assert_ne!(
+        plain.policy_digest().unwrap(),
+        accelerator.policy_digest().unwrap()
     );
 }

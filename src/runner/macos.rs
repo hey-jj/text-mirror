@@ -24,7 +24,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::jail::{JailBackend, SpawnSpec};
+use super::jail::{JailBackend, RuntimeProfile, SpawnSpec};
 use super::{Runner, RunnerError};
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -39,11 +39,21 @@ const RUNTIME_READ_DEVICES: &[&str] = &["/dev/urandom", "/dev/random", "/dev/nul
 /// The Seatbelt jail.
 pub struct SeatbeltJail;
 
+/// The scoped device-access line the pinned accelerator engine was
+/// measured to need: `iokit-open` on the one user-client class, never
+/// the unscoped operation.
+const ACCELERATOR_OPEN_LINE: &str =
+    "(allow iokit-open (iokit-user-client-class \"AGXDeviceUserClient\"))\n";
+
+/// The device property-read line the same measurement required.
+const ACCELERATOR_PROPERTIES_LINE: &str = "(allow iokit-get-properties)\n";
+
 fn profile(
     jail: &Path,
     worker: &Path,
     exec_grants: &[std::path::PathBuf],
     read_grants: &[std::path::PathBuf],
+    runtime_profile: RuntimeProfile,
 ) -> Result<String, RunnerError> {
     let literal = |path: &Path| -> Result<String, RunnerError> {
         let text = path.to_str().ok_or_else(|| RunnerError {
@@ -75,15 +85,25 @@ fn profile(
     // binaries, read only for weights. Literal files only, never a
     // parent directory, so nothing beside the pinned artifacts
     // becomes readable.
+    //
+    // The accelerator allowances below belong to one worker mode, the
+    // one that drives the pinned accelerator engine, and the spec
+    // names that class explicitly. All three key on the class ALONE,
+    // never on the presence of an executable grant: grant presence is
+    // what let allowances measured for one engine reach every other
+    // granted worker, so an image worker carrying its own engine
+    // grant renders the base profile plus its literal grant lines and
+    // nothing else.
+    let accelerator = runtime_profile == RuntimeProfile::Accelerator;
     let mut grant_lines = String::new();
     for path in exec_grants {
-        // Measured need: the pinned engine lists its own directory at
-        // startup and aborts when the listing is denied. The
-        // allowance is the narrowest form that passed measurement,
+        // Measured need: the pinned accelerator engine lists its own
+        // directory at startup and aborts when the listing is denied.
+        // The allowance is the narrowest form that passed measurement,
         // directory-entry listing on the literal parent only: sibling
         // FILES stay unreadable under the default denial, so nothing
         // beside names leaks from the deployment directory.
-        if let Some(parent) = path.parent() {
+        if accelerator && let Some(parent) = path.parent() {
             let parent = literal(parent)?;
             grant_lines.push_str(&format!("(allow file-read-data (literal \"{parent}\"))\n"));
         }
@@ -96,10 +116,9 @@ fn profile(
         let path = literal(path)?;
         grant_lines.push_str(&format!("(allow file-read* (literal \"{path}\"))\n"));
     }
-    // The accelerator runtime allowances, present only when the spec
-    // carries executable grants, which is exactly the shape of a
-    // wired pinned engine: a grant-free jail keeps the narrower
-    // profile unchanged. Measured minimum, each line justified by an
+    // The accelerator device allowances, present for the one worker
+    // mode measured to need them. Measured minimum, each line
+    // justified by an
     // observed failure without it:
     // - iokit-get-properties: the accelerator device's property reads
     //   during initialization.
@@ -109,10 +128,9 @@ fn profile(
     //   a backend check could pass over an unusable device and the
     //   engine would fail at first use. The scoped class was
     //   sufficient in measurement; nothing wider is granted.
-    if !exec_grants.is_empty() {
-        grant_lines.push_str("(allow iokit-get-properties)\n");
-        grant_lines
-            .push_str("(allow iokit-open (iokit-user-client-class \"AGXDeviceUserClient\"))\n");
+    if accelerator {
+        grant_lines.push_str(ACCELERATOR_PROPERTIES_LINE);
+        grant_lines.push_str(ACCELERATOR_OPEN_LINE);
     }
     // Deny by default. Grant only the mach, sysctl, and loader
     // allowances a process needs to reach main, execute and read the
@@ -172,6 +190,7 @@ impl JailBackend for SeatbeltJail {
                 spec.worker,
                 spec.exec_grants,
                 spec.read_grants,
+                spec.runtime_profile,
             )?)
             .arg(spec.worker)
             .arg("sandbox-helper")
@@ -213,5 +232,120 @@ impl JailBackend for SeatbeltJail {
 
     fn probe(&self, runner: &Runner) -> Result<(), RunnerError> {
         super::jail::probe_net(runner, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The 0.6.0 profile, byte for byte, for a fixed jail and worker.
+    /// A literal, not a re-rendering, so drift in the base shape fails
+    /// here instead of being re-derived into the expectation.
+    const BASE_0_6_0: &str = r#"(version 1)
+(deny default)
+(deny network*)
+(allow process-fork)
+(allow process-exec* (literal "/opt/worker/text-mirror-worker"))
+(allow mach-lookup)
+(allow mach-bootstrap)
+(allow ipc-posix-shm*)
+(allow sysctl-read)
+(allow system-sched)
+(allow signal (target same-sandbox))
+(import "dyld-support.sb")
+(allow file-read-metadata)
+(allow file-read* file-map-executable (literal "/opt/worker/text-mirror-worker"))
+(allow file-read* file-map-executable
+  (subpath "/usr/lib")
+  (subpath "/System")
+  (literal "/dev/urandom")
+  (literal "/dev/random")
+  (literal "/dev/null")
+  (subpath "/dev/fd"))
+(allow file-read* file-write* (subpath "/jail/run"))
+"#;
+
+    const ENGINE_LINE: &str =
+        "(allow process-exec* file-read* file-map-executable (literal \"/deploy/engine-cli\"))\n";
+    const WEIGHTS_LINE: &str = "(allow file-read* (literal \"/deploy/weights.bin\"))\n";
+    const PARENT_LISTING_LINE: &str = "(allow file-read-data (literal \"/deploy\"))\n";
+    /// The device pair as literal text, deliberately not the source
+    /// constants, so a widened constant fails here instead of moving
+    /// the expectation with it.
+    const DEVICE_LINES: &str = "(allow iokit-get-properties)\n(allow iokit-open (iokit-user-client-class \"AGXDeviceUserClient\"))\n";
+
+    fn render(exec: &[&str], read: &[&str], runtime_profile: RuntimeProfile) -> String {
+        let exec: Vec<PathBuf> = exec.iter().map(PathBuf::from).collect();
+        let read: Vec<PathBuf> = read.iter().map(PathBuf::from).collect();
+        profile(
+            Path::new("/jail/run"),
+            Path::new("/opt/worker/text-mirror-worker"),
+            &exec,
+            &read,
+            runtime_profile,
+        )
+        .expect("the fixed paths render")
+    }
+
+    #[test]
+    fn a_grant_free_plain_jail_renders_the_0_6_0_profile_byte_for_byte() {
+        assert_eq!(render(&[], &[], RuntimeProfile::Plain), BASE_0_6_0);
+    }
+
+    #[test]
+    fn the_plain_class_with_grants_is_the_base_plus_the_literal_grant_lines_only() {
+        // 128 test (a). The image-shaped spec: one executable grant,
+        // one read grant, the base class. Exact string equality, so
+        // any added line fails, and no device token or parent listing
+        // may appear whatever grants the spec carries.
+        let rendered = render(
+            &["/deploy/engine-cli"],
+            &["/deploy/weights.bin"],
+            RuntimeProfile::Plain,
+        );
+        assert_eq!(
+            rendered,
+            format!("{BASE_0_6_0}{ENGINE_LINE}{WEIGHTS_LINE}"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("iokit"), "{rendered}");
+        assert!(!rendered.contains("file-read-data"), "{rendered}");
+    }
+
+    #[test]
+    fn the_accelerator_class_carries_the_parent_listing_and_exactly_two_device_lines() {
+        // 128 test (b). The audio-shaped spec: the parent listing in
+        // its literal form, exactly the two device lines with the
+        // single user-client class, and no other device token
+        // anywhere in the profile.
+        let rendered = render(
+            &["/deploy/engine-cli"],
+            &["/deploy/weights.bin"],
+            RuntimeProfile::Accelerator,
+        );
+        assert_eq!(
+            rendered,
+            format!("{BASE_0_6_0}{PARENT_LISTING_LINE}{ENGINE_LINE}{WEIGHTS_LINE}{DEVICE_LINES}"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(PARENT_LISTING_LINE), "{rendered}");
+        let device_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.contains("iokit"))
+            .collect();
+        assert_eq!(
+            device_lines,
+            vec![
+                "(allow iokit-get-properties)",
+                r#"(allow iokit-open (iokit-user-client-class "AGXDeviceUserClient"))"#,
+            ],
+            "{rendered}"
+        );
+        // The widening forms, each named so it fails here.
+        assert!(!rendered.contains("(allow iokit-open)"), "{rendered}");
+        assert!(!rendered.contains("(allow iokit*"), "{rendered}");
+        assert!(!rendered.contains("file-read-data (subpath"), "{rendered}");
     }
 }

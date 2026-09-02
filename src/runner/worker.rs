@@ -629,11 +629,21 @@ mod harness {
         #[serde(deny_unknown_fields)]
         struct EscapeRequest {
             read_path: String,
+            /// Optional directory whose entries are listed, so a test
+            /// can separate a listing-only allowance from a read of
+            /// the files it names.
+            #[serde(default)]
+            list_path: Option<String>,
         }
         let body: EscapeRequest = parse(&request)?;
         let read = std::fs::read(&body.read_path)
             .map(|bytes| format!("read succeeded with {} bytes", bytes.len()))
             .unwrap_or_else(|e| format!("read denied: {e}"));
+        let list = body.list_path.as_ref().map(|path| {
+            std::fs::read_dir(path)
+                .map(|entries| format!("list succeeded with {} entries", entries.count()))
+                .unwrap_or_else(|e| format!("list denied: {e}"))
+        });
         let target = std::env::temp_dir().join("text-mirror-escape-probe");
         let write = std::fs::write(&target, b"escaped")
             .map(|_| "write succeeded".to_string())
@@ -641,6 +651,7 @@ mod harness {
         Ok(Response::ok(serde_json::json!({
             "read": read,
             "write": write,
+            "list": list,
         })))
     }
 

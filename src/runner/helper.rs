@@ -230,9 +230,16 @@ fn apply_rlimits(config: &HelperConfig) -> Result<(), Refusal> {
 /// 64 made every fork fail with EAGAIN before the adapter could spawn
 /// its engine child. The configured number's intent is the
 /// invocation's spawn budget, so it is applied on top of the load
-/// that already exists: this invocation may add at most that many
-/// processes, and the fork-bomb bound is preserved. A count the host
-/// cannot supply fails the run closed with the named reason
+/// that already exists, and the bound it enforces is on the real user
+/// id's total: that total can never exceed its spawn-time count plus
+/// the configured budget, whatever the worker tree does. Both drift
+/// directions follow from that. Growth of the user id's count after
+/// the measurement narrows what this invocation may add. A shrink
+/// lets the worker tree grow into the slots other processes freed,
+/// so the tree may hold more than the budget while the user id total
+/// stays at or under the same ceiling. The hard limit clamps either
+/// way. A count the host cannot supply fails the run closed with the
+/// named reason
 /// `process-count-unavailable` and nothing is exec'd, because the
 /// headroom the budget rides on is unknown and a substituted
 /// baseline is a guess at the very number being bounded.
