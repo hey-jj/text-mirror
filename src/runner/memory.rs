@@ -33,7 +33,10 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
             };
             return match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(leader_pid), None) {
                 Err(nix::errno::Errno::ESRCH) => Ok(0),
-                _ => Err(format!("cannot enumerate the process group: {e}")),
+                _ => Err(format!(
+                    "cannot enumerate the process group: {:?}",
+                    e.kind()
+                )),
             };
         }
     };
@@ -48,15 +51,17 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
                     .checked_add(usage.ri_resident_size)
                     .ok_or_else(|| "the resident-size sum overflowed".to_string())?;
             }
-            Err(e) => {
+            Err(_) => {
                 // The member may have exited between the listing and
                 // the query. Only a confirmed exit is a race: a member
                 // a fresh listing still names is a real query failure,
                 // and the guard fails closed on it.
-                let still = pids_by_type(ProcFilter::ByProgramGroup { pgrpid: leader })
-                    .map_err(|e| format!("cannot re-enumerate the process group: {e}"))?;
+                let still =
+                    pids_by_type(ProcFilter::ByProgramGroup { pgrpid: leader }).map_err(|e| {
+                        format!("cannot re-enumerate the process group: {:?}", e.kind())
+                    })?;
                 if still.contains(pid) {
-                    return Err(format!("cannot read a group member's resident size: {e}"));
+                    return Err("cannot read a group member's resident size".to_string());
                 }
             }
         }
@@ -68,10 +73,10 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
 /// `leader`, from the `/proc` view.
 #[cfg(target_os = "linux")]
 pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
-    let entries = std::fs::read_dir("/proc").map_err(|e| format!("cannot enumerate /proc: {e}"))?;
+    let entries = std::fs::read_dir("/proc").map_err(|e| process_table_error(&e))?;
     let mut pids = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot enumerate /proc: {e}"))?;
+        let entry = entry.map_err(|e| process_table_error(&e))?;
         if let Some(pid) = entry
             .file_name()
             .to_str()
@@ -86,6 +91,11 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
         |pid, file| std::fs::read_to_string(format!("/proc/{pid}/{file}")),
         |pid| std::fs::exists(format!("/proc/{pid}")),
     )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn process_table_error(error: &std::io::Error) -> String {
+    format!("cannot enumerate the process table: {:?}", error.kind())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -163,12 +173,16 @@ fn confirmed_exit_race(
             Ok(true) => {}
             Err(recheck) => {
                 return Err(format!(
-                    "cannot re-check process {pid} after a read failure: {recheck}"
+                    "cannot re-check process {pid} after a read failure: {:?}",
+                    recheck.kind()
                 ));
             }
         }
     }
-    Err(format!("cannot read the records of process {pid}: {error}"))
+    Err(format!(
+        "cannot read the records of process {pid}: {:?}",
+        error.kind()
+    ))
 }
 
 /// The process-group id from one `stat` record: the third whitespace
@@ -232,6 +246,15 @@ mod tests {
         assert!(vm_rss_bytes("VmRSS:\t12 mB\n").is_err());
     }
 
+    #[test]
+    fn a_process_table_failure_names_only_the_operation_and_kind() {
+        let error = Error::new(ErrorKind::NotFound, "detail with a path");
+        assert_eq!(
+            process_table_error(&error),
+            "cannot enumerate the process table: NotFound"
+        );
+    }
+
     /// A two-member record view: a group member with 2 MiB resident
     /// and a stranger in another group.
     fn read_two(pid: u32, file: &str) -> std::io::Result<String> {
@@ -290,7 +313,7 @@ mod tests {
         // unbounded member.
         let error = sum_group_records(77, &[10, 12], denied, |_| Ok(false))
             .expect_err("a denied read must fail the query");
-        assert!(error.contains("denied"), "{error}");
+        assert!(error.contains("PermissionDenied"), "{error}");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

@@ -671,8 +671,11 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         let detail = exit_detail(&status);
         let stderr_text = String::from_utf8_lossy(&stderr_kept);
         let stderr_text = scrub_stderr(&stderr_text, limits.max_stderr_bytes);
+        if !stderr_text.is_empty() {
+            eprintln!("adapter stderr: {stderr_text}");
+        }
         #[cfg(unix)]
-        let refusal = helper_refusal(status.code(), &stderr_text);
+        let refusal = helper_refusal(status.code());
         #[cfg(not(unix))]
         let refusal = None;
         if let Some(error) = refusal {
@@ -680,11 +683,7 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         }
         return Err(RunnerError {
             code: "adapter_crash",
-            message: if stderr_text.is_empty() {
-                format!("worker {detail}, any response frame is discarded")
-            } else {
-                format!("worker {detail}: {stderr_text}")
-            },
+            message: format!("worker {detail}, any response frame is discarded"),
         });
     }
     let payload = match stdout_end {
@@ -720,26 +719,30 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
     Ok(response)
 }
 
-/// Replaces each whitespace-delimited stderr token that contains `/`
-/// before the text can enter a runner message. Both helper refusals
-/// and worker crashes use this function. The returned text stays
-/// within the configured stderr byte ceiling.
+/// Replaces each stderr line carrying a path separator before writing
+/// it to the parent's stderr. Redacting the whole line also covers a
+/// path with spaces. The returned text stays within the configured
+/// stderr byte ceiling.
 fn scrub_stderr(stderr_text: &str, max_bytes: u64) -> String {
     const PATH_PLACEHOLDER: &str = "[path]";
 
     let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
     let mut scrubbed = String::new();
-    for token in stderr_text.split_whitespace() {
-        let token = if token.contains('/') {
+    for line in stderr_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let line = if line.contains(['/', '\\']) {
             PATH_PLACEHOLDER
         } else {
-            token
+            line
         };
         let separator = usize::from(!scrubbed.is_empty());
         if scrubbed
             .len()
             .saturating_add(separator)
-            .saturating_add(token.len())
+            .saturating_add(line.len())
             > max_bytes
         {
             break;
@@ -747,7 +750,7 @@ fn scrub_stderr(stderr_text: &str, max_bytes: u64) -> String {
         if separator == 1 {
             scrubbed.push(' ');
         }
-        scrubbed.push_str(token);
+        scrubbed.push_str(line);
     }
     scrubbed
 }
@@ -758,8 +761,9 @@ fn scrub_stderr(stderr_text: &str, max_bytes: u64) -> String {
 /// because a spawn budget whose baseline is unknown is refused, not
 /// guessed at. Any other exit code is the adapter's own.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn helper_refusal(exit: Option<i32>, stderr_text: &str) -> Option<RunnerError> {
-    let (code, refused) = match exit? {
+fn helper_refusal(exit: Option<i32>) -> Option<RunnerError> {
+    let exit = exit?;
+    let (code, refused) = match exit {
         SANDBOX_SETUP_EXIT => ("sandbox_unavailable", "refused to engage the jail"),
         PROCESS_COUNT_EXIT => (
             "process-count-unavailable",
@@ -769,7 +773,7 @@ fn helper_refusal(exit: Option<i32>, stderr_text: &str) -> Option<RunnerError> {
     };
     Some(RunnerError {
         code,
-        message: format!("the sandbox helper {refused}: {stderr_text}"),
+        message: format!("the sandbox helper {refused} (exit {exit})"),
     })
 }
 
@@ -788,7 +792,7 @@ fn memory_verdict(measurement: Result<u64, String>, ceiling: u64) -> Option<Runn
         Ok(_) => None,
         Err(detail) => Some(RunnerError {
             code: "memory-monitor-failed",
-            message: format!("the resident-memory measurement failed, failing closed: {detail}"),
+            message: detail,
         }),
     }
 }
@@ -844,35 +848,178 @@ mod tests {
     #[test]
     fn a_helper_refusal_is_named_and_never_folded_into_a_crash() {
         // A failed jail setup keeps the code it always had.
-        let setup =
-            helper_refusal(Some(SANDBOX_SETUP_EXIT), "detail").expect("a setup exit is a refusal");
+        let setup = helper_refusal(Some(SANDBOX_SETUP_EXIT)).expect("a setup exit is a refusal");
         assert_eq!(setup.code, "sandbox_unavailable");
+        assert_eq!(
+            setup.message,
+            "the sandbox helper refused to engage the jail (exit 71)"
+        );
         // An unmeasurable process count is named on its own, so the
         // manifest says why the spawn never happened.
-        let count = helper_refusal(Some(PROCESS_COUNT_EXIT), "the listing is unavailable")
-            .expect("a count exit is a refusal");
+        let count = helper_refusal(Some(PROCESS_COUNT_EXIT)).expect("a count exit is a refusal");
         assert_eq!(count.code, "process-count-unavailable");
-        assert!(
-            count.message.contains("the listing is unavailable"),
-            "{count}"
+        assert_eq!(
+            count.message,
+            "the sandbox helper could not measure the user's process count and refused the spawn (exit 72)"
         );
         // Everything else is the adapter's own exit, not a refusal.
-        assert!(helper_refusal(Some(1), "detail").is_none());
-        assert!(helper_refusal(None, "detail").is_none());
+        assert!(helper_refusal(Some(1)).is_none());
+        assert!(helper_refusal(None).is_none());
     }
 
     #[test]
-    fn stderr_passthrough_replaces_absolute_and_grant_paths() {
+    fn stderr_log_scrub_replaces_plain_and_spaced_paths() {
         let absolute = "/runtime/worker";
-        let grant = "/runtime/grants/engine-cli";
-        let detail = format!("sandbox_setup_failed: open {absolute} grant {grant}: NotFound");
+        let spaced = "/runtime/private deploy secret";
+        let detail = format!(
+            "fixed helper detail\nsandbox_setup_failed: open {absolute}\nsandbox_setup_failed: open {spaced}"
+        );
         let scrubbed = scrub_stderr(&detail, 1024);
-        let refusal =
-            helper_refusal(Some(SANDBOX_SETUP_EXIT), &scrubbed).expect("a setup exit is a refusal");
-        assert!(!refusal.message.contains(absolute), "{refusal}");
-        assert!(!refusal.message.contains(grant), "{refusal}");
-        assert_eq!(refusal.message.matches("[path]").count(), 2);
-        assert!(refusal.message.len() <= 1024);
+        assert_eq!(scrubbed, "fixed helper detail [path] [path]");
+        assert!(!scrubbed.contains(absolute), "{scrubbed}");
+        for component in spaced.split_whitespace() {
+            assert!(!scrubbed.contains(component), "{scrubbed}");
+        }
+        assert!(scrubbed.len() <= 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_failure_detail_never_enters_a_record_or_bundle() {
+        use std::os::unix::process::CommandExt;
+
+        let marker = format!("spaced_path_{}", std::process::id());
+        let pieces = [
+            format!("{marker}_root"),
+            format!("{marker}_first"),
+            format!("{marker}_second"),
+            format!("{marker}_third"),
+        ];
+        let private_path = std::path::Path::new("/")
+            .join(&pieces[0])
+            .join(format!("{} {} {}", pieces[1], pieces[2], pieces[3]));
+        let stderr = format!(
+            "sandbox_setup_failed: cannot open {}",
+            private_path.display()
+        );
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf '%s\\n' \"$1\" >&2; exit 71")
+            .arg("helper")
+            .arg(stderr)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let failure = drive(&mut child, &Limits::default()).expect_err("the helper refuses");
+        assert_eq!(failure.code, "sandbox_unavailable");
+        assert_eq!(
+            failure.message,
+            "the sandbox helper refused to engage the jail (exit 71)"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_dir = dir.path().join("manifest");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        let record = crate::manifest::Record {
+            schema: crate::manifest::ManifestSchema,
+            source_path: "input.bin".to_string(),
+            source_hash: crate::hash::hash_bytes(b"input"),
+            source_size: 5,
+            declared_format: None,
+            detected_format: "unknown".to_string(),
+            format_mismatch: false,
+            status: crate::manifest::Status::Failed,
+            text_path: None,
+            text_hash: None,
+            artifact_kind: None,
+            converter_id: Some("adapter".to_string()),
+            converter_version: Some("1".to_string()),
+            tool_version: None,
+            rules_version: crate::pipeline::Rules::builtin()
+                .unwrap()
+                .version()
+                .to_string(),
+            media: None,
+            parent_source: None,
+            dedup_of: None,
+            warnings: Vec::new(),
+            error: Some(failure.to_string()),
+            duration_ms: Some(0),
+        };
+        assert_eq!(
+            record.error.as_deref(),
+            Some("sandbox_unavailable: the sandbox helper refused to engage the jail (exit 71)")
+        );
+        let serialized = serde_json::to_vec(&record).unwrap();
+        let shard = manifest_dir.join("alpha.jsonl");
+        let mut writer = crate::manifest::ManifestWriter::open(&shard).unwrap();
+        writer.append(&record).unwrap();
+        drop(writer);
+
+        let bundle = dir.path().join("bundle");
+        crate::bundle::bundle(&crate::bundle::BundleOptions {
+            mirror_root: &dir.path().join("mirror"),
+            manifest_dir: &manifest_dir,
+            division: "alpha",
+            output: &bundle,
+        })
+        .unwrap();
+
+        fn assert_absent(bytes: &[u8], piece: &[u8]) {
+            assert!(
+                !bytes.windows(piece.len()).any(|window| window == piece),
+                "a path component reached stored bytes"
+            );
+        }
+
+        fn check_tree(dir: &std::path::Path, pieces: &[String]) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    check_tree(&path, pieces);
+                } else {
+                    let bytes = std::fs::read(path).unwrap();
+                    for piece in pieces {
+                        assert_absent(&bytes, piece.as_bytes());
+                    }
+                }
+            }
+        }
+
+        for piece in &pieces {
+            assert_absent(&serialized, piece.as_bytes());
+        }
+        check_tree(&bundle, &pieces);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_crash_message_carries_only_the_exit_classification() {
+        use std::os::unix::process::CommandExt;
+
+        let marker = format!("worker_path_{}", std::process::id());
+        let stderr = format!("worker failed while reading /{marker}/with spaces");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf '%s\\n' \"$1\" >&2; exit 9")
+            .arg("worker")
+            .arg(stderr)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let failure = drive(&mut child, &Limits::default()).expect_err("the worker fails");
+        assert_eq!(failure.code, "adapter_crash");
+        assert_eq!(
+            failure.message,
+            "worker exited with code 9, any response frame is discarded"
+        );
+        assert!(!failure.message.contains(&marker), "{failure}");
     }
 
     #[test]
@@ -934,17 +1081,19 @@ mod tests {
 /// cover the sites a test can trigger; this covers all of them.
 #[cfg(test)]
 mod message_audit_tests {
-    const SOURCES: [(&str, &str); 4] = [
+    const SOURCES: [(&str, &str); 5] = [
         ("mod.rs", include_str!("mod.rs")),
         ("jail.rs", include_str!("jail.rs")),
         ("macos.rs", include_str!("macos.rs")),
         ("linux.rs", include_str!("linux.rs")),
+        ("memory.rs", include_str!("memory.rs")),
     ];
 
     /// The spellings a path takes when it is rendered into a message.
-    const RENDERINGS: [&str; 8] = [
+    const RENDERINGS: [&str; 9] = [
         "display()",
         "to_string_lossy(",
+        "{stderr_text",
         "{text",
         "{path",
         "{e}",
@@ -952,6 +1101,8 @@ mod message_audit_tests {
         "e.to_string()",
         "source.to_string()",
     ];
+
+    const FAILURE_FORWARDINGS: [&str; 4] = ["{detail}", "{e}", "{error}", "{recheck}"];
 
     /// Variables in the runner that hold a path, which no message may
     /// interpolate.
@@ -1008,6 +1159,58 @@ mod message_audit_tests {
         found
     }
 
+    /// Every construction that can return a memory measurement
+    /// failure to the runner.
+    fn memory_failure_sites(source: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for needle in ["Err(format!(", ".map_err("] {
+            let mut from = 0;
+            while let Some(at) = source[from..].find(needle) {
+                let start = from + at;
+                let open = source[start..].find('(').map(|i| start + i).unwrap();
+                let mut depth = 0usize;
+                let mut end = open;
+                for (offset, ch) in source[open..].char_indices() {
+                    if ch == '(' {
+                        depth += 1;
+                    } else if ch == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + offset + ch.len_utf8();
+                            break;
+                        }
+                    }
+                }
+                found.push(source[start..end].to_string());
+                from = end.max(start + needle.len());
+            }
+        }
+        if let Some(start) = source.find("fn process_table_error") {
+            let open = source[start..].find('{').map(|i| start + i).unwrap();
+            let mut depth = 0usize;
+            for (offset, ch) in source[open..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        found.push(source[start..open + offset + ch.len_utf8()].to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    fn carries_unbounded_failure_detail(site: &str) -> bool {
+        site.contains('/')
+            || RENDERINGS.iter().any(|rendering| site.contains(rendering))
+            || FAILURE_FORWARDINGS
+                .iter()
+                .any(|rendering| site.contains(rendering))
+    }
+
     #[test]
     fn no_runner_error_message_renders_a_path() {
         let mut audited = 0;
@@ -1038,6 +1241,23 @@ mod message_audit_tests {
     }
 
     #[test]
+    fn no_memory_failure_renders_a_path_or_an_error_display() {
+        let source = include_str!("memory.rs");
+        let sites = memory_failure_sites(source);
+        assert!(
+            sites.len() >= 8,
+            "only {} memory sites checked",
+            sites.len()
+        );
+        for site in sites {
+            assert!(
+                !carries_unbounded_failure_detail(&site),
+                "a memory failure carries an unbounded detail: {site}"
+            );
+        }
+    }
+
+    #[test]
     fn the_construction_site_check_rejects_error_display() {
         let old_worker_hash = concat!(
             "Runner",
@@ -1048,13 +1268,46 @@ mod message_audit_tests {
             r#""),
         }"#
         );
-        let sites = sites(old_worker_hash);
-        assert_eq!(sites.len(), 1);
+        let worker_sites = sites(old_worker_hash);
+        assert_eq!(worker_sites.len(), 1);
         assert!(
             RENDERINGS
                 .iter()
-                .any(|rendering| sites[0].contains(rendering)),
+                .any(|rendering| worker_sites[0].contains(rendering)),
             "the former worker-hash construction escaped the check"
+        );
+
+        let old_memory = concat!(
+            r#"std::fs::read_dir("/"#,
+            "proc",
+            r#"").map_err(|e| format!("cannot enumerate /"#,
+            "proc: ",
+            "{e}",
+            r#""))"#
+        );
+        let memory_sites = memory_failure_sites(old_memory);
+        assert_eq!(memory_sites.len(), 1);
+        assert!(
+            carries_unbounded_failure_detail(&memory_sites[0]),
+            "the former process-table construction escaped the check"
+        );
+
+        let old_forwarding = concat!(
+            "Runner",
+            r#"Error {
+            code: "memory-monitor-failed",
+            message: format!("the resident-memory measurement failed, failing closed: "#,
+            "{detail}",
+            r#""),
+        }"#
+        );
+        let sites = sites(old_forwarding);
+        assert_eq!(sites.len(), 1);
+        assert!(
+            FAILURE_FORWARDINGS
+                .iter()
+                .any(|rendering| sites[0].contains(rendering)),
+            "the former memory-detail forwarding escaped the check"
         );
     }
 }
