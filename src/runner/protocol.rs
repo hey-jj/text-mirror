@@ -337,18 +337,47 @@ mod tests {
         use bodies::{ProbeAttempt, ProbeName, ProbeOutcome, ProbeReport};
 
         let report = ProbeReport {
-            attempts: vec![ProbeAttempt {
-                name: ProbeName::UnixSocket,
-                outcome: ProbeOutcome::Denied,
-                error_kind: io::ErrorKind::PermissionDenied,
-            }],
+            attempts: crate::runner::runner_message_tests::IO_KINDS
+                .iter()
+                .copied()
+                .map(|error_kind| ProbeAttempt {
+                    name: ProbeName::UnixSocket,
+                    outcome: ProbeOutcome::Denied,
+                    error_kind,
+                })
+                .collect(),
         };
         let value = serde_json::to_value(&report).unwrap();
         let back: ProbeReport = serde_json::from_value(value).unwrap();
-        assert_eq!(back.attempts.len(), 1);
-        assert_eq!(back.attempts[0].name, ProbeName::UnixSocket);
-        assert_eq!(back.attempts[0].outcome, ProbeOutcome::Denied);
-        assert_eq!(back.attempts[0].error_kind, io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            back.attempts.len(),
+            crate::runner::runner_message_tests::IO_KINDS.len()
+        );
+        for (attempt, expected_kind) in back
+            .attempts
+            .iter()
+            .zip(crate::runner::runner_message_tests::IO_KINDS)
+        {
+            assert_eq!(attempt.name, ProbeName::UnixSocket);
+            assert_eq!(attempt.outcome, ProbeOutcome::Denied);
+            assert_eq!(attempt.error_kind, *expected_kind);
+        }
+
+        let deadlock = serde_json::to_value(ProbeAttempt {
+            name: ProbeName::UnixSocket,
+            outcome: ProbeOutcome::Denied,
+            error_kind: io::ErrorKind::Deadlock,
+        })
+        .unwrap();
+        assert_eq!(deadlock["error_kind"], "deadlock");
+
+        let future_kind = serde_json::json!({
+            "name": "unix_socket",
+            "outcome": "denied",
+            "error_kind": "future_kind"
+        });
+        let fallback: ProbeAttempt = serde_json::from_value(future_kind).unwrap();
+        assert_eq!(fallback.error_kind, io::ErrorKind::Other);
 
         let unknown = serde_json::json!({
             "attempts": [{
@@ -406,6 +435,8 @@ pub mod bodies {
     mod error_kind_wire {
         use super::*;
 
+        // This enum mirrors every io::ErrorKind stable at the crate MSRV, Rust 1.88.
+        // Keep Other for kinds newer than the MSRV. Revisit the list when the MSRV changes.
         #[derive(Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         enum WireErrorKind {
@@ -438,6 +469,7 @@ pub mod bodies {
             FileTooLarge,
             ResourceBusy,
             ExecutableFileBusy,
+            Deadlock,
             CrossesDevices,
             TooManyLinks,
             InvalidFilename,
@@ -447,50 +479,54 @@ pub mod bodies {
             UnexpectedEof,
             OutOfMemory,
             Other,
+            #[serde(other)]
+            Unknown,
         }
 
-        impl From<io::ErrorKind> for WireErrorKind {
-            fn from(kind: io::ErrorKind) -> WireErrorKind {
-                match kind {
-                    io::ErrorKind::NotFound => WireErrorKind::NotFound,
-                    io::ErrorKind::PermissionDenied => WireErrorKind::PermissionDenied,
-                    io::ErrorKind::ConnectionRefused => WireErrorKind::ConnectionRefused,
-                    io::ErrorKind::ConnectionReset => WireErrorKind::ConnectionReset,
-                    io::ErrorKind::HostUnreachable => WireErrorKind::HostUnreachable,
-                    io::ErrorKind::NetworkUnreachable => WireErrorKind::NetworkUnreachable,
-                    io::ErrorKind::ConnectionAborted => WireErrorKind::ConnectionAborted,
-                    io::ErrorKind::NotConnected => WireErrorKind::NotConnected,
-                    io::ErrorKind::AddrInUse => WireErrorKind::AddrInUse,
-                    io::ErrorKind::AddrNotAvailable => WireErrorKind::AddrNotAvailable,
-                    io::ErrorKind::NetworkDown => WireErrorKind::NetworkDown,
-                    io::ErrorKind::BrokenPipe => WireErrorKind::BrokenPipe,
-                    io::ErrorKind::AlreadyExists => WireErrorKind::AlreadyExists,
-                    io::ErrorKind::WouldBlock => WireErrorKind::WouldBlock,
-                    io::ErrorKind::NotADirectory => WireErrorKind::NotADirectory,
-                    io::ErrorKind::IsADirectory => WireErrorKind::IsADirectory,
-                    io::ErrorKind::DirectoryNotEmpty => WireErrorKind::DirectoryNotEmpty,
-                    io::ErrorKind::ReadOnlyFilesystem => WireErrorKind::ReadOnlyFilesystem,
-                    io::ErrorKind::StaleNetworkFileHandle => WireErrorKind::StaleNetworkFileHandle,
-                    io::ErrorKind::InvalidInput => WireErrorKind::InvalidInput,
-                    io::ErrorKind::InvalidData => WireErrorKind::InvalidData,
-                    io::ErrorKind::TimedOut => WireErrorKind::TimedOut,
-                    io::ErrorKind::WriteZero => WireErrorKind::WriteZero,
-                    io::ErrorKind::StorageFull => WireErrorKind::StorageFull,
-                    io::ErrorKind::NotSeekable => WireErrorKind::NotSeekable,
-                    io::ErrorKind::QuotaExceeded => WireErrorKind::QuotaExceeded,
-                    io::ErrorKind::FileTooLarge => WireErrorKind::FileTooLarge,
-                    io::ErrorKind::ResourceBusy => WireErrorKind::ResourceBusy,
-                    io::ErrorKind::ExecutableFileBusy => WireErrorKind::ExecutableFileBusy,
-                    io::ErrorKind::CrossesDevices => WireErrorKind::CrossesDevices,
-                    io::ErrorKind::TooManyLinks => WireErrorKind::TooManyLinks,
-                    io::ErrorKind::InvalidFilename => WireErrorKind::InvalidFilename,
-                    io::ErrorKind::ArgumentListTooLong => WireErrorKind::ArgumentListTooLong,
-                    io::ErrorKind::Interrupted => WireErrorKind::Interrupted,
-                    io::ErrorKind::Unsupported => WireErrorKind::Unsupported,
-                    io::ErrorKind::UnexpectedEof => WireErrorKind::UnexpectedEof,
-                    io::ErrorKind::OutOfMemory => WireErrorKind::OutOfMemory,
-                    _ => WireErrorKind::Other,
+        fn from_io_kind(kind: io::ErrorKind) -> Option<WireErrorKind> {
+            match kind {
+                io::ErrorKind::NotFound => Some(WireErrorKind::NotFound),
+                io::ErrorKind::PermissionDenied => Some(WireErrorKind::PermissionDenied),
+                io::ErrorKind::ConnectionRefused => Some(WireErrorKind::ConnectionRefused),
+                io::ErrorKind::ConnectionReset => Some(WireErrorKind::ConnectionReset),
+                io::ErrorKind::HostUnreachable => Some(WireErrorKind::HostUnreachable),
+                io::ErrorKind::NetworkUnreachable => Some(WireErrorKind::NetworkUnreachable),
+                io::ErrorKind::ConnectionAborted => Some(WireErrorKind::ConnectionAborted),
+                io::ErrorKind::NotConnected => Some(WireErrorKind::NotConnected),
+                io::ErrorKind::AddrInUse => Some(WireErrorKind::AddrInUse),
+                io::ErrorKind::AddrNotAvailable => Some(WireErrorKind::AddrNotAvailable),
+                io::ErrorKind::NetworkDown => Some(WireErrorKind::NetworkDown),
+                io::ErrorKind::BrokenPipe => Some(WireErrorKind::BrokenPipe),
+                io::ErrorKind::AlreadyExists => Some(WireErrorKind::AlreadyExists),
+                io::ErrorKind::WouldBlock => Some(WireErrorKind::WouldBlock),
+                io::ErrorKind::NotADirectory => Some(WireErrorKind::NotADirectory),
+                io::ErrorKind::IsADirectory => Some(WireErrorKind::IsADirectory),
+                io::ErrorKind::DirectoryNotEmpty => Some(WireErrorKind::DirectoryNotEmpty),
+                io::ErrorKind::ReadOnlyFilesystem => Some(WireErrorKind::ReadOnlyFilesystem),
+                io::ErrorKind::StaleNetworkFileHandle => {
+                    Some(WireErrorKind::StaleNetworkFileHandle)
                 }
+                io::ErrorKind::InvalidInput => Some(WireErrorKind::InvalidInput),
+                io::ErrorKind::InvalidData => Some(WireErrorKind::InvalidData),
+                io::ErrorKind::TimedOut => Some(WireErrorKind::TimedOut),
+                io::ErrorKind::WriteZero => Some(WireErrorKind::WriteZero),
+                io::ErrorKind::StorageFull => Some(WireErrorKind::StorageFull),
+                io::ErrorKind::NotSeekable => Some(WireErrorKind::NotSeekable),
+                io::ErrorKind::QuotaExceeded => Some(WireErrorKind::QuotaExceeded),
+                io::ErrorKind::FileTooLarge => Some(WireErrorKind::FileTooLarge),
+                io::ErrorKind::ResourceBusy => Some(WireErrorKind::ResourceBusy),
+                io::ErrorKind::ExecutableFileBusy => Some(WireErrorKind::ExecutableFileBusy),
+                io::ErrorKind::Deadlock => Some(WireErrorKind::Deadlock),
+                io::ErrorKind::CrossesDevices => Some(WireErrorKind::CrossesDevices),
+                io::ErrorKind::TooManyLinks => Some(WireErrorKind::TooManyLinks),
+                io::ErrorKind::InvalidFilename => Some(WireErrorKind::InvalidFilename),
+                io::ErrorKind::ArgumentListTooLong => Some(WireErrorKind::ArgumentListTooLong),
+                io::ErrorKind::Interrupted => Some(WireErrorKind::Interrupted),
+                io::ErrorKind::Unsupported => Some(WireErrorKind::Unsupported),
+                io::ErrorKind::UnexpectedEof => Some(WireErrorKind::UnexpectedEof),
+                io::ErrorKind::OutOfMemory => Some(WireErrorKind::OutOfMemory),
+                io::ErrorKind::Other => Some(WireErrorKind::Other),
+                _ => None,
             }
         }
 
@@ -526,6 +562,7 @@ pub mod bodies {
                     WireErrorKind::FileTooLarge => io::ErrorKind::FileTooLarge,
                     WireErrorKind::ResourceBusy => io::ErrorKind::ResourceBusy,
                     WireErrorKind::ExecutableFileBusy => io::ErrorKind::ExecutableFileBusy,
+                    WireErrorKind::Deadlock => io::ErrorKind::Deadlock,
                     WireErrorKind::CrossesDevices => io::ErrorKind::CrossesDevices,
                     WireErrorKind::TooManyLinks => io::ErrorKind::TooManyLinks,
                     WireErrorKind::InvalidFilename => io::ErrorKind::InvalidFilename,
@@ -535,6 +572,7 @@ pub mod bodies {
                     WireErrorKind::UnexpectedEof => io::ErrorKind::UnexpectedEof,
                     WireErrorKind::OutOfMemory => io::ErrorKind::OutOfMemory,
                     WireErrorKind::Other => io::ErrorKind::Other,
+                    WireErrorKind::Unknown => io::ErrorKind::Other,
                 }
             }
         }
@@ -543,7 +581,11 @@ pub mod bodies {
             kind: &io::ErrorKind,
             serializer: S,
         ) -> std::result::Result<S::Ok, S::Error> {
-            WireErrorKind::from(*kind).serialize(serializer)
+            from_io_kind(*kind)
+                .ok_or_else(|| {
+                    serde::ser::Error::custom("I/O error kind is absent from the wire schema")
+                })?
+                .serialize(serializer)
         }
 
         pub(super) fn deserialize<'de, D: Deserializer<'de>>(

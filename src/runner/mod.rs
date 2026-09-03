@@ -1525,48 +1525,58 @@ mod runner_message_tests {
     use super::*;
     use std::io::ErrorKind;
 
+    const RUST_1_88_STABLE_IO_ERROR_KIND_COUNT: usize = 39;
+    // This table covers every io::ErrorKind stable at the crate MSRV, Rust 1.88.
+    // Revisit the table when the MSRV changes.
+    pub(super) const IO_KINDS: &[ErrorKind] = &[
+        ErrorKind::NotFound,
+        ErrorKind::PermissionDenied,
+        ErrorKind::ConnectionRefused,
+        ErrorKind::ConnectionReset,
+        ErrorKind::HostUnreachable,
+        ErrorKind::NetworkUnreachable,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::NotConnected,
+        ErrorKind::AddrInUse,
+        ErrorKind::AddrNotAvailable,
+        ErrorKind::NetworkDown,
+        ErrorKind::BrokenPipe,
+        ErrorKind::AlreadyExists,
+        ErrorKind::WouldBlock,
+        ErrorKind::NotADirectory,
+        ErrorKind::IsADirectory,
+        ErrorKind::DirectoryNotEmpty,
+        ErrorKind::ReadOnlyFilesystem,
+        ErrorKind::StaleNetworkFileHandle,
+        ErrorKind::InvalidInput,
+        ErrorKind::InvalidData,
+        ErrorKind::TimedOut,
+        ErrorKind::WriteZero,
+        ErrorKind::StorageFull,
+        ErrorKind::NotSeekable,
+        ErrorKind::QuotaExceeded,
+        ErrorKind::FileTooLarge,
+        ErrorKind::ResourceBusy,
+        ErrorKind::ExecutableFileBusy,
+        ErrorKind::Deadlock,
+        ErrorKind::CrossesDevices,
+        ErrorKind::TooManyLinks,
+        ErrorKind::InvalidFilename,
+        ErrorKind::ArgumentListTooLong,
+        ErrorKind::Interrupted,
+        ErrorKind::Unsupported,
+        ErrorKind::UnexpectedEof,
+        ErrorKind::OutOfMemory,
+        ErrorKind::Other,
+    ];
+
+    #[test]
+    fn io_kind_table_covers_every_rust_1_88_stable_kind() {
+        assert_eq!(IO_KINDS.len(), RUST_1_88_STABLE_IO_ERROR_KIND_COUNT);
+    }
+
     #[test]
     fn every_runner_message_variant_is_path_free() {
-        const IO_KINDS: &[ErrorKind] = &[
-            ErrorKind::NotFound,
-            ErrorKind::PermissionDenied,
-            ErrorKind::ConnectionRefused,
-            ErrorKind::ConnectionReset,
-            ErrorKind::HostUnreachable,
-            ErrorKind::NetworkUnreachable,
-            ErrorKind::ConnectionAborted,
-            ErrorKind::NotConnected,
-            ErrorKind::AddrInUse,
-            ErrorKind::AddrNotAvailable,
-            ErrorKind::NetworkDown,
-            ErrorKind::BrokenPipe,
-            ErrorKind::AlreadyExists,
-            ErrorKind::WouldBlock,
-            ErrorKind::NotADirectory,
-            ErrorKind::IsADirectory,
-            ErrorKind::DirectoryNotEmpty,
-            ErrorKind::ReadOnlyFilesystem,
-            ErrorKind::StaleNetworkFileHandle,
-            ErrorKind::InvalidInput,
-            ErrorKind::InvalidData,
-            ErrorKind::TimedOut,
-            ErrorKind::WriteZero,
-            ErrorKind::StorageFull,
-            ErrorKind::NotSeekable,
-            ErrorKind::QuotaExceeded,
-            ErrorKind::FileTooLarge,
-            ErrorKind::ResourceBusy,
-            ErrorKind::ExecutableFileBusy,
-            ErrorKind::CrossesDevices,
-            ErrorKind::TooManyLinks,
-            ErrorKind::InvalidFilename,
-            ErrorKind::ArgumentListTooLong,
-            ErrorKind::Interrupted,
-            ErrorKind::Unsupported,
-            ErrorKind::UnexpectedEof,
-            ErrorKind::OutOfMemory,
-            ErrorKind::Other,
-        ];
         const USIZES: &[usize] = &[0, 1, usize::MAX];
         const U64S: &[u64] = &[0, 1, u64::MAX];
         const U32S: &[u32] = &[0, 1, u32::MAX];
