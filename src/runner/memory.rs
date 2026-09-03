@@ -11,11 +11,30 @@
 //! read failure is a confirmed exit race, a member that is provably
 //! gone by the time its records are read.
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MemoryError {
+    ProcessTable(std::io::ErrorKind),
+    ProcessGroup(std::io::ErrorKind),
+    ProcessGroupRecheck(std::io::ErrorKind),
+    GroupLeaderPid(u32),
+    GroupMemberPid(u32),
+    ResidentSizeSum,
+    ResidentSizeRead(u32),
+    StatRecord(u32),
+    ProcessRecords(u32, std::io::ErrorKind),
+    ProcessRecheck(u32, std::io::ErrorKind),
+    ResidentSizeValue,
+    ResidentSizeUnit,
+    ResidentSizeScale,
+    MonitorUnavailable,
+}
+
 /// The aggregate resident bytes of every process in the group led by
 /// `leader`. An empty group sums to zero, which callers read as the
 /// group having exited.
 #[cfg(target_os = "macos")]
-pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
+pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, MemoryError> {
     use libproc::pid_rusage::{RUsageInfoV2, pidrusage};
     use libproc::processes::{ProcFilter, pids_by_type};
 
@@ -29,39 +48,34 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
             // because a live group the guard cannot enumerate is a
             // group it cannot bound.
             let Ok(leader_pid) = i32::try_from(leader) else {
-                return Err(format!("group leader pid {leader} does not fit a pid_t"));
+                return Err(MemoryError::GroupLeaderPid(leader));
             };
             return match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(leader_pid), None) {
                 Err(nix::errno::Errno::ESRCH) => Ok(0),
-                _ => Err(format!(
-                    "cannot enumerate the process group: {:?}",
-                    e.kind()
-                )),
+                _ => Err(MemoryError::ProcessGroup(e.kind())),
             };
         }
     };
     let mut total: u64 = 0;
     for pid in &members {
         let Ok(pid_i32) = i32::try_from(*pid) else {
-            return Err(format!("group member pid {pid} does not fit a pid_t"));
+            return Err(MemoryError::GroupMemberPid(*pid));
         };
         match pidrusage::<RUsageInfoV2>(pid_i32) {
             Ok(usage) => {
                 total = total
                     .checked_add(usage.ri_resident_size)
-                    .ok_or_else(|| "the resident-size sum overflowed".to_string())?;
+                    .ok_or(MemoryError::ResidentSizeSum)?;
             }
             Err(_) => {
                 // The member may have exited between the listing and
                 // the query. Only a confirmed exit is a race: a member
                 // a fresh listing still names is a real query failure,
                 // and the guard fails closed on it.
-                let still =
-                    pids_by_type(ProcFilter::ByProgramGroup { pgrpid: leader }).map_err(|e| {
-                        format!("cannot re-enumerate the process group: {:?}", e.kind())
-                    })?;
+                let still = pids_by_type(ProcFilter::ByProgramGroup { pgrpid: leader })
+                    .map_err(|e| MemoryError::ProcessGroupRecheck(e.kind()))?;
                 if still.contains(pid) {
-                    return Err("cannot read a group member's resident size".to_string());
+                    return Err(MemoryError::ResidentSizeRead(*pid));
                 }
             }
         }
@@ -72,7 +86,7 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
 /// The aggregate resident bytes of every process in the group led by
 /// `leader`, from the `/proc` view.
 #[cfg(target_os = "linux")]
-pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
+pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, MemoryError> {
     let entries = std::fs::read_dir("/proc").map_err(|e| process_table_error(&e))?;
     let mut pids = Vec::new();
     for entry in entries {
@@ -94,13 +108,13 @@ pub(super) fn group_resident_bytes(leader: u32) -> Result<u64, String> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn process_table_error(error: &std::io::Error) -> String {
-    format!("cannot enumerate the process table: {:?}", error.kind())
+fn process_table_error(error: &std::io::Error) -> MemoryError {
+    MemoryError::ProcessTable(error.kind())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(super) fn group_resident_bytes(_leader: u32) -> Result<u64, String> {
-    Err("no resident-memory monitor exists for this platform".to_string())
+pub(super) fn group_resident_bytes(_leader: u32) -> Result<u64, MemoryError> {
+    Err(MemoryError::MonitorUnavailable)
 }
 
 /// The record-view summation with injected readers, so the error
@@ -122,7 +136,7 @@ fn sum_group_records(
     pids: &[u32],
     read: impl Fn(u32, &str) -> std::io::Result<String>,
     still_exists: impl Fn(u32) -> std::io::Result<bool>,
-) -> Result<u64, String> {
+) -> Result<u64, MemoryError> {
     let mut total: u64 = 0;
     for &pid in pids {
         let stat = match read(pid, "stat") {
@@ -133,7 +147,7 @@ fn sum_group_records(
             }
         };
         let Some(pgrp) = stat_process_group(&stat) else {
-            return Err(format!("cannot parse the stat record of process {pid}"));
+            return Err(MemoryError::StatRecord(pid));
         };
         if pgrp != leader {
             continue;
@@ -150,7 +164,7 @@ fn sum_group_records(
         let bytes = vm_rss_bytes(&status)?.unwrap_or(0);
         total = total
             .checked_add(bytes)
-            .ok_or_else(|| "the resident-size sum overflowed".to_string())?;
+            .ok_or(MemoryError::ResidentSizeSum)?;
     }
     Ok(total)
 }
@@ -166,23 +180,17 @@ fn confirmed_exit_race(
     pid: u32,
     error: &std::io::Error,
     still_exists: &impl Fn(u32) -> std::io::Result<bool>,
-) -> Result<(), String> {
+) -> Result<(), MemoryError> {
     if error.kind() == std::io::ErrorKind::NotFound {
         match still_exists(pid) {
             Ok(false) => return Ok(()),
             Ok(true) => {}
             Err(recheck) => {
-                return Err(format!(
-                    "cannot re-check process {pid} after a read failure: {:?}",
-                    recheck.kind()
-                ));
+                return Err(MemoryError::ProcessRecheck(pid, recheck.kind()));
             }
         }
     }
-    Err(format!(
-        "cannot read the records of process {pid}: {:?}",
-        error.kind()
-    ))
+    Err(MemoryError::ProcessRecords(pid, error.kind()))
 }
 
 /// The process-group id from one `stat` record: the third whitespace
@@ -201,21 +209,21 @@ fn stat_process_group(stat: &str) -> Option<u32> {
 /// does not parse as kibibytes fails the query.
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn vm_rss_bytes(status: &str) -> Result<Option<u64>, String> {
+fn vm_rss_bytes(status: &str) -> Result<Option<u64>, MemoryError> {
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             let mut fields = rest.split_whitespace();
             let value: u64 = fields
                 .next()
                 .and_then(|v| v.parse().ok())
-                .ok_or_else(|| "cannot parse a VmRSS value".to_string())?;
+                .ok_or(MemoryError::ResidentSizeValue)?;
             if fields.next() != Some("kB") {
-                return Err("a VmRSS line is not in kibibytes".to_string());
+                return Err(MemoryError::ResidentSizeUnit);
             }
             return value
                 .checked_mul(1024)
                 .map(Some)
-                .ok_or_else(|| "a VmRSS value overflowed".to_string());
+                .ok_or(MemoryError::ResidentSizeScale);
         }
     }
     Ok(None)
@@ -251,7 +259,7 @@ mod tests {
         let error = Error::new(ErrorKind::NotFound, "detail with a path");
         assert_eq!(
             process_table_error(&error),
-            "cannot enumerate the process table: NotFound"
+            MemoryError::ProcessTable(ErrorKind::NotFound)
         );
     }
 
@@ -284,7 +292,7 @@ mod tests {
         // cannot bound that member, so the query fails closed.
         let error = sum_group_records(77, &[10, 12], read_two, |_| Ok(true))
             .expect_err("an unconfirmed read failure must fail the query");
-        assert!(error.contains("12"), "{error}");
+        assert_eq!(error, MemoryError::ProcessRecords(12, ErrorKind::NotFound));
     }
 
     #[test]
@@ -297,7 +305,10 @@ mod tests {
             Err(Error::new(ErrorKind::PermissionDenied, "re-check denied"))
         })
         .expect_err("an indeterminate re-check must fail the query");
-        assert!(error.contains("re-check"), "{error}");
+        assert_eq!(
+            error,
+            MemoryError::ProcessRecheck(12, ErrorKind::PermissionDenied)
+        );
     }
 
     #[test]
@@ -313,7 +324,10 @@ mod tests {
         // unbounded member.
         let error = sum_group_records(77, &[10, 12], denied, |_| Ok(false))
             .expect_err("a denied read must fail the query");
-        assert!(error.contains("PermissionDenied"), "{error}");
+        assert_eq!(
+            error,
+            MemoryError::ProcessRecords(12, ErrorKind::PermissionDenied)
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

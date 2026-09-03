@@ -363,13 +363,9 @@ pub(super) fn probe_net(runner: &Runner, seccomp: bool) -> Result<(), RunnerErro
     })?;
     let response = runner.run_unprobed("probe-net", payload, &[], seccomp)?;
     let Some(ok) = response.ok else {
-        let detail = response
-            .error
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| "empty response".to_string());
         return Err(RunnerError {
             code: "sandbox_probe_failed",
-            message: format!("network probe reported a failure: {detail}"),
+            message: "network probe reported a failure".to_string(),
         });
     };
     let report: ProbeReport = serde_json::from_value(ok).map_err(|_| RunnerError {

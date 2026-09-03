@@ -377,19 +377,28 @@ impl Runner {
                 )
             }));
         for (label, grant) in grants {
-            let refuse = |detail: &str| RunnerError {
-                code: "adapter_spawn_error",
-                message: format!("{label} is not a literal regular file: {detail}"),
-            };
             match std::fs::symlink_metadata(grant) {
                 Ok(metadata) if metadata.file_type().is_file() => {}
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(refuse("it is a symlink"));
+                    return Err(RunnerError {
+                        code: "adapter_spawn_error",
+                        message: format!("{label} is not a literal regular file: it is a symlink"),
+                    });
                 }
-                Ok(_) => return Err(refuse("it is not a regular file")),
+                Ok(_) => {
+                    return Err(RunnerError {
+                        code: "adapter_spawn_error",
+                        message: format!(
+                            "{label} is not a literal regular file: it is not a regular file"
+                        ),
+                    });
+                }
                 Err(e) => {
-                    let detail = format!("{:?}", e.kind());
-                    return Err(refuse(&detail));
+                    let kind = e.kind();
+                    return Err(RunnerError {
+                        code: "adapter_spawn_error",
+                        message: format!("{label} is not a literal regular file: {kind:?}"),
+                    });
                 }
             }
         }
@@ -668,7 +677,6 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         });
     }
     if !status.success() {
-        let detail = exit_detail(&status);
         let stderr_text = String::from_utf8_lossy(&stderr_kept);
         let stderr_text = scrub_stderr(&stderr_text, limits.max_stderr_bytes);
         if !stderr_text.is_empty() {
@@ -683,7 +691,7 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         }
         return Err(RunnerError {
             code: "adapter_crash",
-            message: format!("worker {detail}, any response frame is discarded"),
+            message: worker_crash_message(&status),
         });
     }
     let payload = match stdout_end {
@@ -781,7 +789,10 @@ fn helper_refusal(exit: Option<i32>) -> Option<RunnerError> {
 /// Over the ceiling is `worker-memory-exceeded`; a failed measurement
 /// is `memory-monitor-failed`, because a guard that cannot see is a
 /// guard that must fail closed.
-fn memory_verdict(measurement: Result<u64, String>, ceiling: u64) -> Option<RunnerError> {
+fn memory_verdict(
+    measurement: Result<u64, memory::MemoryError>,
+    ceiling: u64,
+) -> Option<RunnerError> {
     match measurement {
         Ok(total) if total > ceiling => Some(RunnerError {
             code: "worker-memory-exceeded",
@@ -790,9 +801,48 @@ fn memory_verdict(measurement: Result<u64, String>, ceiling: u64) -> Option<Runn
             ),
         }),
         Ok(_) => None,
-        Err(detail) => Some(RunnerError {
+        Err(error) => Some(RunnerError {
             code: "memory-monitor-failed",
-            message: detail,
+            message: match error {
+                memory::MemoryError::ProcessTable(kind) => {
+                    format!("cannot enumerate the process table: {kind:?}")
+                }
+                memory::MemoryError::ProcessGroup(kind) => {
+                    format!("cannot enumerate the process group: {kind:?}")
+                }
+                memory::MemoryError::ProcessGroupRecheck(kind) => {
+                    format!("cannot re-enumerate the process group: {kind:?}")
+                }
+                memory::MemoryError::GroupLeaderPid(pid) => {
+                    format!("group leader pid {pid} does not fit a pid_t")
+                }
+                memory::MemoryError::GroupMemberPid(pid) => {
+                    format!("group member pid {pid} does not fit a pid_t")
+                }
+                memory::MemoryError::ResidentSizeSum => {
+                    "the resident-size sum overflowed".to_string()
+                }
+                memory::MemoryError::ResidentSizeRead(pid) => {
+                    format!("cannot read the resident size of process {pid}")
+                }
+                memory::MemoryError::StatRecord(pid) => {
+                    format!("cannot parse the stat record of process {pid}")
+                }
+                memory::MemoryError::ProcessRecords(pid, kind) => {
+                    format!("cannot read the records of process {pid}: {kind:?}")
+                }
+                memory::MemoryError::ProcessRecheck(pid, kind) => {
+                    format!("cannot re-check process {pid} after a read failure: {kind:?}")
+                }
+                memory::MemoryError::ResidentSizeValue => "cannot parse a VmRSS value".to_string(),
+                memory::MemoryError::ResidentSizeUnit => {
+                    "a VmRSS line is not in kibibytes".to_string()
+                }
+                memory::MemoryError::ResidentSizeScale => "a VmRSS value overflowed".to_string(),
+                memory::MemoryError::MonitorUnavailable => {
+                    "no resident-memory monitor exists for this platform".to_string()
+                }
+            },
         }),
     }
 }
@@ -827,17 +877,19 @@ fn wait_after_kill(child: &mut Child) -> std::process::ExitStatus {
     })
 }
 
-fn exit_detail(status: &std::process::ExitStatus) -> String {
+fn worker_crash_message(status: &std::process::ExitStatus) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            return format!("died on signal {signal}");
+            return format!("worker died on signal {signal}, any response frame is discarded");
         }
     }
     match status.code() {
-        Some(code) => format!("exited with code {code}"),
-        None => "exited without a status".to_string(),
+        Some(code) => {
+            format!("worker exited with code {code}, any response frame is discarded")
+        }
+        None => "worker exited without a status, any response frame is discarded".to_string(),
     }
 }
 
@@ -1067,10 +1119,18 @@ mod tests {
         assert_eq!(over.code, "worker-memory-exceeded");
         // A failed measurement is a failure of its own, never a pass:
         // a guard that cannot see must fail closed.
-        let failed = memory_verdict(Err("query broke".to_string()), 200)
-            .expect("a failed measurement is a verdict");
+        let failed = memory_verdict(
+            Err(memory::MemoryError::ProcessTable(
+                std::io::ErrorKind::PermissionDenied,
+            )),
+            200,
+        )
+        .expect("a failed measurement is a verdict");
         assert_eq!(failed.code, "memory-monitor-failed");
-        assert!(failed.message.contains("query broke"));
+        assert_eq!(
+            failed.message,
+            "cannot enumerate the process table: PermissionDenied"
+        );
     }
 }
 
@@ -1163,7 +1223,12 @@ mod message_audit_tests {
     /// failure to the runner.
     fn memory_failure_sites(source: &str) -> Vec<String> {
         let mut found = Vec::new();
-        for needle in ["Err(format!(", ".map_err("] {
+        for needle in [
+            "Err(format!(",
+            "Err(MemoryError::",
+            ".map_err(",
+            ".ok_or(MemoryError::",
+        ] {
             let mut from = 0;
             while let Some(at) = source[from..].find(needle) {
                 let start = from + at;
@@ -1204,11 +1269,13 @@ mod message_audit_tests {
     }
 
     fn carries_unbounded_failure_detail(site: &str) -> bool {
-        site.contains('/')
-            || RENDERINGS.iter().any(|rendering| site.contains(rendering))
+        RENDERINGS.iter().any(|rendering| site.contains(rendering))
             || FAILURE_FORWARDINGS
                 .iter()
                 .any(|rendering| site.contains(rendering))
+            || PATH_VARIABLES
+                .iter()
+                .any(|variable| site.contains(variable))
     }
 
     #[test]
@@ -1221,18 +1288,10 @@ mod message_audit_tests {
                     continue;
                 }
                 audited += 1;
-                for rendering in RENDERINGS {
-                    assert!(
-                        !site.contains(rendering),
-                        "{name}: a runner error renders a path with {rendering}: {site}"
-                    );
-                }
-                for variable in PATH_VARIABLES {
-                    assert!(
-                        !site.contains(variable),
-                        "{name}: a runner error interpolates {variable}: {site}"
-                    );
-                }
+                assert!(
+                    !carries_unbounded_failure_detail(&site),
+                    "{name}: a runner error carries an unbounded detail: {site}"
+                );
             }
         }
         // The audit saw the sites it exists for: the grant re-assertion
@@ -1304,9 +1363,7 @@ mod message_audit_tests {
         let sites = sites(old_forwarding);
         assert_eq!(sites.len(), 1);
         assert!(
-            FAILURE_FORWARDINGS
-                .iter()
-                .any(|rendering| sites[0].contains(rendering)),
+            carries_unbounded_failure_detail(&sites[0]),
             "the former memory-detail forwarding escaped the check"
         );
     }
