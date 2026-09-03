@@ -203,8 +203,8 @@ impl Rules {
         // identity digests presence, the generic role labels, the
         // pinned hashes and versions, the adapter version, and the
         // geometry and flatten options, and excludes every absolute
-        // path, so moving an identical provider skips nothing and
-        // changing any pinned identity re-runs everything.
+        // path. Moving an identical provider installation preserves the
+        // checkpoint, while changing any pinned identity re-runs everything.
         let suffix = provider.and_then(|config| {
             config.svg()?;
             let mut identity = config.jail_identity();
