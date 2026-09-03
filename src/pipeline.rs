@@ -102,7 +102,7 @@ impl Rules {
     /// provider is wired, so the effective version is the shared
     /// numeric version of the two tables.
     pub fn from_parts(table: FormatTable, registry: Registry) -> Result<Self> {
-        Self::assemble(table, registry, None, false)
+        Self::assemble(table, registry, None, false, None)
     }
 
     /// Rules in the shape a build without the provider feature takes
@@ -111,7 +111,32 @@ impl Rules {
     /// run the leg. Exists so the feature-off checkpoint arm can be
     /// exercised from a build that carries the feature.
     pub fn from_parts_provider_not_built(table: FormatTable, registry: Registry) -> Result<Self> {
-        Self::assemble(table, registry, None, true)
+        Self::assemble(table, registry, None, true, None)
+    }
+
+    /// Rules with the provider configured as `from_parts_with_runtime`
+    /// wires it, but with the jail identity's template hash replaced by
+    /// the given value, as if the profile template had been edited.
+    /// Exists so a test can run a source under one template identity
+    /// and then another and prove the checkpoint does not carry across.
+    #[cfg(feature = "test-adapters")]
+    pub fn from_parts_with_runtime_under_template(
+        table: FormatTable,
+        registry: Registry,
+        provider: Option<&convert::provider::ProviderConfig>,
+        template_blake3: &str,
+    ) -> Result<Self> {
+        let wired = registry.svg_ocr_converter().is_some();
+        let configured = provider
+            .and_then(convert::provider::ProviderConfig::svg)
+            .is_some();
+        Self::assemble(
+            table,
+            registry,
+            if wired { provider } else { None },
+            configured && !wired,
+            Some(template_blake3),
+        )
     }
 
     /// Rules over an explicit table and registry with the provider
@@ -132,6 +157,7 @@ impl Rules {
             registry,
             if wired { provider } else { None },
             configured && !wired,
+            None,
         )
     }
 
@@ -145,6 +171,7 @@ impl Rules {
             registry,
             provider,
             provider_not_built,
+            None,
         )
     }
 
@@ -153,6 +180,7 @@ impl Rules {
         registry: Registry,
         provider: Option<&convert::provider::ProviderConfig>,
         provider_not_built: bool,
+        template_blake3: Option<&str>,
     ) -> Result<Self> {
         if table.version() != registry.version() {
             return Err(Error::Rules {
@@ -173,9 +201,13 @@ impl Rules {
         // changing any pinned identity re-runs everything.
         let suffix = provider.and_then(|config| {
             config.svg()?;
+            let mut identity = config.jail_identity();
+            if let Some(template) = template_blake3 {
+                identity.template_blake3 = Some(template.to_string());
+            }
             convert::provider::ProviderConfig::version_suffix(
                 &registry.image_ocr_limits().svg_provider,
-                &config.jail_identity(),
+                &identity,
             )
         });
         let effective_version = match suffix {

@@ -380,6 +380,30 @@ impl FakeProvider {
         rules
     }
 
+    /// Rules over this provider's pins with the jail identity's
+    /// template hash replaced, as if the profile template had been
+    /// edited, so a test can drive the checkpoint across that edit.
+    pub fn rules_under_template(&self, template_blake3: &str) -> text_mirror::pipeline::Rules {
+        let config =
+            text_mirror::convert::provider::ProviderConfig::parse(&self.config_toml()).unwrap();
+        let registry = text_mirror::convert::Registry::parse_with_runtime(
+            &self.rules_text(),
+            "converters.toml",
+            &text_mirror::convert::RuntimeInventory::empty(),
+            Some(&config),
+        )
+        .unwrap();
+        let mut rules = text_mirror::pipeline::Rules::from_parts_with_runtime_under_template(
+            text_mirror::detect::FormatTable::builtin().unwrap(),
+            registry,
+            Some(&config),
+            template_blake3,
+        )
+        .unwrap();
+        rules.registry.use_fake_image_ocr();
+        rules
+    }
+
     /// The same provider installed somewhere else: identical programs
     /// and identical pins under different absolute paths.
     pub fn moved(&self) -> FakeProvider {

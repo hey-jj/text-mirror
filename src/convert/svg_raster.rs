@@ -317,12 +317,18 @@ fn entry_digest(root: &Path, launcher: &Path) -> Result<String, SvgRasterError> 
     let metadata = std::fs::symlink_metadata(root)
         .map_err(|_| unreadable("a runtime closure entry cannot be read"))?;
     let mut rows: Vec<(Vec<u8>, ClosureMember)> = Vec::new();
-    if metadata.is_file() {
+    let name = root
+        .file_name()
+        .ok_or_else(|| unreadable("a runtime closure entry has no name"))?;
+    if metadata.file_type().is_symlink() {
+        // An entry must be a real directory or a real regular file.
+        // A link entry would be followed by the walk while the grant
+        // names the link, so it is refused here as it is at
+        // configuration, and never digested.
+        return Err(unreadable("a runtime closure entry is a symlink"));
+    } else if metadata.is_file() {
         // A single-file entry is named by its own file name, so the
         // digest survives the installation moving.
-        let name = root
-            .file_name()
-            .ok_or_else(|| unreadable("a runtime closure entry has no name"))?;
         rows.push((
             name.as_encoded_bytes().to_vec(),
             ClosureMember::File(root.to_path_buf()),
@@ -434,6 +440,47 @@ fn verify_role(entry: &SvgRoleEntry) -> Result<PathBuf, SvgRasterError> {
             "rasterizer-hash-drift",
             format!("provider component {role} does not match its pinned hash"),
         ));
+    }
+    // The paths are re-checked here as well as at configuration: the
+    // executable and every entry in normal form, no entry a symlink,
+    // and the executable inside an entry on the resolved paths. An
+    // aliased path cannot be what the digest was measured over, and an
+    // executable outside its closure has no measured tree.
+    let drift = |detail: String| SvgRasterError::new("rasterizer-hash-drift", detail);
+    if !super::provider::is_normal_form(&path) {
+        return Err(drift(format!(
+            "provider component {role} path is not in normal form"
+        )));
+    }
+    let real_path = super::provider::canonical(&path)
+        .ok_or_else(|| drift(format!("provider component {role} cannot be resolved")))?;
+    let mut real_roots = Vec::with_capacity(entry.closure_roots.len());
+    for root in &entry.closure_roots {
+        let root = Path::new(root);
+        if !super::provider::is_normal_form(root) {
+            return Err(drift(format!(
+                "a closure entry of provider component {role} is not in normal form"
+            )));
+        }
+        if super::provider::is_symlink_entry(root) {
+            return Err(drift(format!(
+                "a closure entry of provider component {role} is a symlink"
+            )));
+        }
+        real_roots.push(super::provider::canonical(root).ok_or_else(|| {
+            drift(format!(
+                "a closure entry of provider component {role} cannot be resolved"
+            ))
+        })?);
+    }
+    if !real_roots.is_empty()
+        && !real_roots
+            .iter()
+            .any(|root| super::provider::lies_inside(&real_path, root))
+    {
+        return Err(drift(format!(
+            "provider component {role} lies outside its enumerated closure"
+        )));
     }
     // The enumerated closure and its digest are a pair here as well
     // as at configuration: a closure with no digest, or a digest with
@@ -851,8 +898,9 @@ mod tests {
         // geometry the document never declared, which is a silent
         // crop. The tokenizer reads the real root, which here declares
         // nothing usable, so each is refused.
-        let decoys: [&[u8]; 5] = [
+        let decoys: [&[u8]; 6] = [
             b"<!-- <svg width=\"1600\" height=\"900\"> --><svg><text>x</text></svg>",
+            b"<![CDATA[<svg width=\"1600\" height=\"900\">]]><svg><text>x</text></svg>",
             b"<!DOCTYPE svg [ <!ENTITY e \"<svg width='1600' height='900'>\"> ]><svg><text>x</text></svg>",
             b"<?xml version=\"1.0\"?><?decoy <svg width=\"1600\" height=\"900\"> ?><svg><text>x</text></svg>",
             b"<svg><![CDATA[<svg width=\"1600\" height=\"900\">]]></svg>",
@@ -864,9 +912,13 @@ mod tests {
         }
         // The same decoys in front of a root that DOES declare a size
         // yield that size and never the decoy's.
-        let real: &[u8] = b"<!-- <svg width=\"1600\" height=\"900\"> --><svg width=\"800\" height=\"450\"><text>x</text></svg>";
-        let geometry = parse_geometry(real).unwrap();
-        assert_eq!((geometry.width, geometry.height), (800.0, 450.0));
+        for real in [
+            b"<!-- <svg width=\"1600\" height=\"900\"> --><svg width=\"800\" height=\"450\"><text>x</text></svg>".as_slice(),
+            b"<![CDATA[<svg width=\"1600\" height=\"900\">]]><svg width=\"800\" height=\"450\"><text>x</text></svg>".as_slice(),
+        ] {
+            let geometry = parse_geometry(real).unwrap();
+            assert_eq!((geometry.width, geometry.height), (800.0, 450.0));
+        }
     }
 
     #[test]
@@ -1174,6 +1226,79 @@ mod tests {
         let with_link = closure_digest(&roots, &launcher).unwrap();
         std::fs::write(outside.join("big"), vec![1u8; 1024]).unwrap();
         assert_eq!(with_link, closure_digest(&roots, &launcher).unwrap());
+    }
+
+    #[test]
+    fn a_closure_entry_that_is_a_symlink_is_refused_before_the_walk() {
+        // An entry is a real directory or a real regular file. A link
+        // entry would be followed by the walk while the grant names
+        // the link, so the digest refuses it, and the per-role check
+        // refuses it before the walk, on top of configuration doing
+        // the same.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let component = real.join("component");
+        std::fs::write(&component, b"component bytes").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = closure_digest(std::slice::from_ref(&link), &component).unwrap_err();
+        assert_eq!(error.code, "rasterizer-hash-drift");
+        assert!(error.message.contains("symlink"), "{error:?}");
+        let mut role = entry(PROVIDER_ROLE_RASTER);
+        role.path = component.to_str().unwrap().to_string();
+        role.expected_blake3 = crate::hash::hash_file(&component).unwrap();
+        role.closure_roots = vec![link.to_str().unwrap().to_string()];
+        role.closure_blake3 = Some("b".repeat(64));
+        let error = verify_role(&role).unwrap_err();
+        assert_eq!(error.code, "rasterizer-hash-drift");
+        assert!(error.message.contains("symlink"), "{error:?}");
+        // The real entry passes those checks and reaches the digest
+        // comparison, which is the next named refusal.
+        role.closure_roots = vec![real.to_str().unwrap().to_string()];
+        let error = verify_role(&role).unwrap_err();
+        assert!(error.message.contains("pinned digest"), "{error:?}");
+    }
+
+    #[test]
+    fn the_worker_decides_containment_on_resolved_paths() {
+        // A component whose written path lies inside an entry but whose
+        // resolved path lies outside is refused, and one written
+        // through a link that resolves inside is accepted up to the
+        // digest comparison.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let closure = root.join("closure");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&closure).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let escaped = outside.join("component");
+        std::fs::write(&escaped, b"component bytes").unwrap();
+        std::os::unix::fs::symlink(&outside, closure.join("link")).unwrap();
+        let mut role = entry(PROVIDER_ROLE_RASTER);
+        role.path = closure.join("link/component").to_str().unwrap().to_string();
+        role.expected_blake3 = crate::hash::hash_file(&escaped).unwrap();
+        role.closure_roots = vec![closure.to_str().unwrap().to_string()];
+        role.closure_blake3 = Some("b".repeat(64));
+        let error = verify_role(&role).unwrap_err();
+        assert_eq!(error.code, "rasterizer-hash-drift");
+        assert!(error.message.contains("outside"), "{error:?}");
+        let inside = closure.join("component");
+        std::fs::write(&inside, b"component bytes").unwrap();
+        std::os::unix::fs::symlink(&closure, root.join("alias")).unwrap();
+        role.path = root.join("alias/component").to_str().unwrap().to_string();
+        let error = verify_role(&role).unwrap_err();
+        assert!(error.message.contains("pinned digest"), "{error:?}");
+        // A written path that is not in normal form never reaches the
+        // resolution at all.
+        role.path = closure
+            .join("../closure/component")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let error = verify_role(&role).unwrap_err();
+        assert!(error.message.contains("normal form"), "{error:?}");
     }
 
     #[test]

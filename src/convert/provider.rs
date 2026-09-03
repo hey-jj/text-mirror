@@ -270,8 +270,20 @@ const SHARED_ROOTS: &[&str] = &[
 ];
 
 /// Whether a closure entry names one of those shared roots, or is so
-/// shallow it can only be one.
+/// shallow it can only be one. Judged on the path as written and, when
+/// it exists, on the tree it really names, so an alias through `..` or
+/// a symlink whose target is a shared root is refused the same way.
 pub fn is_shared_root(path: &Path) -> bool {
+    if names_shared_root(path) {
+        return true;
+    }
+    match std::fs::canonicalize(path) {
+        Ok(real) => names_shared_root(&real),
+        Err(_) => false,
+    }
+}
+
+fn names_shared_root(path: &Path) -> bool {
     let text = path.to_string_lossy();
     let trimmed = text.trim_end_matches('/');
     let normalized = if trimmed.is_empty() { "/" } else { trimmed };
@@ -281,6 +293,39 @@ pub fn is_shared_root(path: &Path) -> bool {
     // A single top-level directory nobody listed is still a shared root
     // by shape.
     path.components().count() < 3
+}
+
+/// Whether a path is absolute and in normal form: the root, then plain
+/// components only, no `.` and no `..`. A path that is not cannot be
+/// compared with anything by its text.
+pub fn is_normal_form(path: &Path) -> bool {
+    use std::path::Component;
+    path.is_absolute()
+        && path
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+}
+
+/// Whether a path's last component is itself a symlink. An enumerated
+/// entry must be a real directory or a real regular file: the grant
+/// is rendered on the path, and the digest never follows a link, so a
+/// link entry would grant one tree and measure another.
+pub fn is_symlink_entry(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// The tree a path really names, or `None` when it cannot be resolved.
+/// Every containment decision and every rendered grant is made on this
+/// form, never on the text as written.
+pub fn canonical(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
+/// Whether one canonical path lies under another, component-wise.
+pub fn lies_inside(real_path: &Path, real_root: &Path) -> bool {
+    real_path == real_root || real_path.starts_with(real_root)
 }
 
 /// Whether an environment variable name is a bounded identifier: an
@@ -375,16 +420,46 @@ impl ProviderRole {
     /// parameters must fit their closed shapes; the file itself is
     /// re-checked and re-hashed in the jailed worker before every
     /// execution, so nothing here is trusted later.
-    fn validate(&self, role: &str) -> Result<()> {
+    fn validated(&self, role: &str) -> Result<ProviderRole> {
         if !self.path.is_absolute() {
             return Err(rules_error(format!(
                 "provider role {role:?} needs an absolute path"
             )));
         }
+        if !is_normal_form(&self.path) {
+            return Err(rules_error(format!(
+                "provider role {role:?} path is not in normal form: write the real absolute path without . or .. components"
+            )));
+        }
+        // The executable and every entry are resolved to the trees
+        // they really name, and everything after this point, the
+        // shared-root refusal, containment, the rendered grants, and
+        // the worker's own checks, sees only those. A path that cannot
+        // be resolved is refused here rather than carried forward as
+        // text nothing can vouch for.
+        let real_path = canonical(&self.path).ok_or_else(|| {
+            rules_error(format!(
+                "provider role {role:?} path {} cannot be resolved",
+                self.path.display()
+            ))
+        })?;
+        let mut real_roots = Vec::with_capacity(self.closure_roots.len());
         for root in &self.closure_roots {
             if !root.is_absolute() {
                 return Err(rules_error(format!(
                     "provider role {role:?} needs absolute closure_roots"
+                )));
+            }
+            if !is_normal_form(root) {
+                return Err(rules_error(format!(
+                    "provider role {role:?} closure_roots entry {} is not in normal form: write the real absolute path without . or .. components",
+                    root.display()
+                )));
+            }
+            if is_symlink_entry(root) {
+                return Err(rules_error(format!(
+                    "provider role {role:?} closure_roots entry {} is a symlink: enumerate the real path it names",
+                    root.display()
                 )));
             }
             if is_shared_root(root) {
@@ -393,17 +468,28 @@ impl ProviderRole {
                     root.display()
                 )));
             }
+            let real_root = canonical(root).ok_or_else(|| {
+                rules_error(format!(
+                    "provider role {role:?} closure_roots entry {} cannot be resolved",
+                    root.display()
+                ))
+            })?;
+            if is_shared_root(&real_root) {
+                return Err(rules_error(format!(
+                    "provider role {role:?} closure_roots entry {} is a shared root: enumerate the measured dependencies instead",
+                    root.display()
+                )));
+            }
+            real_roots.push(real_root);
         }
         // A role that enumerates a closure must sit inside it: the
         // executable is what the closure exists for, and an executable
         // outside every entry would be authorized by its literal grant
-        // alone while its own tree stays unmeasured.
-        if !self.closure_roots.is_empty()
-            && !self
-                .closure_roots
-                .iter()
-                .any(|root| self.path == *root || self.path.starts_with(root))
-        {
+        // alone while its own tree stays unmeasured. Inside is decided
+        // on the resolved paths, component-wise, so neither `..` nor a
+        // symlinked ancestor can place an executable in a closure it
+        // does not really lie in.
+        if !real_roots.is_empty() && !real_roots.iter().any(|root| lies_inside(&real_path, root)) {
             return Err(rules_error(format!(
                 "provider role {role:?} executable lies outside every closure_roots entry"
             )));
@@ -422,7 +508,12 @@ impl ProviderRole {
                 "provider-parameter-invalid: provider role {role:?} jail_temp_env is not a bounded identifier"
             )));
         }
-        Ok(())
+        Ok(ProviderRole {
+            path: real_path,
+            closure_roots: real_roots,
+            jail_service_prefix: self.jail_service_prefix.clone(),
+            jail_temp_env: self.jail_temp_env.clone(),
+        })
     }
 }
 
@@ -461,15 +552,16 @@ impl ProviderConfig {
                 )));
             }
         }
-        let mut resolved = Vec::new();
         for role in PROVIDER_ROLES {
-            let Some(entry) = roles.get(role) else {
+            if !roles.contains_key(role) {
                 return Err(rules_error(format!(
                     "[providers.svg] is missing role {role:?}: both roles form one complete provider"
                 )));
-            };
-            entry.validate(role)?;
-            resolved.push(entry.clone());
+            }
+        }
+        let mut resolved = Vec::new();
+        for role in PROVIDER_ROLES {
+            resolved.push(roles[role].validated(role)?);
         }
         let encoder = resolved.pop().expect("both roles resolved");
         let raster = resolved.pop().expect("both roles resolved");
@@ -583,20 +675,67 @@ mod tests {
         format!("schema = \"{PROVIDER_SCHEMA}\"\n{body}")
     }
 
-    fn complete() -> String {
-        config(&format!(
-            r#"
-[providers.svg."{PROVIDER_ROLE_RASTER}"]
-path = "/deploy/raster/bin/raster"
-closure_roots = ["/deploy/raster"]
-jail_service_prefix = "^ex\\.ample\\.Product\\."
-jail_temp_env = "EXAMPLE_TMPDIR"
+    /// A deployment on disk: both executables and a dependency in real
+    /// directories, because every path is resolved at parse and a path
+    /// that cannot be resolved is refused.
+    struct Deploy {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+    }
 
-[providers.svg."{PROVIDER_ROLE_ENCODER}"]
-path = "/deploy/encoder/bin/encoder"
-closure_roots = ["/deploy/encoder", "/deploy/dependency/lib/dep.dylib"]
-"#
-        ))
+    impl Deploy {
+        fn new() -> Deploy {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap().join("deploy");
+            for rel in [
+                "raster/bin/raster",
+                "encoder/bin/encoder",
+                "dependency/lib/dep.dylib",
+                "elsewhere/bin/raster",
+            ] {
+                let path = root.join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, b"program").unwrap();
+            }
+            Deploy { _dir: dir, root }
+        }
+
+        fn at(&self, rel: &str) -> String {
+            self.root.join(rel).display().to_string()
+        }
+
+        fn raster_path_line(&self) -> String {
+            format!("path = \"{}\"", self.at("raster/bin/raster"))
+        }
+
+        fn raster_roots_line(&self) -> String {
+            format!("closure_roots = [\"{}\"]", self.at("raster"))
+        }
+
+        fn encoder_path_line(&self) -> String {
+            format!("path = \"{}\"", self.at("encoder/bin/encoder"))
+        }
+
+        fn encoder_roots_line(&self) -> String {
+            format!(
+                "closure_roots = [\"{}\", \"{}\"]",
+                self.at("encoder"),
+                self.at("dependency/lib/dep.dylib")
+            )
+        }
+
+        fn complete(&self) -> String {
+            config(&format!(
+                "\n[providers.svg.\"{PROVIDER_ROLE_RASTER}\"]\n{}\n{}\n\
+                 jail_service_prefix = \"^ex\\\\.ample\\\\.Product\\\\.\"\n\
+                 jail_temp_env = \"EXAMPLE_TMPDIR\"\n\n\
+                 [providers.svg.\"{PROVIDER_ROLE_ENCODER}\"]\n{}\n{}\n",
+                self.raster_path_line(),
+                self.raster_roots_line(),
+                self.encoder_path_line(),
+                self.encoder_roots_line(),
+            ))
+        }
     }
 
     fn pins() -> BTreeMap<String, ProviderPin> {
@@ -622,9 +761,10 @@ closure_roots = ["/deploy/encoder", "/deploy/dependency/lib/dep.dylib"]
 
     #[test]
     fn a_complete_configuration_resolves_both_roles() {
-        let parsed = ProviderConfig::parse(&complete()).unwrap();
+        let deploy = Deploy::new();
+        let parsed = ProviderConfig::parse(&deploy.complete()).unwrap();
         let svg = parsed.svg().expect("both roles present");
-        assert_eq!(svg.raster.path, PathBuf::from("/deploy/raster/bin/raster"));
+        assert_eq!(svg.raster.path, deploy.root.join("raster/bin/raster"));
         assert_eq!(
             svg.raster.jail_service_prefix.as_deref(),
             Some(r"^ex\.ample\.Product\.")
@@ -633,8 +773,8 @@ closure_roots = ["/deploy/encoder", "/deploy/dependency/lib/dep.dylib"]
         assert_eq!(
             svg.encoder.closure_roots,
             vec![
-                PathBuf::from("/deploy/encoder"),
-                PathBuf::from("/deploy/dependency/lib/dep.dylib")
+                deploy.root.join("encoder"),
+                deploy.root.join("dependency/lib/dep.dylib")
             ]
         );
         assert!(svg.encoder.jail_service_prefix.is_none());
@@ -693,18 +833,18 @@ closure_roots = ["/deploy/encoder", "/deploy/dependency/lib/dep.dylib"]
 
     #[test]
     fn paths_are_validated_before_a_run_starts() {
-        let relative = complete().replace(
-            "path = \"/deploy/raster/bin/raster\"",
-            "path = \"relative/raster\"",
-        );
+        let deploy = Deploy::new();
+        let relative = deploy
+            .complete()
+            .replace(&deploy.raster_path_line(), "path = \"relative/raster\"");
         assert!(
             ProviderConfig::parse(&relative)
                 .unwrap_err()
                 .to_string()
                 .contains("absolute path")
         );
-        let relative_closure = complete().replace(
-            "closure_roots = [\"/deploy/encoder\", \"/deploy/dependency/lib/dep.dylib\"]",
+        let relative_closure = deploy.complete().replace(
+            &deploy.encoder_roots_line(),
             "closure_roots = [\"relative/lib\"]",
         );
         assert!(
@@ -731,36 +871,42 @@ closure_roots = ["/deploy/encoder", "/deploy/dependency/lib/dep.dylib"]
             "/bin",
             "/opt/homebrew/Cellar/",
         ] {
-            let text = complete().replace(
-                "closure_roots = [\"/deploy/encoder\", \"/deploy/dependency/lib/dep.dylib\"]",
+            let text = deploy.complete().replace(
+                &deploy.encoder_roots_line(),
                 &format!("closure_roots = [\"{shared}\"]"),
             );
             let error = ProviderConfig::parse(&text).unwrap_err().to_string();
             assert!(error.contains("shared root"), "{shared}: {error}");
         }
         // A specific versioned artifact under one of those roots is
-        // exactly what an enumeration should name, so it is accepted.
+        // exactly what an enumeration should name, so its shape is
+        // accepted by the predicate.
         for named in [
             "/opt/homebrew/Cellar/example/1.2.3",
             "/opt/homebrew/Cellar/example/1.2.3/lib/libexample.dylib",
             "/Applications/Example.app",
         ] {
-            // The executable moves inside the named entry, so only the
-            // shape of the entry is under test here.
-            let text = complete()
-                .replace(
-                    "closure_roots = [\"/deploy/encoder\", \"/deploy/dependency/lib/dep.dylib\"]",
-                    &format!("closure_roots = [\"{named}\"]"),
-                )
-                .replace(
-                    "path = \"/deploy/encoder/bin/encoder\"",
-                    &format!("path = \"{named}/bin/encoder\""),
-                );
-            assert!(ProviderConfig::parse(&text).is_ok(), "{named}");
+            assert!(!is_shared_root(Path::new(named)), "{named}");
         }
+        // A component or an entry that does not exist cannot be
+        // resolved, and is refused rather than carried as text.
+        let missing = deploy.complete().replace(
+            &deploy.raster_path_line(),
+            &format!("path = \"{}\"", deploy.at("raster/bin/absent")),
+        );
+        let error = ProviderConfig::parse(&missing).unwrap_err().to_string();
+        assert!(error.contains("cannot be resolved"), "{error}");
+        let missing_entry = deploy.complete().replace(
+            &deploy.encoder_roots_line(),
+            &format!("closure_roots = [\"{}\"]", deploy.at("encoder-absent")),
+        );
+        let error = ProviderConfig::parse(&missing_entry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot be resolved"), "{error}");
         // A configuration that enumerates a closure the rules do not
         // pin is refused where the two meet, at registry construction.
-        let parsed = ProviderConfig::parse(&complete()).unwrap();
+        let parsed = ProviderConfig::parse(&deploy.complete()).unwrap();
         let svg = parsed.svg().unwrap();
         assert!(
             check_closure_is_pinned(
@@ -843,26 +989,27 @@ closure_roots = ["/deploy/encoder", "/deploy/dependency/lib/dep.dylib"]
 
     #[test]
     fn an_out_of_shape_parameter_is_refused_by_name_before_any_run() {
-        let free = complete().replace(
+        let deploy = Deploy::new();
+        let free = deploy.complete().replace(
             r#"jail_service_prefix = "^ex\\.ample\\.Product\\.""#,
             r#"jail_service_prefix = "^(com\\.a|org\\.b)\\.""#,
         );
         let error = ProviderConfig::parse(&free).unwrap_err().to_string();
         assert!(error.contains("provider-parameter-invalid"), "{error}");
         assert!(error.contains("jail_service_prefix"), "{error}");
-        let unanchored = complete().replace(
+        let unanchored = deploy.complete().replace(
             r#"jail_service_prefix = "^ex\\.ample\\.Product\\.""#,
             r#"jail_service_prefix = "ex\\.ample\\.""#,
         );
         assert!(ProviderConfig::parse(&unanchored).is_err());
-        let long_name = complete().replace(
+        let long_name = deploy.complete().replace(
             "jail_temp_env = \"EXAMPLE_TMPDIR\"",
             &format!("jail_temp_env = \"{}\"", "T".repeat(65)),
         );
         let error = ProviderConfig::parse(&long_name).unwrap_err().to_string();
         assert!(error.contains("provider-parameter-invalid"), "{error}");
         assert!(error.contains("jail_temp_env"), "{error}");
-        let lower = complete().replace(
+        let lower = deploy.complete().replace(
             "jail_temp_env = \"EXAMPLE_TMPDIR\"",
             "jail_temp_env = \"lowercase\"",
         );
@@ -997,7 +1144,8 @@ closure_roots = ["/deploy/encoder", "/deploy/dependency/lib/dep.dylib"]
             Some(base)
         );
         // A configuration's own identity carries its parameters.
-        let parsed = ProviderConfig::parse(&complete()).unwrap();
+        let deploy = Deploy::new();
+        let parsed = ProviderConfig::parse(&deploy.complete()).unwrap();
         let identity = parsed.jail_identity();
         assert_eq!(
             identity.service_prefix.as_deref(),
@@ -1011,26 +1159,97 @@ closure_roots = ["/deploy/encoder", "/deploy/dependency/lib/dep.dylib"]
         // A role that enumerates a closure must sit inside it, or its
         // literal grant would authorize an executable whose own tree is
         // unmeasured.
-        let outside = complete().replace(
-            "closure_roots = [\"/deploy/raster\"]",
-            "closure_roots = [\"/deploy/elsewhere\"]",
+        let deploy = Deploy::new();
+        let outside = deploy.complete().replace(
+            &deploy.raster_roots_line(),
+            &format!("closure_roots = [\"{}\"]", deploy.at("elsewhere")),
         );
         let error = ProviderConfig::parse(&outside).unwrap_err().to_string();
         assert!(error.contains("outside every closure_roots"), "{error}");
         // Inside as a subtree member, or as the entry itself, is fine.
-        let as_entry = complete().replace(
-            "closure_roots = [\"/deploy/raster\"]",
-            "closure_roots = [\"/deploy/raster/bin/raster\"]",
+        let as_entry = deploy.complete().replace(
+            &deploy.raster_roots_line(),
+            &format!("closure_roots = [\"{}\"]", deploy.at("raster/bin/raster")),
         );
         assert!(ProviderConfig::parse(&as_entry).is_ok());
-        let among = complete().replace(
-            "closure_roots = [\"/deploy/raster\"]",
-            "closure_roots = [\"/deploy/elsewhere\", \"/deploy/raster\"]",
+        let among = deploy.complete().replace(
+            &deploy.raster_roots_line(),
+            &format!(
+                "closure_roots = [\"{}\", \"{}\"]",
+                deploy.at("elsewhere"),
+                deploy.at("raster")
+            ),
         );
         assert!(ProviderConfig::parse(&among).is_ok());
         // With no closure at all, the executable stands on its literal
         // grant alone, which is the shape of a self-contained component.
-        let none = complete().replace("closure_roots = [\"/deploy/raster\"]\n", "");
+        let none = deploy
+            .complete()
+            .replace(&format!("{}\n", deploy.raster_roots_line()), "");
         assert!(ProviderConfig::parse(&none).is_ok());
+    }
+
+    #[test]
+    fn containment_is_decided_on_resolved_paths() {
+        // Inside means inside the tree the entry really names. A `..`
+        // alias is not in normal form and is refused as written; a
+        // symlinked ancestor that resolves outside the closure is
+        // refused on the resolved path; and a symlinked ancestor that
+        // resolves inside is accepted, with the resolved path kept.
+        let deploy = Deploy::new();
+        let dotted = deploy.complete().replace(
+            &deploy.raster_path_line(),
+            &format!("path = \"{}\"", deploy.at("raster/../elsewhere/bin/raster")),
+        );
+        let error = ProviderConfig::parse(&dotted).unwrap_err().to_string();
+        assert!(error.contains("not in normal form"), "{error}");
+
+        std::os::unix::fs::symlink(
+            deploy.root.join("elsewhere"),
+            deploy.root.join("raster/link"),
+        )
+        .unwrap();
+        let escaping = deploy.complete().replace(
+            &deploy.raster_path_line(),
+            &format!("path = \"{}\"", deploy.at("raster/link/bin/raster")),
+        );
+        let error = ProviderConfig::parse(&escaping).unwrap_err().to_string();
+        assert!(error.contains("outside every closure_roots"), "{error}");
+
+        std::os::unix::fs::symlink(deploy.root.join("raster"), deploy.root.join("alias")).unwrap();
+        let entering = deploy.complete().replace(
+            &deploy.raster_path_line(),
+            &format!("path = \"{}\"", deploy.at("alias/bin/raster")),
+        );
+        let parsed = ProviderConfig::parse(&entering).unwrap();
+        assert_eq!(
+            parsed.svg().unwrap().raster.path,
+            deploy.root.join("raster/bin/raster")
+        );
+
+        // The shared-root refusal is decided the same way: an alias of
+        // a shared root is refused as written, and a link whose target
+        // is a shared root is refused as an entry.
+        let alias = deploy.complete().replace(
+            &deploy.encoder_roots_line(),
+            "closure_roots = [\"/private/tmp/../tmp\"]",
+        );
+        let error = ProviderConfig::parse(&alias).unwrap_err().to_string();
+        assert!(error.contains("not in normal form"), "{error}");
+        std::os::unix::fs::symlink("/usr/lib", deploy.root.join("store")).unwrap();
+        let linked = deploy.complete().replace(
+            &deploy.encoder_roots_line(),
+            &format!("closure_roots = [\"{}\"]", deploy.at("store")),
+        );
+        let error = ProviderConfig::parse(&linked).unwrap_err().to_string();
+        assert!(error.contains("is a symlink"), "{error}");
+        // And so is a link to a perfectly good tree: an entry is the
+        // real directory or the real file, never a name for one.
+        let real_link = deploy.complete().replace(
+            &deploy.raster_roots_line(),
+            &format!("closure_roots = [\"{}\"]", deploy.at("alias")),
+        );
+        let error = ProviderConfig::parse(&real_link).unwrap_err().to_string();
+        assert!(error.contains("is a symlink"), "{error}");
     }
 }

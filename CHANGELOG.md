@@ -36,7 +36,11 @@ Versioning.
   package store, an application directory, or any other directory
   many unrelated programs live in is refused, and a role that
   enumerates a closure must have that closure pinned or the run is
-  refused at registry construction. What the worker asserts about each
+  refused at registry construction. Every configured path is resolved
+  when the configuration is read: a component or entry that cannot be
+  resolved, an entry that is a symlink, or a path written with `.` or
+  `..` is refused, the executable must lie inside one of its entries on
+  the resolved paths, and the jail grants the resolved paths. What the worker asserts about each
   executable, the BLAKE3, the exact version, and the aggregate closure
   digest over every regular file and symlink target under each
   enumerated entry, is versioned

@@ -241,6 +241,10 @@ fn every_configured_provider_failure_is_a_failed_child_never_unsupported() {
     // configured provider that cannot run is a failure on the record:
     // unsupported is for a format nothing claims, and this format is
     // claimed by the passthrough that just converted it.
+    // A component that is absent when the configuration is read is
+    // refused there, so the two absence cases plant their fault after
+    // the rules are built, the shape of a component that goes missing
+    // between startup and the run.
     type Plant = Box<dyn Fn(&mut FakeProvider)>;
     let cases: Vec<(&str, Plant, &str)> = vec![
         (
@@ -306,11 +310,18 @@ fn every_configured_provider_failure_is_a_failed_child_never_unsupported() {
     ];
     for (name, plant, expected) in cases {
         let mut provider = FakeProvider::new(&[(1600, 900), (900, 900), (800, 450)]);
-        plant(&mut provider);
+        let rules = if name.ends_with("absent.svg") {
+            let rules = provider_rules(&provider);
+            plant(&mut provider);
+            rules
+        } else {
+            plant(&mut provider);
+            provider_rules(&provider)
+        };
         let setup = setup();
         fs::write(setup.root.join(name), svg_bytes(1600, 900, "text")).unwrap();
 
-        run_with(&setup, &provider_rules(&provider));
+        run_with(&setup, &rules);
 
         let primary = terminal(&setup, name).unwrap_or_else(|| panic!("{name}: primary"));
         assert_eq!(primary.status, Status::Converted, "{name}");
@@ -444,7 +455,8 @@ fn the_effective_rules_version_names_the_provider_and_excludes_its_paths() {
     assert_eq!(version.len(), "10+svg.".len() + 12, "{version}");
 
     // The same provider reached through a different absolute path is
-    // the same provider: moving an installation skips nothing.
+    // the same provider: moving an identical installation to another
+    // path re-runs nothing.
     let moved = provider.moved();
     assert_eq!(provider_rules(&moved).version(), version);
 
@@ -625,10 +637,11 @@ fn a_failed_provider_child_keeps_its_parent_from_skipping() {
     // the leg keeps the parent live until the child converts, so the
     // refusal is never frozen into the checkpoint.
     let mut provider = FakeProvider::new(&[(1600, 900)]);
+    let rules = provider_rules(&provider);
     provider.remove_raster();
     let setup = setup();
     fs::write(setup.root.join("later.svg"), svg_bytes(1600, 900, "text")).unwrap();
-    run_with(&setup, &provider_rules(&provider));
+    run_with(&setup, &rules);
     let child = terminal(&setup, &child_of("later.svg")).expect("a failed child");
     assert_eq!(child.status, Status::Failed);
     assert!(
@@ -729,6 +742,58 @@ fn different_jail_parameters_are_a_different_effective_version() {
     // The parameter values themselves never reach a record.
     assert!(!second_version.contains("ample"));
     assert!(!second_version.contains("TMPDIR"));
+}
+
+#[test]
+fn an_edited_profile_template_re_runs_the_source() {
+    // The profile template's hash is part of the identity, so a run
+    // under an edited template never checkpoints against a run under
+    // the measured one: the unchanged source re-runs.
+    let provider = FakeProvider::new(&[(1600, 900)]);
+    let setup = setup();
+    fs::write(setup.root.join("art.svg"), svg_bytes(1600, 900, "text")).unwrap();
+    let measured = provider.rules();
+    run_with(&setup, &measured);
+    let first_version = terminal(&setup, "art.svg").unwrap().rules_version;
+    assert!(!artifact(&setup, &child_of("art.svg")).is_empty());
+
+    let edited = provider.rules_under_template(&"u".repeat(64));
+    assert_ne!(measured.version(), edited.version());
+    let report = run_with(&setup, &edited);
+    assert_eq!(report.counts.skipped_unchanged, 0, "{report:?}");
+    let second_version = terminal(&setup, "art.svg").unwrap().rules_version;
+    assert_ne!(first_version, second_version);
+    assert!(!second_version.contains('u'), "{second_version}");
+
+    // And the edited template is then its own checkpoint.
+    let report = run_with(&setup, &edited);
+    assert_eq!(report.counts.skipped_unchanged, 1, "{report:?}");
+}
+
+#[test]
+fn moving_an_identical_installation_re_runs_nothing() {
+    // The identity excludes every absolute path, so the same pinned
+    // provider installed somewhere else is the same version: the
+    // unchanged source checkpoint-skips with its child intact.
+    let provider = FakeProvider::new(&[(1600, 900)]);
+    let setup = setup();
+    fs::write(setup.root.join("art.svg"), svg_bytes(1600, 900, "text")).unwrap();
+    run_with(&setup, &provider.rules());
+    let first = terminal(&setup, "art.svg").unwrap();
+    let child_before = artifact(&setup, &child_of("art.svg"));
+    assert!(!child_before.is_empty());
+
+    let moved = provider.moved();
+    assert_ne!(moved.raster_path(), provider.raster_path());
+    let relocated = moved.rules();
+    assert_eq!(relocated.version(), provider.rules().version());
+    let report = run_with(&setup, &relocated);
+    assert_eq!(report.counts.skipped_unchanged, 1, "{report:?}");
+    let second = terminal(&setup, "art.svg").unwrap();
+    assert_eq!(second.rules_version, first.rules_version);
+    let child = terminal(&setup, &child_of("art.svg")).expect("the child survives");
+    assert_eq!(child.status, Status::Converted);
+    assert_eq!(artifact(&setup, &child_of("art.svg")), child_before);
 }
 
 // --- dedup, collisions, and containers --------------------------------

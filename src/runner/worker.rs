@@ -780,8 +780,8 @@ mod harness {
             loopback: String,
             /// A shell profile file in the real home to read.
             shell_profile: String,
-            /// A resident profile directory to list.
-            profile_dir: String,
+            /// A real file inside a resident profile directory to read.
+            profile_file: String,
             /// The privileged configuration file to read.
             privileged: String,
             /// An undeclared program to attempt to run.
@@ -796,7 +796,7 @@ mod harness {
             "tcp-loopback-connect": attempt_connect(&body.loopback),
             "tcp-listen": outcome(std::net::TcpListener::bind("127.0.0.1:0").map(|_| ())),
             "read-shell-profile": outcome(std::fs::read(&body.shell_profile).map(|_| ())),
-            "read-profile-dir": outcome(std::fs::read_dir(&body.profile_dir).map(|_| ())),
+            "read-resident-profile": outcome(std::fs::read(&body.profile_file).map(|_| ())),
             "read-privileged": outcome(std::fs::read(&body.privileged).map(|_| ())),
             "exec-undeclared": outcome(
                 std::process::Command::new(&body.program)

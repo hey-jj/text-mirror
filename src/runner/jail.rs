@@ -94,6 +94,11 @@ impl ProviderJail {
             code: "sandbox_unavailable",
             message,
         };
+        // Every entry is rendered as a grant on the tree it really
+        // names: resolved here, refused when it cannot be, so an alias
+        // through `..` or a link never reaches the profile and the
+        // shared-root refusal judges the real path.
+        let mut real_closures = Vec::with_capacity(closures.len());
         for closure in &closures {
             if !closure.is_absolute() {
                 return Err(refuse(format!(
@@ -101,12 +106,33 @@ impl ProviderJail {
                     closure.display()
                 )));
             }
-            if crate::convert::provider::is_shared_root(closure) {
+            if !crate::convert::provider::is_normal_form(closure) {
+                return Err(refuse(format!(
+                    "closure entry {} is not in normal form",
+                    closure.display()
+                )));
+            }
+            if crate::convert::provider::is_symlink_entry(closure) {
+                return Err(refuse(format!(
+                    "closure entry {} is a symlink, not the tree it names",
+                    closure.display()
+                )));
+            }
+            let Some(real) = crate::convert::provider::canonical(closure) else {
+                return Err(refuse(format!(
+                    "closure entry {} cannot be resolved",
+                    closure.display()
+                )));
+            };
+            if crate::convert::provider::is_shared_root(closure)
+                || crate::convert::provider::is_shared_root(&real)
+            {
                 return Err(refuse(format!(
                     "closure entry {} is a shared root, not a measured dependency",
                     closure.display()
                 )));
             }
+            real_closures.push(real);
         }
         if let Some(prefix) = &service_prefix
             && !crate::convert::provider::is_service_namespace(prefix)
@@ -123,7 +149,7 @@ impl ProviderJail {
             ));
         }
         Ok(ProviderJail {
-            closures,
+            closures: real_closures,
             service_prefix,
             temp_env,
         })

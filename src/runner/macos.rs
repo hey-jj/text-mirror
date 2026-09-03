@@ -535,6 +535,17 @@ mod tests {
         .expect("the test parameters fit the grammar")
     }
 
+    /// A real closure directory, resolved, since every entry must
+    /// resolve to be granted, and the profile carries the resolved
+    /// path.
+    fn closure_fixture() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let closure = dir.path().canonicalize().unwrap().join("closure");
+        std::fs::create_dir_all(&closure).unwrap();
+        let text = closure.to_str().unwrap().to_string();
+        (dir, text)
+    }
+
     #[test]
     fn the_provider_profile_template_is_pinned_to_its_own_bytes() {
         // The profile is a measured artifact, not a convenience. Its
@@ -548,14 +559,16 @@ mod tests {
 
     #[test]
     fn a_wired_provider_renders_the_measured_profile_byte_for_byte() {
+        let (_dir, closure) = closure_fixture();
         let rendered = render_with(
             &["/deploy/engine-cli"],
             &[],
             RuntimeProfile::Provider,
-            Some(&provider(&["/deploy/closure"], Some(r"^ex\.ample\."))),
+            Some(&provider(&[&closure], Some(r"^ex\.ample\."))),
         )
         .expect("the fixed paths render");
-        assert_eq!(rendered, PROVIDER_0_7_0, "{rendered}");
+        let expected = PROVIDER_0_7_0.replace("/deploy/closure", &closure);
+        assert_eq!(rendered, expected, "{rendered}");
         // The class carries no allowance measured for a different
         // engine: the device pair the accelerator class emits is not
         // this profile's, and the scoped user-client class never
@@ -570,15 +583,19 @@ mod tests {
         // Single-pass substitution: a closure path that happens to spell
         // a placeholder is inserted as text and never re-scanned, so
         // it cannot pull another value into itself.
+        let dir = tempfile::tempdir().unwrap();
+        let closure = dir.path().canonicalize().unwrap().join("closure-jail");
+        std::fs::create_dir_all(&closure).unwrap();
+        let closure = closure.to_str().unwrap().to_string();
         let rendered = render_with(
             &["/deploy/engine-cli"],
             &[],
             RuntimeProfile::Provider,
-            Some(&provider(&["/deploy/closure-jail"], None)),
+            Some(&provider(&[&closure], None)),
         )
         .expect("a placeholder-looking path renders");
         assert!(
-            rendered.contains("(subpath \"/deploy/closure-jail\")"),
+            rendered.contains(&format!("(subpath \"{closure}\")")),
             "{rendered}"
         );
         // A path spelling `{worker}` inside a quoted string cannot be
@@ -631,34 +648,60 @@ mod tests {
         // becomes a registration allowance: a free expression, an
         // unanchored prefix, a shared root as a closure, a malformed
         // variable name.
+        let (dir, closure) = closure_fixture();
         for bad in [r"^.*", r"ex\.ample\.", r"^(a|b)\.", r"^a\.[a-z]+\."] {
-            let error = ProviderJail::new(
-                vec![PathBuf::from("/deploy/closure")],
-                Some(bad.to_string()),
-                None,
-            )
-            .expect_err("a non-conforming namespace must refuse");
+            let error =
+                ProviderJail::new(vec![PathBuf::from(&closure)], Some(bad.to_string()), None)
+                    .expect_err("a non-conforming namespace must refuse");
             assert_eq!(error.code, "sandbox_unavailable", "{bad}");
         }
         let error = ProviderJail::new(vec![PathBuf::from("/usr/lib")], None, None)
             .expect_err("a shared root must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
         let error = ProviderJail::new(
-            vec![PathBuf::from("/deploy/closure")],
+            vec![PathBuf::from(&closure)],
             None,
             Some("lowercase".to_string()),
         )
         .expect_err("a malformed variable name must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
-        // The conforming shape builds and renders.
-        assert!(
-            ProviderJail::new(
-                vec![PathBuf::from("/deploy/closure")],
-                Some(r"^ex\.ample\.".to_string()),
-                Some("EXAMPLE_TMPDIR".to_string()),
-            )
-            .is_ok()
-        );
+        // The entries are judged on the trees they really name: an
+        // alias of a shared root through `..` is refused as written, a
+        // link whose target is a shared root is refused as an entry, a
+        // link to any tree is refused as an entry, and an entry that
+        // does not exist cannot be granted.
+        let error = ProviderJail::new(vec![PathBuf::from("/private/tmp/../tmp")], None, None)
+            .expect_err("an alias of a shared root must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+        assert!(error.message.contains("normal form"), "{}", error.message);
+        let store = dir.path().join("store");
+        std::os::unix::fs::symlink("/usr/lib", &store).unwrap();
+        let error = ProviderJail::new(vec![store], None, None)
+            .expect_err("a link to a shared root must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+        assert!(error.message.contains("symlink"), "{}", error.message);
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&closure, &alias).unwrap();
+        let error =
+            ProviderJail::new(vec![alias], None, None).expect_err("a link entry must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+        let error = ProviderJail::new(vec![PathBuf::from("/deploy/closure")], None, None)
+            .expect_err("an entry that does not exist must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+        assert!(error.message.contains("resolved"), "{}", error.message);
+        // The conforming shape builds and renders, on the resolved
+        // path: an unresolved spelling of the same tree is granted as
+        // the tree.
+        let jail = ProviderJail::new(
+            vec![PathBuf::from(&closure)],
+            Some(r"^ex\.ample\.".to_string()),
+            Some("EXAMPLE_TMPDIR".to_string()),
+        )
+        .unwrap();
+        assert_eq!(jail.closures(), &[PathBuf::from(&closure)]);
+        let unresolved = dir.path().join("closure");
+        let jail = ProviderJail::new(vec![unresolved], None, None).unwrap();
+        assert_eq!(jail.closures(), &[PathBuf::from(&closure)]);
     }
 
     #[test]
@@ -689,11 +732,12 @@ mod tests {
         let error = render_with(&["/deploy/engine-cli"], &[], RuntimeProfile::Provider, None)
             .expect_err("an unwired provider class must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
+        let (_dir, closure) = closure_fixture();
         let error = render_with(
             &[],
             &[],
             RuntimeProfile::Provider,
-            Some(&provider(&["/deploy/closure"], None)),
+            Some(&provider(&[&closure], None)),
         )
         .expect_err("a grant-free provider class must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
@@ -701,12 +745,15 @@ mod tests {
 
     #[test]
     fn a_provider_path_that_cannot_be_quoted_refuses_the_run() {
-        for closure in ["/deploy/quote\"mark", "/deploy/back\\slash"] {
+        let (dir, _closure) = closure_fixture();
+        for name in ["quote\"mark", "back\\slash"] {
+            let closure = dir.path().canonicalize().unwrap().join(name);
+            std::fs::create_dir_all(&closure).unwrap();
             let error = render_with(
                 &["/deploy/engine-cli"],
                 &[],
                 RuntimeProfile::Provider,
-                Some(&provider(&[closure], None)),
+                Some(&provider(&[closure.to_str().unwrap()], None)),
             )
             .expect_err("an unquotable closure must refuse");
             assert_eq!(error.code, "sandbox_unavailable");
@@ -714,8 +761,9 @@ mod tests {
         // A service value that could break the profile's quoting never
         // reaches the renderer: the parameters' own constructor refuses
         // it under the grammar before any render happens.
+        let (_dir, closure) = closure_fixture();
         let error = ProviderJail::new(
-            vec![PathBuf::from("/deploy/closure")],
+            vec![PathBuf::from(&closure)],
             Some("bad\"expression".to_string()),
             None,
         )

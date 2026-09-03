@@ -122,32 +122,41 @@ fn the_provider_jail_refuses_reads_and_writes_outside_itself() {
 }
 
 /// The real home directory, from the account database rather than the
-/// environment, so a redirected `HOME` cannot stand in for it.
+/// environment, so a redirected `HOME` cannot stand in for it, and
+/// through the account lookup itself rather than a directory-service
+/// tool, so the test depends on nothing outside the process.
 fn real_home() -> PathBuf {
-    let output = std::process::Command::new("/usr/bin/dscl")
-        .args([
-            ".",
-            "-read",
-            &format!("/Users/{}", whoami()),
-            "NFSHomeDirectory",
-        ])
-        .output()
-        .expect("the account database answers");
-    let text = String::from_utf8_lossy(&output.stdout);
-    let home = text
-        .split_whitespace()
-        .last()
-        .expect("a home directory")
-        .to_string();
-    PathBuf::from(home)
+    nix::unistd::User::from_uid(nix::unistd::getuid())
+        .expect("the account database answers")
+        .expect("the running user has an account")
+        .dir
 }
 
-fn whoami() -> String {
-    let output = std::process::Command::new("/usr/bin/id")
-        .arg("-un")
-        .output()
-        .expect("the user name");
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+unsafe extern "C" {
+    fn confstr(name: std::ffi::c_int, buf: *mut std::ffi::c_char, len: usize) -> usize;
+}
+
+/// The per-user cache directory the platform reports for the running
+/// user, which lives under the per-user temporary root. Asked of the
+/// platform directly, so the control targets the real cache root and
+/// never a guess at it.
+fn user_cache_root() -> PathBuf {
+    const DARWIN_USER_CACHE_DIR: std::ffi::c_int = 65538;
+    let mut buffer = vec![0u8; 1024];
+    // SAFETY: the buffer outlives the call and its length is passed
+    // alongside it, which is the whole contract of confstr.
+    let written = unsafe {
+        confstr(
+            DARWIN_USER_CACHE_DIR,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    assert!(
+        written > 1 && written <= buffer.len(),
+        "the platform reports the per-user cache directory"
+    );
+    PathBuf::from(String::from_utf8(buffer[..written - 1].to_vec()).unwrap())
 }
 
 /// A file in the real home that exists, for the shell-profile control:
@@ -181,10 +190,17 @@ fn every_escape_control_is_denied_by_name_under_the_provider_jail() {
     let runner = provider_runner(&provider, brisk_limits());
     let home = real_home();
     assert!(home.is_dir(), "{}", home.display());
-    let cache_root = home.join("Library/Caches");
+    let cache_root = user_cache_root();
     assert!(cache_root.is_dir(), "{}", cache_root.display());
-    let profile_dir = home.join("Library/Application Support");
-    assert!(profile_dir.is_dir(), "{}", profile_dir.display());
+    // A resident profile directory of the test's own, under the real
+    // application-support tree for the test's lifetime, with a real
+    // file in it for the control to read: a host path outside the
+    // jail that depends on no installed product.
+    let profile_dir = home.join("Library/Application Support/text-mirror-control-profile");
+    fs::create_dir_all(&profile_dir).unwrap();
+    let profile_file = profile_dir.join("state");
+    fs::write(&profile_file, b"resident profile state").unwrap();
+    assert!(profile_file.is_file(), "{}", profile_file.display());
     let profile = shell_profile(&home);
     let privileged = "/etc/sudoers";
     assert!(Path::new(privileged).exists());
@@ -201,7 +217,7 @@ fn every_escape_control_is_denied_by_name_under_the_provider_jail() {
                 "outbound": "1.1.1.1:443",
                 "loopback": loopback,
                 "shell_profile": profile.to_str().unwrap(),
-                "profile_dir": profile_dir.to_str().unwrap(),
+                "profile_file": profile_file.to_str().unwrap(),
                 "privileged": privileged,
                 "program": "/bin/echo",
             }),
@@ -223,7 +239,7 @@ fn every_escape_control_is_denied_by_name_under_the_provider_jail() {
         "tcp-loopback-connect",
         "tcp-listen",
         "read-shell-profile",
-        "read-profile-dir",
+        "read-resident-profile",
         "read-privileged",
         "exec-undeclared",
     ] {
@@ -241,6 +257,7 @@ fn every_escape_control_is_denied_by_name_under_the_provider_jail() {
         assert!(!marker.exists(), "{} was written", marker.display());
     }
     let _ = fs::remove_file(home.join(".text-mirror-control-profile"));
+    let _ = fs::remove_dir_all(&profile_dir);
 }
 
 #[test]
