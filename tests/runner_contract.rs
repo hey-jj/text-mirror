@@ -102,7 +102,7 @@ fn a_truncated_response_frame_is_a_protocol_error() {
         .run("harness-truncated", serde_json::json!({}), &[])
         .unwrap_err();
     assert_eq!(error.code, "adapter_protocol_error", "{error}");
-    assert!(error.message.contains("truncated"), "{error}");
+    assert!(error.message().contains("truncated"), "{error}");
 }
 
 #[test]
@@ -347,7 +347,7 @@ fn a_non_literal_grant_refuses_the_run_at_spawn() {
         .run("harness-echo", serde_json::json!({}), &[])
         .unwrap_err();
     assert_eq!(error.code, "adapter_spawn_error", "{error}");
-    assert!(error.message.contains("literal"), "{error}");
+    assert!(error.message().contains("literal"), "{error}");
 
     let real = dir.path().join("real");
     std::fs::write(&real, b"bytes").unwrap();
@@ -366,7 +366,7 @@ fn a_non_literal_grant_refuses_the_run_at_spawn() {
         .run("harness-echo", serde_json::json!({}), &[])
         .unwrap_err();
     assert_eq!(error.code, "adapter_spawn_error", "{error}");
-    assert!(error.message.contains("symlink"), "{error}");
+    assert!(error.message().contains("symlink"), "{error}");
 }
 
 #[test]

@@ -25,7 +25,7 @@ use nix::libc;
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
 
 use super::jail::{JailBackend, RuntimeProfile, SpawnSpec};
-use super::{Runner, RunnerError};
+use super::{Runner, RunnerError, RunnerMessage};
 
 /// The Landlock ABI this backend requires in full.
 const LANDLOCK_ABI: ABI = ABI::V3;
@@ -61,11 +61,10 @@ impl JailBackend for NamespaceJail {
         // refused here rather than silently running the external
         // components under the base policy.
         if spec.runtime_profile == RuntimeProfile::Provider {
-            return Err(RunnerError {
-                code: "sandbox_unavailable",
-                message: "no provider jail profile is measured for this platform, refusing the run"
-                    .to_string(),
-            });
+            return Err(RunnerError::new(
+                "sandbox_unavailable",
+                RunnerMessage::ProviderPlatformUnsupported,
+            ));
         }
         let mut command = Command::new(spec.worker);
         command
@@ -119,14 +118,14 @@ impl JailBackend for NamespaceJail {
         super::jail::probe_net(runner, false)?;
         match runner.run_unprobed("probe-seccomp", serde_json::json!({}), &[], true) {
             Err(e) if e.code == "adapter_crash" => Ok(()),
-            Ok(_) => Err(RunnerError {
-                code: "sandbox_probe_failed",
-                message: "the syscall filter let a socket creation through".to_string(),
-            }),
-            Err(e) => Err(RunnerError {
-                code: "sandbox_probe_failed",
-                message: format!("the syscall filter probe failed to run: {}", e.code),
-            }),
+            Ok(_) => Err(RunnerError::new(
+                "sandbox_probe_failed",
+                RunnerMessage::SyscallProbeAllowed,
+            )),
+            Err(_) => Err(RunnerError::new(
+                "sandbox_probe_failed",
+                RunnerMessage::SyscallProbeFailed,
+            )),
         }
     }
 }

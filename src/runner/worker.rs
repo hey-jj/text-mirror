@@ -396,51 +396,48 @@ mod net {
     use std::net::{SocketAddr, TcpStream, UdpSocket};
     use std::time::Duration;
 
-    use crate::runner::protocol::bodies::{ProbeAttempt, ProbeNetRequest};
+    use crate::runner::protocol::bodies::{ProbeAttempt, ProbeName, ProbeNetRequest, ProbeOutcome};
 
     const TIMEOUT: Duration = Duration::from_millis(600);
 
     pub(super) fn attempt_all(request: &ProbeNetRequest) -> Vec<ProbeAttempt> {
         vec![
-            tcp("ipv4_tcp", &request.tcp4_target),
-            tcp("ipv6_tcp", &request.tcp6_target),
+            tcp(ProbeName::Ipv4Tcp, &request.tcp4_target),
+            tcp(ProbeName::Ipv6Tcp, &request.tcp6_target),
             unix_socket(&request.unix_target),
             udp_send(&request.tcp4_target),
         ]
     }
 
-    fn classify(name: &str, result: io::Result<()>) -> ProbeAttempt {
-        let (outcome, detail) = match result {
-            Ok(()) => (
-                "connected",
-                "the connection succeeded, the jail is not proven".to_string(),
-            ),
+    fn classify(name: ProbeName, result: io::Result<()>) -> ProbeAttempt {
+        let (outcome, error_kind) = match result {
+            Ok(()) => (ProbeOutcome::Connected, io::ErrorKind::Other),
             Err(e)
                 if matches!(
                     e.kind(),
                     io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
                 ) =>
             {
-                ("timeout", e.to_string())
+                (ProbeOutcome::Timeout, e.kind())
             }
-            Err(e) => ("denied", e.to_string()),
+            Err(e) => (ProbeOutcome::Denied, e.kind()),
         };
         ProbeAttempt {
-            name: name.to_string(),
-            outcome: outcome.to_string(),
-            detail,
+            name,
+            outcome,
+            error_kind,
         }
     }
 
-    fn tcp(name: &str, target: &str) -> ProbeAttempt {
+    fn tcp(name: ProbeName, target: &str) -> ProbeAttempt {
         // An unparseable target is instrumentation error, not denial.
         let address = match target.parse::<SocketAddr>() {
             Ok(address) => address,
-            Err(e) => {
+            Err(_) => {
                 return ProbeAttempt {
-                    name: name.to_string(),
-                    outcome: "invalid_target".to_string(),
-                    detail: e.to_string(),
+                    name,
+                    outcome: ProbeOutcome::InvalidTarget,
+                    error_kind: io::ErrorKind::InvalidInput,
                 };
             }
         };
@@ -456,13 +453,13 @@ mod net {
         let result = std::os::unix::net::SocketAddr::from_abstract_name(target.as_bytes())
             .and_then(|address| std::os::unix::net::UnixStream::connect_addr(&address))
             .map(drop);
-        classify("unix_socket", result)
+        classify(ProbeName::UnixSocket, result)
     }
 
     #[cfg(not(target_os = "linux"))]
     fn unix_socket(target: &str) -> ProbeAttempt {
         classify(
-            "unix_socket",
+            ProbeName::UnixSocket,
             std::os::unix::net::UnixStream::connect(target).map(drop),
         )
     }
@@ -477,7 +474,7 @@ mod net {
             socket.send(b"probe")?;
             Ok(())
         })();
-        classify("udp_send", result)
+        classify(ProbeName::UdpSend, result)
     }
 }
 

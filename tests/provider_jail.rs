@@ -285,14 +285,12 @@ fn a_granted_file_that_stops_being_a_regular_file_is_refused_without_being_named
         .run("harness-spawn-probe", serde_json::json!({}), &[])
         .expect_err("a directory in place of a granted file must refuse");
     assert_eq!(error.code, "adapter_spawn_error");
+    let message = error.message();
     assert!(
-        error
-            .message
-            .contains("executable grant 1 of 2 is not a literal regular file"),
-        "{}",
-        error.message
+        message.contains("executable grant 1 of 2 is not a literal regular file"),
+        "{message}"
     );
-    assert!(!error.message.contains('/'), "{}", error.message);
+    assert!(!message.contains('/'), "{message}");
     // A link in its place is refused the same way, and named the
     // same way.
     fs::remove_dir_all(provider.raster_path()).unwrap();
@@ -301,7 +299,8 @@ fn a_granted_file_that_stops_being_a_regular_file_is_refused_without_being_named
         .run("harness-spawn-probe", serde_json::json!({}), &[])
         .expect_err("a link in place of a granted file must refuse");
     assert_eq!(error.code, "adapter_spawn_error");
-    assert!(!error.message.contains('/'), "{}", error.message);
+    let message = error.message();
+    assert!(!message.contains('/'), "{message}");
 }
 
 #[test]

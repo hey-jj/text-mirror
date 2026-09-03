@@ -224,7 +224,7 @@ mod imp {
     fn runner_failure(error: RunnerError) -> ConvertError {
         ConvertError {
             code: error.code,
-            message: error.message,
+            message: error.message(),
         }
     }
 

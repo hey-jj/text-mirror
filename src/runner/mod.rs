@@ -43,7 +43,8 @@ pub mod linux;
 pub mod macos;
 
 use jail::{JailBackend, ProviderJail, RuntimeProfile, SpawnSpec};
-use protocol::{FrameRead, Request, RequestSchema, Response};
+use protocol::bodies::{ProbeName, ProbeOutcome};
+use protocol::{FrameRead, Request, RequestSchema, Response, ResponseValidationError};
 
 /// Resource and output limits for one adapter class.
 #[derive(Debug, Clone)]
@@ -114,8 +115,18 @@ impl Default for Limits {
 pub struct RunnerError {
     /// Stable reason code.
     pub code: &'static str,
-    /// Detail for a human reading the manifest.
-    pub message: String,
+    message: RunnerMessage,
+}
+
+impl RunnerError {
+    fn new(code: &'static str, message: RunnerMessage) -> RunnerError {
+        RunnerError { code, message }
+    }
+
+    /// Path-free detail for a human reading the manifest.
+    pub fn message(&self) -> String {
+        self.message.to_string()
+    }
 }
 
 impl std::fmt::Display for RunnerError {
@@ -125,6 +136,415 @@ impl std::fmt::Display for RunnerError {
 }
 
 impl std::error::Error for RunnerError {}
+
+#[derive(Debug, Clone, Copy)]
+enum GrantKind {
+    Executable,
+    Read,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GrantFault {
+    Symlink,
+    NotRegular,
+    Io(std::io::ErrorKind),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ClosureFault {
+    NotAbsolute,
+    NotNormal,
+    Symlink,
+    SharedRoot,
+    Unresolved,
+    NotFileOrDirectory,
+    ResolvedSharedRoot,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PathClass {
+    Jail,
+    Worker,
+    ExecutableGrantDirectory,
+    ExecutableGrant,
+    ReadGrant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TemplateValue {
+    Jail,
+    Worker,
+    Closures,
+    Service,
+    Grants,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExitDetail {
+    SandboxSetup(i32),
+    ProcessCount(i32),
+    WorkerCode(i32),
+    WorkerSignal(i32),
+    WorkerNoStatus,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+enum RunnerMessage {
+    CurrentExecutable(std::io::ErrorKind),
+    CurrentExecutableHasNoDirectory,
+    WorkerBinaryResolve(std::io::ErrorKind),
+    WorkerBinaryMissing,
+    Grant {
+        kind: GrantKind,
+        position: usize,
+        count: usize,
+        fault: GrantFault,
+    },
+    JailDirectoryCreate(std::io::ErrorKind),
+    JailDirectoryCanonicalize(std::io::ErrorKind),
+    InputNameNotBare,
+    StageInput(std::io::ErrorKind),
+    SpawnWorker(std::io::ErrorKind),
+    DrainTimeout(u64),
+    WallTimeout(u64),
+    ResponseFrameOversized {
+        declared: u64,
+        ceiling: u64,
+    },
+    StderrOverflow {
+        written: u64,
+        ceiling: u64,
+    },
+    TrailingStdout,
+    Exit(ExitDetail),
+    EmptyResponse,
+    TruncatedResponse,
+    ReadResponse(std::io::ErrorKind),
+    ParseResponse,
+    ValidateResponse(ResponseValidationError),
+    MemoryExceeded {
+        total: u64,
+        ceiling: u64,
+    },
+    Memory(memory::MemoryError),
+    Closure {
+        position: usize,
+        count: usize,
+        fault: ClosureFault,
+    },
+    ServiceNamespace,
+    TempDirectoryVariable,
+    PlatformBackendMissing,
+    WorkerHash(std::io::ErrorKind),
+    ProbeRequestEncode,
+    ProbeReportedFailure,
+    ProbeResponseParse,
+    ProbeAttemptMissing(ProbeName),
+    ProbeAttempt {
+        name: ProbeName,
+        outcome: ProbeOutcome,
+        error_kind: std::io::ErrorKind,
+    },
+    ProbeListener(std::io::ErrorKind),
+    TemplateBrace(TemplateValue),
+    ClosureNotUtf8 {
+        position: usize,
+        count: usize,
+    },
+    ClosureCannotBeQuoted {
+        position: usize,
+        count: usize,
+    },
+    PathNotUtf8(PathClass),
+    PathCannotBeQuoted(PathClass),
+    ProviderNeedsWiring,
+    SandboxHelperMissing,
+    ProviderPlatformUnsupported,
+    SyscallProbeAllowed,
+    SyscallProbeFailed,
+}
+
+impl std::fmt::Display for RunnerMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            RunnerMessage::CurrentExecutable(kind) => {
+                write!(f, "cannot resolve the current executable: {kind:?}")
+            }
+            RunnerMessage::CurrentExecutableHasNoDirectory => {
+                f.write_str("the current executable has no directory")
+            }
+            RunnerMessage::WorkerBinaryResolve(kind) => {
+                write!(f, "cannot resolve the worker binary: {kind:?}")
+            }
+            RunnerMessage::WorkerBinaryMissing => {
+                write!(f, "no {WORKER_BINARY} beside the current executable")
+            }
+            RunnerMessage::Grant {
+                kind,
+                position,
+                count,
+                fault,
+            } => {
+                let kind = match kind {
+                    GrantKind::Executable => "executable grant",
+                    GrantKind::Read => "read grant",
+                };
+                write!(
+                    f,
+                    "{kind} {position} of {count} is not a literal regular file: "
+                )?;
+                match fault {
+                    GrantFault::Symlink => f.write_str("it is a symlink"),
+                    GrantFault::NotRegular => f.write_str("it is not a regular file"),
+                    GrantFault::Io(kind) => write!(f, "{kind:?}"),
+                }
+            }
+            RunnerMessage::JailDirectoryCreate(kind) => {
+                write!(f, "cannot create the jail directory: {kind:?}")
+            }
+            RunnerMessage::JailDirectoryCanonicalize(kind) => {
+                write!(f, "cannot canonicalize the jail directory: {kind:?}")
+            }
+            RunnerMessage::InputNameNotBare => f.write_str("an input name is not a bare file name"),
+            RunnerMessage::StageInput(kind) => write!(f, "cannot stage an input: {kind:?}"),
+            RunnerMessage::SpawnWorker(kind) => {
+                write!(f, "cannot spawn the jailed worker: {kind:?}")
+            }
+            RunnerMessage::DrainTimeout(milliseconds) => write!(
+                f,
+                "a pipe stayed open {milliseconds} milliseconds after the group kill, so a descendant escaped the process group. The drain is detached and all output is discarded"
+            ),
+            RunnerMessage::WallTimeout(milliseconds) => write!(
+                f,
+                "killed the process group after the {milliseconds} millisecond wall-clock ceiling, partial output discarded"
+            ),
+            RunnerMessage::ResponseFrameOversized { declared, ceiling } => write!(
+                f,
+                "response frame declared {declared} bytes over the {ceiling} byte ceiling, refused before allocation"
+            ),
+            RunnerMessage::StderrOverflow { written, ceiling } => {
+                write!(
+                    f,
+                    "stderr wrote {written} bytes over the {ceiling} byte cap"
+                )
+            }
+            RunnerMessage::TrailingStdout => {
+                f.write_str("bytes after the response frame, one frame is the whole stdout budget")
+            }
+            RunnerMessage::Exit(detail) => match detail {
+                ExitDetail::SandboxSetup(code) => write!(
+                    f,
+                    "the sandbox helper refused to engage the jail (exit {code})"
+                ),
+                ExitDetail::ProcessCount(code) => write!(
+                    f,
+                    "the sandbox helper could not measure the user's process count and refused the spawn (exit {code})"
+                ),
+                ExitDetail::WorkerCode(code) => write!(
+                    f,
+                    "worker exited with code {code}, any response frame is discarded"
+                ),
+                ExitDetail::WorkerSignal(signal) => write!(
+                    f,
+                    "worker died on signal {signal}, any response frame is discarded"
+                ),
+                ExitDetail::WorkerNoStatus => {
+                    f.write_str("worker exited without a status, any response frame is discarded")
+                }
+            },
+            RunnerMessage::EmptyResponse => f.write_str("worker exited without a response frame"),
+            RunnerMessage::TruncatedResponse => {
+                f.write_str("worker exited with a truncated response frame")
+            }
+            RunnerMessage::ReadResponse(kind) => {
+                write!(f, "reading the response failed: {kind:?}")
+            }
+            RunnerMessage::ParseResponse => f.write_str("response frame did not parse"),
+            RunnerMessage::ValidateResponse(detail) => match detail {
+                ResponseValidationError::BothBodies => {
+                    f.write_str("response carries both ok and error")
+                }
+                ResponseValidationError::NoBody => {
+                    f.write_str("response carries neither ok nor error")
+                }
+            },
+            RunnerMessage::MemoryExceeded { total, ceiling } => write!(
+                f,
+                "the worker process group holds {total} resident bytes over the {ceiling} byte ceiling, killed"
+            ),
+            RunnerMessage::Memory(error) => match error {
+                memory::MemoryError::ProcessTable(kind) => {
+                    write!(f, "cannot enumerate the process table: {kind:?}")
+                }
+                memory::MemoryError::ProcessGroup(kind) => {
+                    write!(f, "cannot enumerate the process group: {kind:?}")
+                }
+                memory::MemoryError::ProcessGroupRecheck(kind) => {
+                    write!(f, "cannot re-enumerate the process group: {kind:?}")
+                }
+                memory::MemoryError::GroupLeaderPid(pid) => {
+                    write!(f, "group leader pid {pid} does not fit a pid_t")
+                }
+                memory::MemoryError::GroupMemberPid(pid) => {
+                    write!(f, "group member pid {pid} does not fit a pid_t")
+                }
+                memory::MemoryError::ResidentSizeSum => {
+                    f.write_str("the resident-size sum overflowed")
+                }
+                memory::MemoryError::ResidentSizeRead(pid) => {
+                    write!(f, "cannot read the resident size of process {pid}")
+                }
+                memory::MemoryError::StatRecord(pid) => {
+                    write!(f, "cannot parse the stat record of process {pid}")
+                }
+                memory::MemoryError::ProcessRecords(pid, kind) => {
+                    write!(f, "cannot read the records of process {pid}: {kind:?}")
+                }
+                memory::MemoryError::ProcessRecheck(pid, kind) => write!(
+                    f,
+                    "cannot re-check process {pid} after a read failure: {kind:?}"
+                ),
+                memory::MemoryError::ResidentSizeValue => f.write_str("cannot parse a VmRSS value"),
+                memory::MemoryError::ResidentSizeUnit => {
+                    f.write_str("a VmRSS line is not in kibibytes")
+                }
+                memory::MemoryError::ResidentSizeScale => f.write_str("a VmRSS value overflowed"),
+                memory::MemoryError::MonitorUnavailable => {
+                    f.write_str("no resident-memory monitor exists for this platform")
+                }
+            },
+            RunnerMessage::Closure {
+                position,
+                count,
+                fault,
+            } => {
+                write!(f, "closure entry {position} of {count} ")?;
+                match fault {
+                    ClosureFault::NotAbsolute => f.write_str("is not absolute"),
+                    ClosureFault::NotNormal => f.write_str("is not in normal form"),
+                    ClosureFault::Symlink => f.write_str("is a symlink, not the tree it names"),
+                    ClosureFault::SharedRoot => {
+                        f.write_str("is a shared root, not a measured dependency")
+                    }
+                    ClosureFault::Unresolved => f.write_str("cannot be resolved"),
+                    ClosureFault::NotFileOrDirectory => {
+                        f.write_str("is not a directory or a regular file")
+                    }
+                    ClosureFault::ResolvedSharedRoot => {
+                        f.write_str("resolves to a shared root, not a measured dependency")
+                    }
+                }
+            }
+            RunnerMessage::ServiceNamespace => {
+                f.write_str("the service namespace is not an anchored dotted prefix")
+            }
+            RunnerMessage::TempDirectoryVariable => {
+                f.write_str("the temp-directory variable is not a bounded identifier")
+            }
+            RunnerMessage::PlatformBackendMissing => {
+                f.write_str("no jail backend exists for this platform, refusing to run adapters")
+            }
+            RunnerMessage::WorkerHash(kind) => {
+                write!(f, "the worker binary cannot be hashed: {kind:?}")
+            }
+            RunnerMessage::ProbeRequestEncode => f.write_str("cannot encode probe request"),
+            RunnerMessage::ProbeReportedFailure => f.write_str("network probe reported a failure"),
+            RunnerMessage::ProbeResponseParse => {
+                f.write_str("network probe response did not parse")
+            }
+            RunnerMessage::ProbeAttemptMissing(name) => {
+                write!(f, "network probe skipped the {} attempt", probe_name(name))
+            }
+            RunnerMessage::ProbeAttempt {
+                name,
+                outcome,
+                error_kind,
+            } => write!(
+                f,
+                "network probe attempt {} ended {} ({error_kind:?}), the jail is not proven",
+                probe_name(name),
+                probe_outcome(outcome)
+            ),
+            RunnerMessage::ProbeListener(kind) => {
+                write!(f, "cannot stand up the Unix probe listener: {kind:?}")
+            }
+            RunnerMessage::TemplateBrace(value) => write!(
+                f,
+                "the {} value carries a brace and cannot be rendered",
+                template_value(value)
+            ),
+            RunnerMessage::ClosureNotUtf8 { position, count } => {
+                write!(f, "closure entry {position} of {count} is not UTF-8")
+            }
+            RunnerMessage::ClosureCannotBeQuoted { position, count } => write!(
+                f,
+                "closure entry {position} of {count} cannot be quoted in a jail profile"
+            ),
+            RunnerMessage::PathNotUtf8(class) => {
+                write!(f, "{} is not UTF-8", path_class(class))
+            }
+            RunnerMessage::PathCannotBeQuoted(class) => write!(
+                f,
+                "{} cannot be quoted in a Seatbelt profile",
+                path_class(class)
+            ),
+            RunnerMessage::ProviderNeedsWiring => {
+                f.write_str("the provider jail class needs a wired provider, refusing the run")
+            }
+            RunnerMessage::SandboxHelperMissing => {
+                f.write_str("the sandbox helper is missing, refusing to run adapters")
+            }
+            RunnerMessage::ProviderPlatformUnsupported => f.write_str(
+                "no provider jail profile is measured for this platform, refusing the run",
+            ),
+            RunnerMessage::SyscallProbeAllowed => {
+                f.write_str("the syscall filter let a socket creation through")
+            }
+            RunnerMessage::SyscallProbeFailed => {
+                f.write_str("the syscall filter probe failed to run")
+            }
+        }
+    }
+}
+
+fn probe_name(name: ProbeName) -> &'static str {
+    match name {
+        ProbeName::Ipv4Tcp => "ipv4_tcp",
+        ProbeName::Ipv6Tcp => "ipv6_tcp",
+        ProbeName::UnixSocket => "unix_socket",
+        ProbeName::UdpSend => "udp_send",
+    }
+}
+
+fn probe_outcome(outcome: ProbeOutcome) -> &'static str {
+    match outcome {
+        ProbeOutcome::Connected => "connected",
+        ProbeOutcome::Denied => "denied",
+        ProbeOutcome::Timeout => "timeout",
+        ProbeOutcome::InvalidTarget => "invalid_target",
+    }
+}
+
+fn path_class(class: PathClass) -> &'static str {
+    match class {
+        PathClass::Jail => "the jail path",
+        PathClass::Worker => "the worker path",
+        PathClass::ExecutableGrantDirectory => "an executable grant's directory",
+        PathClass::ExecutableGrant => "an executable grant",
+        PathClass::ReadGrant => "a read grant",
+    }
+}
+
+fn template_value(value: TemplateValue) -> &'static str {
+    match value {
+        TemplateValue::Jail => "jail template",
+        TemplateValue::Worker => "worker template",
+        TemplateValue::Closures => "closures template",
+        TemplateValue::Service => "service template",
+        TemplateValue::Grants => "grants template",
+    }
+}
 
 /// The BLAKE3 of the provider jail profile template on this platform,
 /// or `None` where no provider profile is measured. Part of the
@@ -155,19 +575,16 @@ pub const PROCESS_COUNT_EXIT: i32 = 72;
 /// Locates the worker binary beside the current executable, or one
 /// directory up, which covers an installed layout and a build tree.
 pub fn locate_worker() -> Result<PathBuf, RunnerError> {
-    let missing = |detail: String| RunnerError {
-        code: "worker_not_found",
-        message: detail,
-    };
     let current = std::env::current_exe().map_err(|e| {
-        missing(format!(
-            "cannot resolve the current executable: {:?}",
-            e.kind()
-        ))
+        RunnerError::new(
+            "worker_not_found",
+            RunnerMessage::CurrentExecutable(e.kind()),
+        )
     })?;
     let Some(dir) = current.parent() else {
-        return Err(missing(
-            "the current executable has no directory".to_string(),
+        return Err(RunnerError::new(
+            "worker_not_found",
+            RunnerMessage::CurrentExecutableHasNoDirectory,
         ));
     };
     let mut candidates = vec![dir.join(WORKER_BINARY)];
@@ -176,14 +593,18 @@ pub fn locate_worker() -> Result<PathBuf, RunnerError> {
     }
     for candidate in &candidates {
         if candidate.is_file() {
-            return candidate
-                .canonicalize()
-                .map_err(|e| missing(format!("cannot resolve the worker binary: {:?}", e.kind())));
+            return candidate.canonicalize().map_err(|e| {
+                RunnerError::new(
+                    "worker_not_found",
+                    RunnerMessage::WorkerBinaryResolve(e.kind()),
+                )
+            });
         }
     }
-    Err(missing(format!(
-        "no {WORKER_BINARY} beside the current executable"
-    )))
+    Err(RunnerError::new(
+        "worker_not_found",
+        RunnerMessage::WorkerBinaryMissing,
+    ))
 }
 
 /// Runs worker modes under the platform jail.
@@ -356,70 +777,80 @@ impl Runner {
         // fault, never the path: this message reaches the record of
         // whatever was being converted, and a deployment path does not
         // belong there.
-        let grants = self
-            .exec_grants
-            .iter()
-            .enumerate()
-            .map(|(index, grant)| {
-                (
-                    format!(
-                        "executable grant {} of {}",
+        let grants =
+            self.exec_grants
+                .iter()
+                .enumerate()
+                .map(|(index, grant)| {
+                    (
+                        GrantKind::Executable,
                         index + 1,
-                        self.exec_grants.len()
-                    ),
-                    grant,
-                )
-            })
-            .chain(self.read_grants.iter().enumerate().map(|(index, grant)| {
-                (
-                    format!("read grant {} of {}", index + 1, self.read_grants.len()),
-                    grant,
-                )
-            }));
-        for (label, grant) in grants {
+                        self.exec_grants.len(),
+                        grant,
+                    )
+                })
+                .chain(self.read_grants.iter().enumerate().map(|(index, grant)| {
+                    (GrantKind::Read, index + 1, self.read_grants.len(), grant)
+                }));
+        for (kind, position, count, grant) in grants {
             match std::fs::symlink_metadata(grant) {
                 Ok(metadata) if metadata.file_type().is_file() => {}
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(RunnerError {
-                        code: "adapter_spawn_error",
-                        message: format!("{label} is not a literal regular file: it is a symlink"),
-                    });
+                    return Err(RunnerError::new(
+                        "adapter_spawn_error",
+                        RunnerMessage::Grant {
+                            kind,
+                            position,
+                            count,
+                            fault: GrantFault::Symlink,
+                        },
+                    ));
                 }
                 Ok(_) => {
-                    return Err(RunnerError {
-                        code: "adapter_spawn_error",
-                        message: format!(
-                            "{label} is not a literal regular file: it is not a regular file"
-                        ),
-                    });
+                    return Err(RunnerError::new(
+                        "adapter_spawn_error",
+                        RunnerMessage::Grant {
+                            kind,
+                            position,
+                            count,
+                            fault: GrantFault::NotRegular,
+                        },
+                    ));
                 }
                 Err(e) => {
-                    let kind = e.kind();
-                    return Err(RunnerError {
-                        code: "adapter_spawn_error",
-                        message: format!("{label} is not a literal regular file: {kind:?}"),
-                    });
+                    return Err(RunnerError::new(
+                        "adapter_spawn_error",
+                        RunnerMessage::Grant {
+                            kind,
+                            position,
+                            count,
+                            fault: GrantFault::Io(e.kind()),
+                        },
+                    ));
                 }
             }
         }
-        let jail_dir = tempfile::tempdir().map_err(|e| RunnerError {
-            code: "adapter_spawn_error",
-            message: format!("cannot create the jail directory: {:?}", e.kind()),
+        let jail_dir = tempfile::tempdir().map_err(|e| {
+            RunnerError::new(
+                "adapter_spawn_error",
+                RunnerMessage::JailDirectoryCreate(e.kind()),
+            )
         })?;
-        let jail_path = jail_dir.path().canonicalize().map_err(|e| RunnerError {
-            code: "adapter_spawn_error",
-            message: format!("cannot canonicalize the jail directory: {:?}", e.kind()),
+        let jail_path = jail_dir.path().canonicalize().map_err(|e| {
+            RunnerError::new(
+                "adapter_spawn_error",
+                RunnerMessage::JailDirectoryCanonicalize(e.kind()),
+            )
         })?;
         for (name, bytes) in files {
             if name.contains('/') || name.contains("..") {
-                return Err(RunnerError {
-                    code: "adapter_spawn_error",
-                    message: format!("input name {name:?} is not a bare file name"),
-                });
+                return Err(RunnerError::new(
+                    "adapter_spawn_error",
+                    RunnerMessage::InputNameNotBare,
+                ));
             }
-            std::fs::write(jail_path.join(name), bytes).map_err(|e| RunnerError {
-                code: "adapter_spawn_error",
-                message: format!("cannot stage input {name:?}: {:?}", e.kind()),
+            std::fs::write(jail_path.join(name), bytes).map_err(|e| {
+                RunnerError::new("adapter_spawn_error", RunnerMessage::StageInput(e.kind()))
             })?;
         }
 
@@ -446,9 +877,8 @@ impl Runner {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let mut child = command.spawn().map_err(|e| RunnerError {
-            code: "adapter_spawn_error",
-            message: format!("cannot spawn the jailed worker: {:?}", e.kind()),
+        let mut child = command.spawn().map_err(|e| {
+            RunnerError::new("adapter_spawn_error", RunnerMessage::SpawnWorker(e.kind()))
         })?;
 
         let request = Request {
@@ -631,50 +1061,48 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         .recv_timeout(join_deadline.saturating_duration_since(Instant::now()))
         .ok();
     let (Some(stdout_end), Some((stderr_kept, stderr_total))) = (stdout_end, stderr_end) else {
-        return Err(RunnerError {
-            code: "adapter_drain_timeout",
-            message: format!(
-                "a pipe stayed open {DRAIN_JOIN_BOUND:?} after the group kill, so a descendant escaped the process group; the drain is detached and all output is discarded"
+        return Err(RunnerError::new(
+            "adapter_drain_timeout",
+            RunnerMessage::DrainTimeout(
+                u64::try_from(DRAIN_JOIN_BOUND.as_millis()).unwrap_or(u64::MAX),
             ),
-        });
+        ));
     };
 
     if let Some(failure) = memory_failure {
         return Err(failure);
     }
     if timed_out {
-        return Err(RunnerError {
-            code: "adapter_timeout",
-            message: format!(
-                "killed the process group after the {:?} wall-clock ceiling, partial output discarded",
-                limits.wall_timeout
+        return Err(RunnerError::new(
+            "adapter_timeout",
+            RunnerMessage::WallTimeout(
+                u64::try_from(limits.wall_timeout.as_millis()).unwrap_or(u64::MAX),
             ),
-        });
+        ));
     }
     if let StdoutEnd::Oversized { declared } = stdout_end {
-        return Err(RunnerError {
-            code: "adapter_frame_oversized",
-            message: format!(
-                "response frame declared {declared} bytes over the {} byte ceiling, refused before allocation",
-                limits.max_response_bytes
-            ),
-        });
+        return Err(RunnerError::new(
+            "adapter_frame_oversized",
+            RunnerMessage::ResponseFrameOversized {
+                declared,
+                ceiling: u64::from(limits.max_response_bytes),
+            },
+        ));
     }
     if stderr_total > limits.max_stderr_bytes {
-        return Err(RunnerError {
-            code: "adapter_output_overflow",
-            message: format!(
-                "stderr wrote {stderr_total} bytes over the {} byte cap",
-                limits.max_stderr_bytes
-            ),
-        });
+        return Err(RunnerError::new(
+            "adapter_output_overflow",
+            RunnerMessage::StderrOverflow {
+                written: stderr_total,
+                ceiling: limits.max_stderr_bytes,
+            },
+        ));
     }
     if matches!(stdout_end, StdoutEnd::Trailing) {
-        return Err(RunnerError {
-            code: "adapter_output_overflow",
-            message: "bytes after the response frame, one frame is the whole stdout budget"
-                .to_string(),
-        });
+        return Err(RunnerError::new(
+            "adapter_output_overflow",
+            RunnerMessage::TrailingStdout,
+        ));
     }
     if !status.success() {
         let stderr_text = String::from_utf8_lossy(&stderr_kept);
@@ -689,40 +1117,40 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         if let Some(error) = refusal {
             return Err(error);
         }
-        return Err(RunnerError {
-            code: "adapter_crash",
-            message: worker_crash_message(&status),
-        });
+        return Err(RunnerError::new(
+            "adapter_crash",
+            RunnerMessage::Exit(worker_crash_detail(&status)),
+        ));
     }
     let payload = match stdout_end {
         StdoutEnd::Frame(payload) => payload,
         StdoutEnd::Empty => {
-            return Err(RunnerError {
-                code: "adapter_protocol_error",
-                message: "worker exited without a response frame".to_string(),
-            });
+            return Err(RunnerError::new(
+                "adapter_protocol_error",
+                RunnerMessage::EmptyResponse,
+            ));
         }
         StdoutEnd::Truncated => {
-            return Err(RunnerError {
-                code: "adapter_protocol_error",
-                message: "worker exited with a truncated response frame".to_string(),
-            });
+            return Err(RunnerError::new(
+                "adapter_protocol_error",
+                RunnerMessage::TruncatedResponse,
+            ));
         }
         StdoutEnd::ReadError(detail) => {
-            return Err(RunnerError {
-                code: "adapter_protocol_error",
-                message: format!("reading the response failed: {detail:?}"),
-            });
+            return Err(RunnerError::new(
+                "adapter_protocol_error",
+                RunnerMessage::ReadResponse(detail),
+            ));
         }
         StdoutEnd::Oversized { .. } | StdoutEnd::Trailing => unreachable!("handled above"),
     };
-    let response: Response = serde_json::from_slice(&payload).map_err(|_| RunnerError {
-        code: "adapter_protocol_error",
-        message: "response frame did not parse".to_string(),
-    })?;
-    response.validate().map_err(|detail| RunnerError {
-        code: "adapter_protocol_error",
-        message: detail,
+    let response: Response = serde_json::from_slice(&payload)
+        .map_err(|_| RunnerError::new("adapter_protocol_error", RunnerMessage::ParseResponse))?;
+    response.validate().map_err(|detail| {
+        RunnerError::new(
+            "adapter_protocol_error",
+            RunnerMessage::ValidateResponse(detail),
+        )
     })?;
     Ok(response)
 }
@@ -771,18 +1199,18 @@ fn scrub_stderr(stderr_text: &str, max_bytes: u64) -> String {
 #[cfg_attr(not(unix), allow(dead_code))]
 fn helper_refusal(exit: Option<i32>) -> Option<RunnerError> {
     let exit = exit?;
-    let (code, refused) = match exit {
-        SANDBOX_SETUP_EXIT => ("sandbox_unavailable", "refused to engage the jail"),
+    let (code, detail) = match exit {
+        SANDBOX_SETUP_EXIT => (
+            "sandbox_unavailable",
+            ExitDetail::SandboxSetup(SANDBOX_SETUP_EXIT),
+        ),
         PROCESS_COUNT_EXIT => (
             "process-count-unavailable",
-            "could not measure the user's process count and refused the spawn",
+            ExitDetail::ProcessCount(PROCESS_COUNT_EXIT),
         ),
         _ => return None,
     };
-    Some(RunnerError {
-        code,
-        message: format!("the sandbox helper {refused} (exit {exit})"),
-    })
+    Some(RunnerError::new(code, RunnerMessage::Exit(detail)))
 }
 
 /// Interprets one resident-memory measurement against the ceiling.
@@ -794,56 +1222,15 @@ fn memory_verdict(
     ceiling: u64,
 ) -> Option<RunnerError> {
     match measurement {
-        Ok(total) if total > ceiling => Some(RunnerError {
-            code: "worker-memory-exceeded",
-            message: format!(
-                "the worker process group holds {total} resident bytes over the {ceiling} byte ceiling, killed"
-            ),
-        }),
+        Ok(total) if total > ceiling => Some(RunnerError::new(
+            "worker-memory-exceeded",
+            RunnerMessage::MemoryExceeded { total, ceiling },
+        )),
         Ok(_) => None,
-        Err(error) => Some(RunnerError {
-            code: "memory-monitor-failed",
-            message: match error {
-                memory::MemoryError::ProcessTable(kind) => {
-                    format!("cannot enumerate the process table: {kind:?}")
-                }
-                memory::MemoryError::ProcessGroup(kind) => {
-                    format!("cannot enumerate the process group: {kind:?}")
-                }
-                memory::MemoryError::ProcessGroupRecheck(kind) => {
-                    format!("cannot re-enumerate the process group: {kind:?}")
-                }
-                memory::MemoryError::GroupLeaderPid(pid) => {
-                    format!("group leader pid {pid} does not fit a pid_t")
-                }
-                memory::MemoryError::GroupMemberPid(pid) => {
-                    format!("group member pid {pid} does not fit a pid_t")
-                }
-                memory::MemoryError::ResidentSizeSum => {
-                    "the resident-size sum overflowed".to_string()
-                }
-                memory::MemoryError::ResidentSizeRead(pid) => {
-                    format!("cannot read the resident size of process {pid}")
-                }
-                memory::MemoryError::StatRecord(pid) => {
-                    format!("cannot parse the stat record of process {pid}")
-                }
-                memory::MemoryError::ProcessRecords(pid, kind) => {
-                    format!("cannot read the records of process {pid}: {kind:?}")
-                }
-                memory::MemoryError::ProcessRecheck(pid, kind) => {
-                    format!("cannot re-check process {pid} after a read failure: {kind:?}")
-                }
-                memory::MemoryError::ResidentSizeValue => "cannot parse a VmRSS value".to_string(),
-                memory::MemoryError::ResidentSizeUnit => {
-                    "a VmRSS line is not in kibibytes".to_string()
-                }
-                memory::MemoryError::ResidentSizeScale => "a VmRSS value overflowed".to_string(),
-                memory::MemoryError::MonitorUnavailable => {
-                    "no resident-memory monitor exists for this platform".to_string()
-                }
-            },
-        }),
+        Err(error) => Some(RunnerError::new(
+            "memory-monitor-failed",
+            RunnerMessage::Memory(error),
+        )),
     }
 }
 
@@ -877,19 +1264,17 @@ fn wait_after_kill(child: &mut Child) -> std::process::ExitStatus {
     })
 }
 
-fn worker_crash_message(status: &std::process::ExitStatus) -> String {
+fn worker_crash_detail(status: &std::process::ExitStatus) -> ExitDetail {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            return format!("worker died on signal {signal}, any response frame is discarded");
+            return ExitDetail::WorkerSignal(signal);
         }
     }
     match status.code() {
-        Some(code) => {
-            format!("worker exited with code {code}, any response frame is discarded")
-        }
-        None => "worker exited without a status, any response frame is discarded".to_string(),
+        Some(code) => ExitDetail::WorkerCode(code),
+        None => ExitDetail::WorkerNoStatus,
     }
 }
 
@@ -903,7 +1288,7 @@ mod tests {
         let setup = helper_refusal(Some(SANDBOX_SETUP_EXIT)).expect("a setup exit is a refusal");
         assert_eq!(setup.code, "sandbox_unavailable");
         assert_eq!(
-            setup.message,
+            setup.message(),
             "the sandbox helper refused to engage the jail (exit 71)"
         );
         // An unmeasurable process count is named on its own, so the
@@ -911,7 +1296,7 @@ mod tests {
         let count = helper_refusal(Some(PROCESS_COUNT_EXIT)).expect("a count exit is a refusal");
         assert_eq!(count.code, "process-count-unavailable");
         assert_eq!(
-            count.message,
+            count.message(),
             "the sandbox helper could not measure the user's process count and refused the spawn (exit 72)"
         );
         // Everything else is the adapter's own exit, not a refusal.
@@ -968,7 +1353,7 @@ mod tests {
         let failure = drive(&mut child, &Limits::default()).expect_err("the helper refuses");
         assert_eq!(failure.code, "sandbox_unavailable");
         assert_eq!(
-            failure.message,
+            failure.message(),
             "the sandbox helper refused to engage the jail (exit 71)"
         );
 
@@ -1068,10 +1453,10 @@ mod tests {
         let failure = drive(&mut child, &Limits::default()).expect_err("the worker fails");
         assert_eq!(failure.code, "adapter_crash");
         assert_eq!(
-            failure.message,
+            failure.message(),
             "worker exited with code 9, any response frame is discarded"
         );
-        assert!(!failure.message.contains(&marker), "{failure}");
+        assert!(!failure.message().contains(&marker), "{failure}");
     }
 
     #[test]
@@ -1090,16 +1475,16 @@ mod tests {
         .expect_err("the missing worker cannot be hashed");
         assert_eq!(error.code, "worker_not_found");
         assert_eq!(
-            error.message,
+            error.message(),
             "the worker binary cannot be hashed: NotFound"
         );
+        let message = error.message();
         for component in missing.components() {
             let std::path::Component::Normal(component) = component else {
                 continue;
             };
             assert!(
-                !error
-                    .message
+                !message
                     .as_bytes()
                     .windows(component.as_encoded_bytes().len())
                     .any(|window| window == component.as_encoded_bytes()),
@@ -1128,243 +1513,252 @@ mod tests {
         .expect("a failed measurement is a verdict");
         assert_eq!(failed.code, "memory-monitor-failed");
         assert_eq!(
-            failed.message,
+            failed.message(),
             "cannot enumerate the process table: PermissionDenied"
         );
     }
 }
 
-/// Every runner error message can reach a record, so none may carry a
-/// path. This reads the runner's own sources and refuses any error
-/// construction, or any message handed to a refusal closure, that
-/// renders a path or names a path-carrying variable. Runtime tests
-/// cover the sites a test can trigger; this covers all of them.
+/// Renders every message variant with boundary values.
 #[cfg(test)]
-mod message_audit_tests {
-    const SOURCES: [(&str, &str); 5] = [
-        ("mod.rs", include_str!("mod.rs")),
-        ("jail.rs", include_str!("jail.rs")),
-        ("macos.rs", include_str!("macos.rs")),
-        ("linux.rs", include_str!("linux.rs")),
-        ("memory.rs", include_str!("memory.rs")),
-    ];
-
-    /// The spellings a path takes when it is rendered into a message.
-    const RENDERINGS: [&str; 9] = [
-        "display()",
-        "to_string_lossy(",
-        "{stderr_text",
-        "{text",
-        "{path",
-        "{e}",
-        "{source}",
-        "e.to_string()",
-        "source.to_string()",
-    ];
-
-    const FAILURE_FORWARDINGS: [&str; 4] = ["{detail}", "{e}", "{error}", "{recheck}"];
-
-    /// Variables in the runner that hold a path, which no message may
-    /// interpolate.
-    const PATH_VARIABLES: [&str; 8] = [
-        "{grant",
-        "{closure",
-        "{worker",
-        "{candidate",
-        "{current",
-        "{target",
-        "{jail",
-        "{dir",
-    ];
-
-    /// Every error construction site and every refusal-closure call in
-    /// one source, as the text of the site.
-    fn sites(source: &str) -> Vec<String> {
-        let mut found = Vec::new();
-        for needle in [
-            "RunnerError {",
-            "refuse(",
-            "missing(",
-            "probe_bind_error(",
-            "drift(",
-        ] {
-            let mut from = 0;
-            while let Some(at) = source[from..].find(needle) {
-                let start = from + at;
-                // The site runs to the matching close of the brace or
-                // parenthesis that opens it.
-                let open = source[start..].find(['{', '(']).map(|i| start + i).unwrap();
-                let (opener, closer) = if source.as_bytes()[open] == b'{' {
-                    ('{', '}')
-                } else {
-                    ('(', ')')
-                };
-                let mut depth = 0usize;
-                let mut end = open;
-                for (offset, ch) in source[open..].char_indices() {
-                    if ch == opener {
-                        depth += 1;
-                    } else if ch == closer {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = open + offset + ch.len_utf8();
-                            break;
-                        }
-                    }
-                }
-                found.push(source[start..end].to_string());
-                from = end.max(start + needle.len());
-            }
-        }
-        found
-    }
-
-    /// Every construction that can return a memory measurement
-    /// failure to the runner.
-    fn memory_failure_sites(source: &str) -> Vec<String> {
-        let mut found = Vec::new();
-        for needle in [
-            "Err(format!(",
-            "Err(MemoryError::",
-            ".map_err(",
-            ".ok_or(MemoryError::",
-        ] {
-            let mut from = 0;
-            while let Some(at) = source[from..].find(needle) {
-                let start = from + at;
-                let open = source[start..].find('(').map(|i| start + i).unwrap();
-                let mut depth = 0usize;
-                let mut end = open;
-                for (offset, ch) in source[open..].char_indices() {
-                    if ch == '(' {
-                        depth += 1;
-                    } else if ch == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = open + offset + ch.len_utf8();
-                            break;
-                        }
-                    }
-                }
-                found.push(source[start..end].to_string());
-                from = end.max(start + needle.len());
-            }
-        }
-        if let Some(start) = source.find("fn process_table_error") {
-            let open = source[start..].find('{').map(|i| start + i).unwrap();
-            let mut depth = 0usize;
-            for (offset, ch) in source[open..].char_indices() {
-                if ch == '{' {
-                    depth += 1;
-                } else if ch == '}' {
-                    depth -= 1;
-                    if depth == 0 {
-                        found.push(source[start..open + offset + ch.len_utf8()].to_string());
-                        break;
-                    }
-                }
-            }
-        }
-        found
-    }
-
-    fn carries_unbounded_failure_detail(site: &str) -> bool {
-        RENDERINGS.iter().any(|rendering| site.contains(rendering))
-            || FAILURE_FORWARDINGS
-                .iter()
-                .any(|rendering| site.contains(rendering))
-            || PATH_VARIABLES
-                .iter()
-                .any(|variable| site.contains(variable))
-    }
+mod runner_message_tests {
+    use super::*;
+    use std::io::ErrorKind;
 
     #[test]
-    fn no_runner_error_message_renders_a_path() {
-        let mut audited = 0;
-        for (name, source) in SOURCES {
-            for site in sites(source) {
-                // The audit reads the sites, not itself.
-                if site.contains("RENDERINGS") || site.contains("PATH_VARIABLES") {
-                    continue;
-                }
-                audited += 1;
-                assert!(
-                    !carries_unbounded_failure_detail(&site),
-                    "{name}: a runner error carries an unbounded detail: {site}"
-                );
-            }
-        }
-        // The audit saw the sites it exists for: the grant re-assertion
-        // and the closure refusals among them.
-        assert!(audited >= 40, "only {audited} sites audited");
-    }
+    fn every_runner_message_variant_is_path_free() {
+        const IO_KINDS: &[ErrorKind] = &[
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+            ErrorKind::AddrInUse,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::NetworkDown,
+            ErrorKind::BrokenPipe,
+            ErrorKind::AlreadyExists,
+            ErrorKind::WouldBlock,
+            ErrorKind::NotADirectory,
+            ErrorKind::IsADirectory,
+            ErrorKind::DirectoryNotEmpty,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::StaleNetworkFileHandle,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidData,
+            ErrorKind::TimedOut,
+            ErrorKind::WriteZero,
+            ErrorKind::StorageFull,
+            ErrorKind::NotSeekable,
+            ErrorKind::QuotaExceeded,
+            ErrorKind::FileTooLarge,
+            ErrorKind::ResourceBusy,
+            ErrorKind::ExecutableFileBusy,
+            ErrorKind::CrossesDevices,
+            ErrorKind::TooManyLinks,
+            ErrorKind::InvalidFilename,
+            ErrorKind::ArgumentListTooLong,
+            ErrorKind::Interrupted,
+            ErrorKind::Unsupported,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::OutOfMemory,
+            ErrorKind::Other,
+        ];
+        const USIZES: &[usize] = &[0, 1, usize::MAX];
+        const U64S: &[u64] = &[0, 1, u64::MAX];
+        const U32S: &[u32] = &[0, 1, u32::MAX];
+        const I32S: &[i32] = &[i32::MIN, -1, 0, 1, i32::MAX];
+        const PROBE_NAMES: &[ProbeName] = &[
+            ProbeName::Ipv4Tcp,
+            ProbeName::Ipv6Tcp,
+            ProbeName::UnixSocket,
+            ProbeName::UdpSend,
+        ];
+        const PROBE_OUTCOMES: &[ProbeOutcome] = &[
+            ProbeOutcome::Connected,
+            ProbeOutcome::Denied,
+            ProbeOutcome::Timeout,
+            ProbeOutcome::InvalidTarget,
+        ];
 
-    #[test]
-    fn no_memory_failure_renders_a_path_or_an_error_display() {
-        let source = include_str!("memory.rs");
-        let sites = memory_failure_sites(source);
-        assert!(
-            sites.len() >= 8,
-            "only {} memory sites checked",
-            sites.len()
-        );
-        for site in sites {
+        let render = |message: RunnerMessage| {
+            let text = message.to_string();
+            assert!(!text.contains('/'), "separator in runner message: {text}");
+            assert!(!text.contains('\\'), "separator in runner message: {text}");
             assert!(
-                !carries_unbounded_failure_detail(&site),
-                "a memory failure carries an unbounded detail: {site}"
+                text.is_ascii(),
+                "non-ASCII byte in runner message: {text:?}"
             );
+        };
+
+        for &kind in IO_KINDS {
+            render(RunnerMessage::CurrentExecutable(kind));
+            render(RunnerMessage::WorkerBinaryResolve(kind));
+            render(RunnerMessage::JailDirectoryCreate(kind));
+            render(RunnerMessage::JailDirectoryCanonicalize(kind));
+            render(RunnerMessage::StageInput(kind));
+            render(RunnerMessage::SpawnWorker(kind));
+            render(RunnerMessage::ReadResponse(kind));
+            render(RunnerMessage::WorkerHash(kind));
+            render(RunnerMessage::ProbeListener(kind));
+            for &grant in &[GrantKind::Executable, GrantKind::Read] {
+                render(RunnerMessage::Grant {
+                    kind: grant,
+                    position: usize::MAX,
+                    count: usize::MAX,
+                    fault: GrantFault::Io(kind),
+                });
+            }
+            for &name in PROBE_NAMES {
+                for &outcome in PROBE_OUTCOMES {
+                    render(RunnerMessage::ProbeAttempt {
+                        name,
+                        outcome,
+                        error_kind: kind,
+                    });
+                }
+            }
+            for error in [
+                memory::MemoryError::ProcessTable(kind),
+                memory::MemoryError::ProcessGroup(kind),
+                memory::MemoryError::ProcessGroupRecheck(kind),
+                memory::MemoryError::ProcessRecords(u32::MAX, kind),
+                memory::MemoryError::ProcessRecheck(u32::MAX, kind),
+            ] {
+                render(RunnerMessage::Memory(error));
+            }
         }
-    }
 
-    #[test]
-    fn the_construction_site_check_rejects_error_display() {
-        let old_worker_hash = concat!(
-            "Runner",
-            r#"Error {
-            code: "worker_not_found",
-            message: format!("the worker binary cannot be hashed: "#,
-            "{e}",
-            r#""),
-        }"#
-        );
-        let worker_sites = sites(old_worker_hash);
-        assert_eq!(worker_sites.len(), 1);
-        assert!(
-            RENDERINGS
-                .iter()
-                .any(|rendering| worker_sites[0].contains(rendering)),
-            "the former worker-hash construction escaped the check"
-        );
+        render(RunnerMessage::CurrentExecutableHasNoDirectory);
+        render(RunnerMessage::WorkerBinaryMissing);
+        render(RunnerMessage::InputNameNotBare);
+        render(RunnerMessage::TrailingStdout);
+        render(RunnerMessage::EmptyResponse);
+        render(RunnerMessage::TruncatedResponse);
+        render(RunnerMessage::ParseResponse);
+        render(RunnerMessage::ProbeRequestEncode);
+        render(RunnerMessage::ProbeReportedFailure);
+        render(RunnerMessage::ProbeResponseParse);
+        render(RunnerMessage::ServiceNamespace);
+        render(RunnerMessage::TempDirectoryVariable);
+        render(RunnerMessage::PlatformBackendMissing);
+        render(RunnerMessage::ProviderNeedsWiring);
+        render(RunnerMessage::SandboxHelperMissing);
+        render(RunnerMessage::ProviderPlatformUnsupported);
+        render(RunnerMessage::SyscallProbeAllowed);
+        render(RunnerMessage::SyscallProbeFailed);
 
-        let old_memory = concat!(
-            r#"std::fs::read_dir("/"#,
-            "proc",
-            r#"").map_err(|e| format!("cannot enumerate /"#,
-            "proc: ",
-            "{e}",
-            r#""))"#
-        );
-        let memory_sites = memory_failure_sites(old_memory);
-        assert_eq!(memory_sites.len(), 1);
-        assert!(
-            carries_unbounded_failure_detail(&memory_sites[0]),
-            "the former process-table construction escaped the check"
-        );
+        for &value in USIZES {
+            for &kind in &[GrantKind::Executable, GrantKind::Read] {
+                for &fault in &[GrantFault::Symlink, GrantFault::NotRegular] {
+                    render(RunnerMessage::Grant {
+                        kind,
+                        position: value,
+                        count: value,
+                        fault,
+                    });
+                }
+            }
+            for &fault in &[
+                ClosureFault::NotAbsolute,
+                ClosureFault::NotNormal,
+                ClosureFault::Symlink,
+                ClosureFault::SharedRoot,
+                ClosureFault::Unresolved,
+                ClosureFault::NotFileOrDirectory,
+                ClosureFault::ResolvedSharedRoot,
+            ] {
+                render(RunnerMessage::Closure {
+                    position: value,
+                    count: value,
+                    fault,
+                });
+            }
+            render(RunnerMessage::ClosureNotUtf8 {
+                position: value,
+                count: value,
+            });
+            render(RunnerMessage::ClosureCannotBeQuoted {
+                position: value,
+                count: value,
+            });
+        }
 
-        let old_forwarding = concat!(
-            "Runner",
-            r#"Error {
-            code: "memory-monitor-failed",
-            message: format!("the resident-memory measurement failed, failing closed: "#,
-            "{detail}",
-            r#""),
-        }"#
-        );
-        let sites = sites(old_forwarding);
-        assert_eq!(sites.len(), 1);
-        assert!(
-            carries_unbounded_failure_detail(&sites[0]),
-            "the former memory-detail forwarding escaped the check"
-        );
+        for &value in U64S {
+            render(RunnerMessage::DrainTimeout(value));
+            render(RunnerMessage::WallTimeout(value));
+            render(RunnerMessage::ResponseFrameOversized {
+                declared: value,
+                ceiling: value,
+            });
+            render(RunnerMessage::StderrOverflow {
+                written: value,
+                ceiling: value,
+            });
+            render(RunnerMessage::MemoryExceeded {
+                total: value,
+                ceiling: value,
+            });
+        }
+
+        for &value in U32S {
+            for error in [
+                memory::MemoryError::GroupLeaderPid(value),
+                memory::MemoryError::GroupMemberPid(value),
+                memory::MemoryError::ResidentSizeRead(value),
+                memory::MemoryError::StatRecord(value),
+            ] {
+                render(RunnerMessage::Memory(error));
+            }
+        }
+        for error in [
+            memory::MemoryError::ResidentSizeSum,
+            memory::MemoryError::ResidentSizeValue,
+            memory::MemoryError::ResidentSizeUnit,
+            memory::MemoryError::ResidentSizeScale,
+            memory::MemoryError::MonitorUnavailable,
+        ] {
+            render(RunnerMessage::Memory(error));
+        }
+
+        for &value in I32S {
+            render(RunnerMessage::Exit(ExitDetail::SandboxSetup(value)));
+            render(RunnerMessage::Exit(ExitDetail::ProcessCount(value)));
+            render(RunnerMessage::Exit(ExitDetail::WorkerCode(value)));
+            render(RunnerMessage::Exit(ExitDetail::WorkerSignal(value)));
+        }
+        render(RunnerMessage::Exit(ExitDetail::WorkerNoStatus));
+
+        for detail in [
+            ResponseValidationError::BothBodies,
+            ResponseValidationError::NoBody,
+        ] {
+            render(RunnerMessage::ValidateResponse(detail));
+        }
+        for &name in PROBE_NAMES {
+            render(RunnerMessage::ProbeAttemptMissing(name));
+        }
+        for value in [
+            TemplateValue::Jail,
+            TemplateValue::Worker,
+            TemplateValue::Closures,
+            TemplateValue::Service,
+            TemplateValue::Grants,
+        ] {
+            render(RunnerMessage::TemplateBrace(value));
+        }
+        for class in [
+            PathClass::Jail,
+            PathClass::Worker,
+            PathClass::ExecutableGrantDirectory,
+            PathClass::ExecutableGrant,
+            PathClass::ReadGrant,
+        ] {
+            render(RunnerMessage::PathNotUtf8(class));
+            render(RunnerMessage::PathCannotBeQuoted(class));
+        }
     }
 }

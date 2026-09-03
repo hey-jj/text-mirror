@@ -21,8 +21,8 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-use super::protocol::bodies::{ProbeNetRequest, ProbeReport};
-use super::{Limits, Runner, RunnerError};
+use super::protocol::bodies::{ProbeName, ProbeNetRequest, ProbeOutcome, ProbeReport};
+use super::{ClosureFault, Limits, Runner, RunnerError, RunnerMessage};
 use crate::hash;
 
 /// Which measured jail profile a worker mode runs under.
@@ -90,10 +90,6 @@ impl ProviderJail {
         service_prefix: Option<String>,
         temp_env: Option<String>,
     ) -> Result<ProviderJail, RunnerError> {
-        let refuse = |message: String| RunnerError {
-            code: "sandbox_unavailable",
-            message,
-        };
         // Every entry is rendered as a grant on the tree it really
         // names: resolved here, refused when it cannot be, so an alias
         // through `..` or a link never reaches the profile and the
@@ -104,50 +100,54 @@ impl ProviderJail {
         // deployment path belongs in one.
         let total = closures.len();
         for (index, closure) in closures.iter().enumerate() {
-            let entry = format!("closure entry {} of {total}", index + 1);
+            let position = index + 1;
+            let refuse = |fault| {
+                RunnerError::new(
+                    "sandbox_unavailable",
+                    RunnerMessage::Closure {
+                        position,
+                        count: total,
+                        fault,
+                    },
+                )
+            };
             if !closure.is_absolute() {
-                return Err(refuse(format!("{entry} is not absolute")));
+                return Err(refuse(ClosureFault::NotAbsolute));
             }
             if !crate::convert::provider::is_normal_form(closure) {
-                return Err(refuse(format!("{entry} is not in normal form")));
+                return Err(refuse(ClosureFault::NotNormal));
             }
             if crate::convert::provider::is_symlink_entry(closure) {
-                return Err(refuse(format!(
-                    "{entry} is a symlink, not the tree it names"
-                )));
+                return Err(refuse(ClosureFault::Symlink));
             }
             if crate::convert::provider::is_shared_root(closure) {
-                return Err(refuse(format!(
-                    "{entry} is a shared root, not a measured dependency"
-                )));
+                return Err(refuse(ClosureFault::SharedRoot));
             }
             let Some(real) = crate::convert::provider::canonical(closure) else {
-                return Err(refuse(format!("{entry} cannot be resolved")));
+                return Err(refuse(ClosureFault::Unresolved));
             };
             if !crate::convert::provider::is_real_entry(closure) {
-                return Err(refuse(format!(
-                    "{entry} is not a directory or a regular file"
-                )));
+                return Err(refuse(ClosureFault::NotFileOrDirectory));
             }
             if crate::convert::provider::is_shared_root(&real) {
-                return Err(refuse(format!(
-                    "{entry} resolves to a shared root, not a measured dependency"
-                )));
+                return Err(refuse(ClosureFault::ResolvedSharedRoot));
             }
             real_closures.push(real);
         }
         if let Some(prefix) = &service_prefix
             && !crate::convert::provider::is_service_namespace(prefix)
         {
-            return Err(refuse(
-                "the service namespace is not an anchored dotted prefix".to_string(),
+            return Err(RunnerError::new(
+                "sandbox_unavailable",
+                RunnerMessage::ServiceNamespace,
             ));
         }
         if let Some(name) = &temp_env
             && !crate::convert::provider::is_env_name(name)
         {
-            return Err(refuse(
-                "the temp-directory variable is not a bounded identifier".to_string(),
+            return Err(RunnerError::new(
+                "sandbox_unavailable",
+                RunnerMessage::TempDirectoryVariable,
             ));
         }
         Ok(ProviderJail {
@@ -242,11 +242,10 @@ pub fn platform_backend() -> Result<Box<dyn JailBackend>, RunnerError> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        Err(RunnerError {
-            code: "sandbox_unavailable",
-            message: "no jail backend exists for this platform, refusing to run adapters"
-                .to_string(),
-        })
+        Err(RunnerError::new(
+            "sandbox_unavailable",
+            RunnerMessage::PlatformBackendMissing,
+        ))
     }
 }
 
@@ -273,10 +272,7 @@ pub(super) fn policy_digest(
             crate::Error::Io { source, .. } => source.kind(),
             _ => std::io::ErrorKind::Other,
         };
-        RunnerError {
-            code: "worker_not_found",
-            message: format!("the worker binary cannot be hashed: {kind:?}"),
-        }
+        RunnerError::new("worker_not_found", RunnerMessage::WorkerHash(kind))
     })?;
     let grant_lines = |label: &str, grants: &[std::path::PathBuf]| {
         grants
@@ -357,37 +353,38 @@ pub(super) fn probe_net(runner: &Runner, seccomp: bool) -> Result<(), RunnerErro
         tcp4_target,
         tcp6_target,
     })
-    .map_err(|_| RunnerError {
-        code: "sandbox_probe_failed",
-        message: "cannot encode probe request".to_string(),
-    })?;
+    .map_err(|_| RunnerError::new("sandbox_probe_failed", RunnerMessage::ProbeRequestEncode))?;
     let response = runner.run_unprobed("probe-net", payload, &[], seccomp)?;
     let Some(ok) = response.ok else {
-        return Err(RunnerError {
-            code: "sandbox_probe_failed",
-            message: "network probe reported a failure".to_string(),
-        });
+        return Err(RunnerError::new(
+            "sandbox_probe_failed",
+            RunnerMessage::ProbeReportedFailure,
+        ));
     };
-    let report: ProbeReport = serde_json::from_value(ok).map_err(|_| RunnerError {
-        code: "sandbox_probe_failed",
-        message: "network probe response did not parse".to_string(),
-    })?;
-    let expected = ["ipv4_tcp", "ipv6_tcp", "unix_socket", "udp_send"];
+    let report: ProbeReport = serde_json::from_value(ok)
+        .map_err(|_| RunnerError::new("sandbox_probe_failed", RunnerMessage::ProbeResponseParse))?;
+    let expected = [
+        ProbeName::Ipv4Tcp,
+        ProbeName::Ipv6Tcp,
+        ProbeName::UnixSocket,
+        ProbeName::UdpSend,
+    ];
     for name in expected {
         let Some(attempt) = report.attempts.iter().find(|a| a.name == name) else {
-            return Err(RunnerError {
-                code: "sandbox_probe_failed",
-                message: format!("network probe skipped the {name} attempt"),
-            });
+            return Err(RunnerError::new(
+                "sandbox_probe_failed",
+                RunnerMessage::ProbeAttemptMissing(name),
+            ));
         };
-        if attempt.outcome != "denied" {
-            return Err(RunnerError {
-                code: "sandbox_probe_failed",
-                message: format!(
-                    "network probe attempt {name} ended {} ({}), the jail is not proven",
-                    attempt.outcome, attempt.detail
-                ),
-            });
+        if attempt.outcome != ProbeOutcome::Denied {
+            return Err(RunnerError::new(
+                "sandbox_probe_failed",
+                RunnerMessage::ProbeAttempt {
+                    name,
+                    outcome: attempt.outcome,
+                    error_kind: attempt.error_kind,
+                },
+            ));
         }
     }
     Ok(())
@@ -441,8 +438,8 @@ impl UnixProbeListener {
 }
 
 fn probe_bind_error(e: std::io::Error) -> RunnerError {
-    RunnerError {
-        code: "sandbox_probe_failed",
-        message: format!("cannot stand up the Unix probe listener: {:?}", e.kind()),
-    }
+    RunnerError::new(
+        "sandbox_probe_failed",
+        RunnerMessage::ProbeListener(e.kind()),
+    )
 }

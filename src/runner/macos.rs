@@ -25,7 +25,7 @@ use std::path::Path;
 use std::process::Command;
 
 use super::jail::{JailBackend, ProviderJail, RuntimeProfile, SpawnSpec};
-use super::{Runner, RunnerError};
+use super::{PathClass, Runner, RunnerError, RunnerMessage, TemplateValue};
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -131,10 +131,18 @@ const PLACEHOLDERS: [&str; 5] = ["{jail}", "{worker}", "{closures}", "{service}"
 fn substitute(template: &str, values: &[(&str, &str)]) -> Result<String, RunnerError> {
     for (name, value) in values {
         if value.contains('{') || value.contains('}') {
-            return Err(RunnerError {
-                code: "sandbox_unavailable",
-                message: format!("the {name} value carries a brace and cannot be rendered"),
-            });
+            let value = match *name {
+                "{jail}" => TemplateValue::Jail,
+                "{worker}" => TemplateValue::Worker,
+                "{closures}" => TemplateValue::Closures,
+                "{service}" => TemplateValue::Service,
+                "{grants}" => TemplateValue::Grants,
+                _ => unreachable!("the template value table is closed"),
+            };
+            return Err(RunnerError::new(
+                "sandbox_unavailable",
+                RunnerMessage::TemplateBrace(value),
+            ));
         }
     }
     let mut out = String::with_capacity(template.len() * 2);
@@ -168,21 +176,27 @@ fn provider_profile(
     provider: &ProviderJail,
     grant_lines: &str,
 ) -> Result<String, RunnerError> {
-    let refuse = |message: String| RunnerError {
-        code: "sandbox_unavailable",
-        message,
-    };
     let mut closures = Vec::new();
     let total = provider.closures().len();
     for (index, path) in provider.closures().iter().enumerate() {
-        let entry = format!("closure entry {} of {total}", index + 1);
-        let text = path
-            .to_str()
-            .ok_or_else(|| refuse(format!("{entry} is not UTF-8")))?;
+        let position = index + 1;
+        let text = path.to_str().ok_or_else(|| {
+            RunnerError::new(
+                "sandbox_unavailable",
+                RunnerMessage::ClosureNotUtf8 {
+                    position,
+                    count: total,
+                },
+            )
+        })?;
         if text.contains('"') || text.contains('\\') {
-            return Err(refuse(format!(
-                "{entry} cannot be quoted in a jail profile"
-            )));
+            return Err(RunnerError::new(
+                "sandbox_unavailable",
+                RunnerMessage::ClosureCannotBeQuoted {
+                    position,
+                    count: total,
+                },
+            ));
         }
         // Both filter forms per entry, so one enumeration covers a
         // directory and a single file alike: a subpath filter grants a
@@ -197,8 +211,9 @@ fn provider_profile(
             // never reaches a registration allowance, whatever
             // constructed the parameters.
             if !crate::convert::provider::is_service_namespace(prefix) {
-                return Err(refuse(
-                    "the provider service namespace is not an anchored dotted prefix".to_string(),
+                return Err(RunnerError::new(
+                    "sandbox_unavailable",
+                    RunnerMessage::ServiceNamespace,
                 ));
             }
             format!("(allow mach-register (global-name-regex #\"{prefix}\"))\n")
@@ -227,21 +242,20 @@ fn profile(
 ) -> Result<String, RunnerError> {
     // A refusal names which path class was refused, never the path:
     // these messages can reach a record.
-    let literal = |label: &str, path: &Path| -> Result<String, RunnerError> {
-        let text = path.to_str().ok_or_else(|| RunnerError {
-            code: "sandbox_unavailable",
-            message: format!("{label} is not UTF-8"),
+    let literal = |class: PathClass, path: &Path| -> Result<String, RunnerError> {
+        let text = path.to_str().ok_or_else(|| {
+            RunnerError::new("sandbox_unavailable", RunnerMessage::PathNotUtf8(class))
         })?;
         if text.contains('"') || text.contains('\\') {
-            return Err(RunnerError {
-                code: "sandbox_unavailable",
-                message: format!("{label} cannot be quoted in a Seatbelt profile"),
-            });
+            return Err(RunnerError::new(
+                "sandbox_unavailable",
+                RunnerMessage::PathCannotBeQuoted(class),
+            ));
         }
         Ok(text.to_string())
     };
-    let jail = literal("the jail path", jail)?;
-    let worker = literal("the worker path", worker)?;
+    let jail = literal(PathClass::Jail, jail)?;
+    let worker = literal(PathClass::Worker, worker)?;
     let runtime_reads = RUNTIME_READ_SUBPATHS
         .iter()
         .map(|path| format!("  (subpath \"{path}\")"))
@@ -278,16 +292,16 @@ fn profile(
         // FILES stay unreadable under the default denial, so nothing
         // beside names leaks from the deployment directory.
         if accelerator && let Some(parent) = path.parent() {
-            let parent = literal("an executable grant's directory", parent)?;
+            let parent = literal(PathClass::ExecutableGrantDirectory, parent)?;
             grant_lines.push_str(&format!("(allow file-read-data (literal \"{parent}\"))\n"));
         }
-        let path = literal("an executable grant", path)?;
+        let path = literal(PathClass::ExecutableGrant, path)?;
         grant_lines.push_str(&format!(
             "(allow process-exec* file-read* file-map-executable (literal \"{path}\"))\n"
         ));
     }
     for path in read_grants {
-        let path = literal("a read grant", path)?;
+        let path = literal(PathClass::ReadGrant, path)?;
         grant_lines.push_str(&format!("(allow file-read* (literal \"{path}\"))\n"));
     }
     // The accelerator device allowances, present for the one worker
@@ -313,11 +327,10 @@ fn profile(
     // parameters, so no other worker mode can reach these allowances.
     if runtime_profile == RuntimeProfile::Provider {
         let Some(provider) = provider.filter(|_| !exec_grants.is_empty()) else {
-            return Err(RunnerError {
-                code: "sandbox_unavailable",
-                message: "the provider jail class needs a wired provider, refusing the run"
-                    .to_string(),
-            });
+            return Err(RunnerError::new(
+                "sandbox_unavailable",
+                RunnerMessage::ProviderNeedsWiring,
+            ));
         };
         return provider_profile(&jail, &worker, provider, &grant_lines);
     }
@@ -366,10 +379,10 @@ impl JailBackend for SeatbeltJail {
 
     fn command(&self, spec: &SpawnSpec<'_>) -> Result<Command, RunnerError> {
         if !Path::new(SANDBOX_EXEC).is_file() {
-            return Err(RunnerError {
-                code: "sandbox_unavailable",
-                message: "the sandbox helper is missing, refusing to run adapters".to_string(),
-            });
+            return Err(RunnerError::new(
+                "sandbox_unavailable",
+                RunnerMessage::SandboxHelperMissing,
+            ));
         }
         let mut command = Command::new(SANDBOX_EXEC);
         command
@@ -677,13 +690,13 @@ mod tests {
         let error = ProviderJail::new(vec![PathBuf::from("/private/tmp/../tmp")], None, None)
             .expect_err("an alias of a shared root must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
-        assert!(error.message.contains("normal form"), "{}", error.message);
+        assert!(error.message().contains("normal form"), "{error}");
         let store = dir.path().join("store");
         std::os::unix::fs::symlink("/usr/lib", &store).unwrap();
         let error = ProviderJail::new(vec![store], None, None)
             .expect_err("a link to a shared root must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
-        assert!(error.message.contains("symlink"), "{}", error.message);
+        assert!(error.message().contains("symlink"), "{error}");
         let alias = dir.path().join("alias");
         std::os::unix::fs::symlink(&closure, &alias).unwrap();
         let error =
@@ -692,7 +705,7 @@ mod tests {
         let error = ProviderJail::new(vec![PathBuf::from("/deploy/closure")], None, None)
             .expect_err("an entry that does not exist must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
-        assert!(error.message.contains("resolved"), "{}", error.message);
+        assert!(error.message().contains("resolved"), "{error}");
         // The resolved shared-root comparison itself: a real directory
         // reached through an ancestor link into a shared root.
         let usrlink = dir.path().join("usrlink");
@@ -700,7 +713,7 @@ mod tests {
         let error = ProviderJail::new(vec![usrlink.join("lib")], None, None)
             .expect_err("a real entry carried into a shared root must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
-        assert!(error.message.contains("shared root"), "{}", error.message);
+        assert!(error.message().contains("shared root"), "{error}");
         // An entry that is neither a directory nor a regular file.
         let socket = dir.path().join("sock");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -708,9 +721,10 @@ mod tests {
             ProviderJail::new(vec![socket], None, None).expect_err("a socket entry must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
         assert!(
-            error.message.contains("not a directory or a regular file"),
-            "{}",
-            error.message
+            error
+                .message()
+                .contains("not a directory or a regular file"),
+            "{error}"
         );
         // A FIFO is refused the same way.
         let fifo = dir.path().join("fifo");
@@ -724,9 +738,10 @@ mod tests {
         let error = ProviderJail::new(vec![fifo.clone()], None, None)
             .expect_err("a FIFO entry must refuse");
         assert!(
-            error.message.contains("not a directory or a regular file"),
-            "{}",
-            error.message
+            error
+                .message()
+                .contains("not a directory or a regular file"),
+            "{error}"
         );
         // No refusal names a path: these messages can reach a record.
         for entry in [
@@ -742,10 +757,9 @@ mod tests {
             let error = ProviderJail::new(vec![entry.clone()], None, None)
                 .expect_err("every one of these refuses");
             assert!(
-                !error.message.contains('/'),
-                "{}: {}",
-                entry.display(),
-                error.message
+                !error.message().contains('/'),
+                "{}: {error}",
+                entry.display()
             );
         }
         // The conforming shape builds and renders, on the resolved

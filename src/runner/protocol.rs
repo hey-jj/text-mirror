@@ -120,13 +120,22 @@ impl Response {
     }
 
     /// Checks that exactly one of `ok` and `error` is present.
-    pub fn validate(&self) -> std::result::Result<(), String> {
+    pub fn validate(&self) -> std::result::Result<(), ResponseValidationError> {
         match (&self.ok, &self.error) {
             (Some(_), None) | (None, Some(_)) => Ok(()),
-            (Some(_), Some(_)) => Err("response carries both ok and error".to_string()),
-            (None, None) => Err("response carries neither ok nor error".to_string()),
+            (Some(_), Some(_)) => Err(ResponseValidationError::BothBodies),
+            (None, None) => Err(ResponseValidationError::NoBody),
         }
     }
+}
+
+/// Why a response violates the one-body wire shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseValidationError {
+    /// Both the success and failure bodies are present.
+    BothBodies,
+    /// Neither body is present.
+    NoBody,
 }
 
 /// A machine-readable failure carried over the wire.
@@ -314,13 +323,41 @@ mod tests {
                 message: "detail".to_string(),
             }),
         };
-        assert!(both.validate().is_err());
+        assert_eq!(both.validate(), Err(ResponseValidationError::BothBodies));
         let neither = Response {
             schema: ResponseSchema,
             ok: None,
             error: None,
         };
-        assert!(neither.validate().is_err());
+        assert_eq!(neither.validate(), Err(ResponseValidationError::NoBody));
+    }
+
+    #[test]
+    fn probe_attempts_roundtrip_as_closed_wire_values() {
+        use bodies::{ProbeAttempt, ProbeName, ProbeOutcome, ProbeReport};
+
+        let report = ProbeReport {
+            attempts: vec![ProbeAttempt {
+                name: ProbeName::UnixSocket,
+                outcome: ProbeOutcome::Denied,
+                error_kind: io::ErrorKind::PermissionDenied,
+            }],
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        let back: ProbeReport = serde_json::from_value(value).unwrap();
+        assert_eq!(back.attempts.len(), 1);
+        assert_eq!(back.attempts[0].name, ProbeName::UnixSocket);
+        assert_eq!(back.attempts[0].outcome, ProbeOutcome::Denied);
+        assert_eq!(back.attempts[0].error_kind, io::ErrorKind::PermissionDenied);
+
+        let unknown = serde_json::json!({
+            "attempts": [{
+                "name": "unix_socket",
+                "outcome": "detail_from_worker",
+                "error_kind": "permission_denied"
+            }]
+        });
+        assert!(serde_json::from_value::<ProbeReport>(unknown).is_err());
     }
 
     #[test]
@@ -334,7 +371,187 @@ mod tests {
 /// Typed request and response bodies for the shipped adapters. Each
 /// adapter's `payload` and `ok` values are these shapes.
 pub mod bodies {
+    use std::io;
+
     use super::*;
+
+    /// The fixed capability-probe attempts.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ProbeName {
+        /// IPv4 TCP connection.
+        Ipv4Tcp,
+        /// IPv6 TCP connection.
+        Ipv6Tcp,
+        /// Local Unix socket connection.
+        UnixSocket,
+        /// IPv4 UDP send.
+        UdpSend,
+    }
+
+    /// The closed result classes for one capability-probe attempt.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ProbeOutcome {
+        /// The connection succeeded.
+        Connected,
+        /// The attempt returned an immediate error.
+        Denied,
+        /// The attempt reached its time limit.
+        Timeout,
+        /// The parent supplied an invalid target.
+        InvalidTarget,
+    }
+
+    mod error_kind_wire {
+        use super::*;
+
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum WireErrorKind {
+            NotFound,
+            PermissionDenied,
+            ConnectionRefused,
+            ConnectionReset,
+            HostUnreachable,
+            NetworkUnreachable,
+            ConnectionAborted,
+            NotConnected,
+            AddrInUse,
+            AddrNotAvailable,
+            NetworkDown,
+            BrokenPipe,
+            AlreadyExists,
+            WouldBlock,
+            NotADirectory,
+            IsADirectory,
+            DirectoryNotEmpty,
+            ReadOnlyFilesystem,
+            StaleNetworkFileHandle,
+            InvalidInput,
+            InvalidData,
+            TimedOut,
+            WriteZero,
+            StorageFull,
+            NotSeekable,
+            QuotaExceeded,
+            FileTooLarge,
+            ResourceBusy,
+            ExecutableFileBusy,
+            CrossesDevices,
+            TooManyLinks,
+            InvalidFilename,
+            ArgumentListTooLong,
+            Interrupted,
+            Unsupported,
+            UnexpectedEof,
+            OutOfMemory,
+            Other,
+        }
+
+        impl From<io::ErrorKind> for WireErrorKind {
+            fn from(kind: io::ErrorKind) -> WireErrorKind {
+                match kind {
+                    io::ErrorKind::NotFound => WireErrorKind::NotFound,
+                    io::ErrorKind::PermissionDenied => WireErrorKind::PermissionDenied,
+                    io::ErrorKind::ConnectionRefused => WireErrorKind::ConnectionRefused,
+                    io::ErrorKind::ConnectionReset => WireErrorKind::ConnectionReset,
+                    io::ErrorKind::HostUnreachable => WireErrorKind::HostUnreachable,
+                    io::ErrorKind::NetworkUnreachable => WireErrorKind::NetworkUnreachable,
+                    io::ErrorKind::ConnectionAborted => WireErrorKind::ConnectionAborted,
+                    io::ErrorKind::NotConnected => WireErrorKind::NotConnected,
+                    io::ErrorKind::AddrInUse => WireErrorKind::AddrInUse,
+                    io::ErrorKind::AddrNotAvailable => WireErrorKind::AddrNotAvailable,
+                    io::ErrorKind::NetworkDown => WireErrorKind::NetworkDown,
+                    io::ErrorKind::BrokenPipe => WireErrorKind::BrokenPipe,
+                    io::ErrorKind::AlreadyExists => WireErrorKind::AlreadyExists,
+                    io::ErrorKind::WouldBlock => WireErrorKind::WouldBlock,
+                    io::ErrorKind::NotADirectory => WireErrorKind::NotADirectory,
+                    io::ErrorKind::IsADirectory => WireErrorKind::IsADirectory,
+                    io::ErrorKind::DirectoryNotEmpty => WireErrorKind::DirectoryNotEmpty,
+                    io::ErrorKind::ReadOnlyFilesystem => WireErrorKind::ReadOnlyFilesystem,
+                    io::ErrorKind::StaleNetworkFileHandle => WireErrorKind::StaleNetworkFileHandle,
+                    io::ErrorKind::InvalidInput => WireErrorKind::InvalidInput,
+                    io::ErrorKind::InvalidData => WireErrorKind::InvalidData,
+                    io::ErrorKind::TimedOut => WireErrorKind::TimedOut,
+                    io::ErrorKind::WriteZero => WireErrorKind::WriteZero,
+                    io::ErrorKind::StorageFull => WireErrorKind::StorageFull,
+                    io::ErrorKind::NotSeekable => WireErrorKind::NotSeekable,
+                    io::ErrorKind::QuotaExceeded => WireErrorKind::QuotaExceeded,
+                    io::ErrorKind::FileTooLarge => WireErrorKind::FileTooLarge,
+                    io::ErrorKind::ResourceBusy => WireErrorKind::ResourceBusy,
+                    io::ErrorKind::ExecutableFileBusy => WireErrorKind::ExecutableFileBusy,
+                    io::ErrorKind::CrossesDevices => WireErrorKind::CrossesDevices,
+                    io::ErrorKind::TooManyLinks => WireErrorKind::TooManyLinks,
+                    io::ErrorKind::InvalidFilename => WireErrorKind::InvalidFilename,
+                    io::ErrorKind::ArgumentListTooLong => WireErrorKind::ArgumentListTooLong,
+                    io::ErrorKind::Interrupted => WireErrorKind::Interrupted,
+                    io::ErrorKind::Unsupported => WireErrorKind::Unsupported,
+                    io::ErrorKind::UnexpectedEof => WireErrorKind::UnexpectedEof,
+                    io::ErrorKind::OutOfMemory => WireErrorKind::OutOfMemory,
+                    _ => WireErrorKind::Other,
+                }
+            }
+        }
+
+        impl From<WireErrorKind> for io::ErrorKind {
+            fn from(kind: WireErrorKind) -> io::ErrorKind {
+                match kind {
+                    WireErrorKind::NotFound => io::ErrorKind::NotFound,
+                    WireErrorKind::PermissionDenied => io::ErrorKind::PermissionDenied,
+                    WireErrorKind::ConnectionRefused => io::ErrorKind::ConnectionRefused,
+                    WireErrorKind::ConnectionReset => io::ErrorKind::ConnectionReset,
+                    WireErrorKind::HostUnreachable => io::ErrorKind::HostUnreachable,
+                    WireErrorKind::NetworkUnreachable => io::ErrorKind::NetworkUnreachable,
+                    WireErrorKind::ConnectionAborted => io::ErrorKind::ConnectionAborted,
+                    WireErrorKind::NotConnected => io::ErrorKind::NotConnected,
+                    WireErrorKind::AddrInUse => io::ErrorKind::AddrInUse,
+                    WireErrorKind::AddrNotAvailable => io::ErrorKind::AddrNotAvailable,
+                    WireErrorKind::NetworkDown => io::ErrorKind::NetworkDown,
+                    WireErrorKind::BrokenPipe => io::ErrorKind::BrokenPipe,
+                    WireErrorKind::AlreadyExists => io::ErrorKind::AlreadyExists,
+                    WireErrorKind::WouldBlock => io::ErrorKind::WouldBlock,
+                    WireErrorKind::NotADirectory => io::ErrorKind::NotADirectory,
+                    WireErrorKind::IsADirectory => io::ErrorKind::IsADirectory,
+                    WireErrorKind::DirectoryNotEmpty => io::ErrorKind::DirectoryNotEmpty,
+                    WireErrorKind::ReadOnlyFilesystem => io::ErrorKind::ReadOnlyFilesystem,
+                    WireErrorKind::StaleNetworkFileHandle => io::ErrorKind::StaleNetworkFileHandle,
+                    WireErrorKind::InvalidInput => io::ErrorKind::InvalidInput,
+                    WireErrorKind::InvalidData => io::ErrorKind::InvalidData,
+                    WireErrorKind::TimedOut => io::ErrorKind::TimedOut,
+                    WireErrorKind::WriteZero => io::ErrorKind::WriteZero,
+                    WireErrorKind::StorageFull => io::ErrorKind::StorageFull,
+                    WireErrorKind::NotSeekable => io::ErrorKind::NotSeekable,
+                    WireErrorKind::QuotaExceeded => io::ErrorKind::QuotaExceeded,
+                    WireErrorKind::FileTooLarge => io::ErrorKind::FileTooLarge,
+                    WireErrorKind::ResourceBusy => io::ErrorKind::ResourceBusy,
+                    WireErrorKind::ExecutableFileBusy => io::ErrorKind::ExecutableFileBusy,
+                    WireErrorKind::CrossesDevices => io::ErrorKind::CrossesDevices,
+                    WireErrorKind::TooManyLinks => io::ErrorKind::TooManyLinks,
+                    WireErrorKind::InvalidFilename => io::ErrorKind::InvalidFilename,
+                    WireErrorKind::ArgumentListTooLong => io::ErrorKind::ArgumentListTooLong,
+                    WireErrorKind::Interrupted => io::ErrorKind::Interrupted,
+                    WireErrorKind::Unsupported => io::ErrorKind::Unsupported,
+                    WireErrorKind::UnexpectedEof => io::ErrorKind::UnexpectedEof,
+                    WireErrorKind::OutOfMemory => io::ErrorKind::OutOfMemory,
+                    WireErrorKind::Other => io::ErrorKind::Other,
+                }
+            }
+        }
+
+        pub(super) fn serialize<S: Serializer>(
+            kind: &io::ErrorKind,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            WireErrorKind::from(*kind).serialize(serializer)
+        }
+
+        pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<io::ErrorKind, D::Error> {
+            WireErrorKind::deserialize(deserializer).map(io::ErrorKind::from)
+        }
+    }
 
     /// Request body for the `pdf` adapter.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -703,14 +920,13 @@ pub mod bodies {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct ProbeAttempt {
-        /// Which path was attempted, such as `ipv4_tcp`.
-        pub name: String,
-        /// `denied` for an immediate error, `connected` for success,
-        /// `timeout` when the attempt hung. Only `denied` proves the
-        /// jail.
-        pub outcome: String,
-        /// The underlying error or address detail.
-        pub detail: String,
+        /// Which fixed capability was attempted.
+        pub name: ProbeName,
+        /// How the attempt ended.
+        pub outcome: ProbeOutcome,
+        /// The I/O class reported by the attempt.
+        #[serde(with = "error_kind_wire")]
+        pub error_kind: io::ErrorKind,
     }
 
     /// Request body for the `probe-net` mode.
