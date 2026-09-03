@@ -379,6 +379,7 @@ impl ProviderPin {
 /// closure and its pinned digest are a pair. A closure with no digest
 /// would grant a subtree nothing asserts the contents of, and a digest
 /// with no closure asserts nothing at all.
+#[cfg(feature = "svg-provider")]
 pub(crate) fn check_closure_is_pinned(
     role: &str,
     configured: &ProviderRole,

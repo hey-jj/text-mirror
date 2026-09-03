@@ -10,7 +10,7 @@ readme = "README.md"
 repository = "https://github.com/hey-jj/text-mirror"
 documentation = "https://docs.rs/text-mirror"
 rust-version = "1.88"
-exclude = ["AGENTS.md", "/tests"]
+exclude = ["AGENTS.md", "/tests", "rust-toolchain.toml"]
 
 [lib]
 name = "text_mirror"

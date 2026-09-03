@@ -201,6 +201,14 @@ Versioning.
 
 ### Changed
 
+- The public `ProbeAttempt` struct gained an `error_kind` field. Its
+  wire value uses a closed set of error-kind names, so external code
+  that constructs the struct must add the field.
+- The public `ProbeAttempt` struct no longer has a `detail` field.
+  External code that reads or constructs that field must use the typed
+  error kind.
+- The public `RunnerError` struct's `message` field is now private.
+  Callers read it through `RunnerError::message()`.
 - The `image-pixel-ocr` converter moves from 1.0.0 to 1.1.0: the same
   converter gained the svg input route and the child-specific segment
   source. Direct png, jpeg, and webp conversion is unchanged, spans
