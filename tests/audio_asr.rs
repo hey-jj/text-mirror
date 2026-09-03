@@ -194,15 +194,16 @@ fn a_record_never_carries_a_component_of_a_runtime_path() {
     fs::write(setup.root.join("call.wav"), tone_wav()).unwrap();
     let runtime_dir = tempfile::tempdir().unwrap();
     let mut inventory = RuntimeInventory::empty();
-    for role in ["asr-cli", "asr-weights", "asr-probe"] {
+    let runtime_paths = ["asr-cli", "asr-weights", "asr-probe"].map(|role| {
         let path = runtime_dir.path().join(role);
         fs::write(&path, format!("stand-in bytes for {role}")).unwrap();
         inventory.set(role, path.canonicalize().unwrap()).unwrap();
-    }
+        path.canonicalize().unwrap()
+    });
     let rules = Rules::builtin_with_inventory(&inventory).unwrap();
-    let engine = runtime_dir.path().join("asr-cli");
-    fs::remove_file(&engine).unwrap();
-    fs::create_dir_all(&engine).unwrap();
+    let engine = &runtime_paths[0];
+    fs::remove_file(engine).unwrap();
+    fs::create_dir_all(engine).unwrap();
     run_with(&setup, &rules);
     let record = terminal(&setup, "call.wav");
     assert_eq!(record.status, Status::Failed);
@@ -215,18 +216,21 @@ fn a_record_never_carries_a_component_of_a_runtime_path() {
     let mut text = error;
     text.extend(record.warnings.iter().cloned());
     assert!(!text.contains('/'), "{text}");
-    for component in runtime_dir
-        .path()
-        .canonicalize()
-        .unwrap()
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .filter(|c| c.len() > 3)
-    {
-        assert!(
-            !text.contains(component),
-            "{component} reached the record: {text}"
-        );
+    let record_bytes = serde_json::to_vec(&record).unwrap();
+    for path in &runtime_paths {
+        for component in path.components() {
+            let std::path::Component::Normal(component) = component else {
+                continue;
+            };
+            let component = component.as_encoded_bytes();
+            assert!(
+                !record_bytes
+                    .windows(component.len())
+                    .any(|window| window == component),
+                "path component reached the record: {}",
+                String::from_utf8_lossy(component)
+            );
+        }
     }
 }
 

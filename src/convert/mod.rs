@@ -1368,6 +1368,29 @@ impl Registry {
         }
     }
 
+    /// Test seam for the provider runner's spawn-time grant check.
+    /// The converter performs its normal parent presence preflight,
+    /// replaces `path` with a directory, then enters `Runner::run`.
+    /// This method exists only with `test-adapters` and keeps the fake
+    /// recognition stage used by provider pipeline tests.
+    #[cfg(all(
+        unix,
+        feature = "image-ocr",
+        feature = "svg-provider",
+        feature = "test-adapters"
+    ))]
+    pub fn use_provider_spawn_recheck_test_seam(&mut self, path: std::path::PathBuf) {
+        if let (Some(index), Some(svg)) = (self.svg_ocr_index, &self.svg_provider) {
+            self.converters[index] = Box::new(
+                subprocess::ImagePixelOcr::new_fake_with_svg_provider_spawn_recheck(
+                    self.image_ocr_limits.clone(),
+                    svg,
+                    path,
+                ),
+            );
+        }
+    }
+
     /// The converter that runs the svg provider leg, when a complete
     /// provider is configured and this build carries the feature. It
     /// never enters `by_format`, so the pipeline reaches it here to run

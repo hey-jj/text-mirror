@@ -798,39 +798,47 @@ fn moving_an_identical_installation_re_runs_nothing() {
 
 #[test]
 fn a_record_never_carries_a_component_of_a_provider_path() {
-    // The configured executable is swapped for a directory after the
-    // configuration was read and before the run. The child records the
-    // failure by role label, and no component of the deployment path
-    // reaches the record: not the reason, not a warning.
+    // The test seam swaps the configured executable after the parent
+    // presence preflight and immediately before `Runner::run`. The
+    // child therefore records the runner's spawn-time refusal.
     let provider = FakeProvider::new(&[(1600, 900)]);
-    let rules = provider_rules(&provider);
+    let provider_paths = [
+        provider.raster_path().to_path_buf(),
+        provider.encoder_path().to_path_buf(),
+    ];
+    let mut rules = provider_rules(&provider);
+    rules
+        .registry
+        .use_provider_spawn_recheck_test_seam(provider_paths[0].clone());
     let setup = setup();
     fs::write(setup.root.join("art.svg"), svg_bytes(1600, 900, "text")).unwrap();
-    fs::remove_file(provider.raster_path()).unwrap();
-    fs::create_dir_all(provider.raster_path()).unwrap();
     run_with(&setup, &rules);
     let child = terminal(&setup, &child_of("art.svg")).expect("a failed child");
     assert_eq!(child.status, Status::Failed);
     let error = child.error.clone().unwrap_or_default();
-    assert!(error.starts_with("rasterizer-missing"), "{error}");
+    assert!(error.starts_with("adapter_spawn_error"), "{error}");
+    assert!(
+        error.contains("executable grant 1 of 2 is not a literal regular file"),
+        "{error}"
+    );
     let mut text = error;
     text.extend(child.warnings.iter().cloned());
     assert!(!text.contains('/'), "{text}");
-    // The deployment directory's own components, which are the
-    // private part of the path: the executable's file name is the
-    // generic role word and may appear in the reason on its own.
-    for component in provider
-        .raster_path()
-        .parent()
-        .unwrap()
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .filter(|c| c.len() > 3)
-    {
-        assert!(
-            !text.contains(component),
-            "{component} reached the record: {text}"
-        );
+    let record_bytes = serde_json::to_vec(&child).unwrap();
+    for path in &provider_paths {
+        for component in path.components() {
+            let std::path::Component::Normal(component) = component else {
+                continue;
+            };
+            let component = component.as_encoded_bytes();
+            assert!(
+                !record_bytes
+                    .windows(component.len())
+                    .any(|window| window == component),
+                "path component reached the record: {}",
+                String::from_utf8_lossy(component)
+            );
+        }
     }
 }
 

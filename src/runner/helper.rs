@@ -26,9 +26,9 @@ use std::path::PathBuf;
 
 use super::{PROCESS_COUNT_EXIT, SANDBOX_SETUP_EXIT, WORKER_BINARY};
 
-/// A refused setup: one line of stderr detail and the exit code the
-/// parent maps back to a named runner reason. Every refusal that is
-/// not called out by its own code is a jail setup failure.
+/// A refused setup: one path-free line of stderr detail and the exit
+/// code the parent maps back to a named runner reason. Every refusal
+/// that is not called out by its own code is a jail setup failure.
 #[derive(Debug)]
 struct Refusal {
     detail: String,
@@ -87,7 +87,7 @@ pub fn parse_args(args: &[String]) -> Result<HelperConfig, String> {
     while let Some(flag) = iter.next() {
         let value = iter
             .next()
-            .ok_or_else(|| format!("flag {flag} is missing its value"))?;
+            .ok_or_else(|| "a helper flag is missing its value".to_string())?;
         match flag.as_str() {
             "--jail" => jail = Some(PathBuf::from(value)),
             "--worker" => worker = Some(PathBuf::from(value)),
@@ -106,12 +106,12 @@ pub fn parse_args(args: &[String]) -> Result<HelperConfig, String> {
                 seccomp = Some(match value.as_str() {
                     "kill" => true,
                     "off" => false,
-                    other => return Err(format!("unknown seccomp mode {other:?}")),
+                    _ => return Err("unknown seccomp mode".to_string()),
                 })
             }
             "--grant-exec" => exec_grants.push(PathBuf::from(value)),
             "--grant-read" => read_grants.push(PathBuf::from(value)),
-            other => return Err(format!("unknown flag {other:?}")),
+            _ => return Err("unknown helper flag".to_string()),
         }
     }
     Ok(HelperConfig {
@@ -131,7 +131,7 @@ pub fn parse_args(args: &[String]) -> Result<HelperConfig, String> {
 fn parse_number(flag: &str, value: &str) -> Result<u64, String> {
     value
         .parse()
-        .map_err(|e| format!("flag {flag} value {value:?} is not a number: {e}"))
+        .map_err(|_| format!("flag {flag} does not carry a number"))
 }
 
 /// Runs the helper: engage the jail, then exec the adapter mode.
@@ -203,7 +203,7 @@ fn engage(_config: &HelperConfig) -> Result<(), Refusal> {
 fn apply_rlimits(config: &HelperConfig) -> Result<(), Refusal> {
     use rlimit::{Resource, setrlimit};
     let apply = |resource: Resource, name: &str, value: u64| {
-        setrlimit(resource, value, value).map_err(|e| format!("setrlimit {name} failed: {e}"))
+        setrlimit(resource, value, value).map_err(|_| format!("setrlimit {name} failed"))
     };
     #[cfg(target_os = "linux")]
     if let Some(bytes) = config.address_space_bytes {
@@ -246,7 +246,7 @@ fn apply_rlimits(config: &HelperConfig) -> Result<(), Refusal> {
 fn nproc_limit(configured: u64) -> Result<u64, Refusal> {
     use rlimit::{Resource, getrlimit};
     let (_, hard) =
-        getrlimit(Resource::NPROC).map_err(|e| format!("getrlimit RLIMIT_NPROC failed: {e}"))?;
+        getrlimit(Resource::NPROC).map_err(|_| "getrlimit RLIMIT_NPROC failed".to_string())?;
     headroom_limit(configured, hard, current_uid_process_count)
 }
 
@@ -259,7 +259,8 @@ fn headroom_limit(
 ) -> Result<u64, Refusal> {
     let base = count().map_err(|e| Refusal {
         detail: format!(
-            "the real user id's process count could not be measured, so the headroom this limit rides on is unknown: {e}"
+            "the real user id's process count could not be measured, so the headroom this limit rides on is unknown: {:?}",
+            e.kind()
         ),
         exit: PROCESS_COUNT_EXIT,
     })?;
@@ -326,11 +327,11 @@ fn close_extra_fds() -> Result<(), String> {
     const FD_DIR: &str = "/proc/self/fd";
     #[cfg(not(target_os = "linux"))]
     const FD_DIR: &str = "/dev/fd";
-    let entries =
-        std::fs::read_dir(FD_DIR).map_err(|e| format!("cannot enumerate descriptors: {e}"))?;
+    let entries = std::fs::read_dir(FD_DIR)
+        .map_err(|e| format!("cannot enumerate descriptors: {:?}", e.kind()))?;
     let mut fds = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot enumerate descriptors: {e}"))?;
+        let entry = entry.map_err(|e| format!("cannot enumerate descriptors: {:?}", e.kind()))?;
         if let Some(fd) = entry
             .file_name()
             .to_str()
@@ -361,7 +362,7 @@ fn exec_adapter(config: &HelperConfig) -> String {
     };
     match nix::unistd::execv(&path, &[argv0.as_c_str(), mode.as_c_str()]) {
         Ok(infallible) => match infallible {},
-        Err(e) => format!("exec of the adapter mode failed: {e}"),
+        Err(e) => format!("exec of the adapter mode failed: {e:?}"),
     }
 }
 
@@ -393,11 +394,7 @@ mod tests {
         .expect_err("an unmeasurable count must refuse the run");
         assert_eq!(refusal.exit, PROCESS_COUNT_EXIT);
         assert_ne!(refusal.exit, SANDBOX_SETUP_EXIT);
-        assert!(
-            refusal.detail.contains("the listing is unavailable"),
-            "{}",
-            refusal.detail
-        );
+        assert!(refusal.detail.contains("Other"), "{}", refusal.detail);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

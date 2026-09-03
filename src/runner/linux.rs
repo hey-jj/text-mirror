@@ -125,7 +125,7 @@ impl JailBackend for NamespaceJail {
             }),
             Err(e) => Err(RunnerError {
                 code: "sandbox_probe_failed",
-                message: format!("the syscall filter probe failed to run: {e}"),
+                message: format!("the syscall filter probe failed to run: {}", e.code),
             }),
         }
     }
@@ -136,18 +136,18 @@ impl JailBackend for NamespaceJail {
 pub(super) fn unshare_namespaces() -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let this = std::fs::metadata("/proc/self")
-        .map_err(|e| format!("cannot read process identity: {e}"))?;
+        .map_err(|e| format!("cannot read process identity: {:?}", e.kind()))?;
     let (uid, gid) = (this.uid(), this.gid());
     nix::sched::unshare(
         nix::sched::CloneFlags::CLONE_NEWUSER | nix::sched::CloneFlags::CLONE_NEWNET,
     )
-    .map_err(|e| format!("unshare(newuser|newnet) failed: {e}"))?;
+    .map_err(|e| format!("unshare(newuser|newnet) failed: {e:?}"))?;
     std::fs::write("/proc/self/setgroups", "deny")
-        .map_err(|e| format!("cannot deny setgroups: {e}"))?;
+        .map_err(|e| format!("cannot deny setgroups: {:?}", e.kind()))?;
     std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1\n"))
-        .map_err(|e| format!("cannot write the uid map: {e}"))?;
+        .map_err(|e| format!("cannot write the uid map: {:?}", e.kind()))?;
     std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1\n"))
-        .map_err(|e| format!("cannot write the gid map: {e}"))?;
+        .map_err(|e| format!("cannot write the gid map: {:?}", e.kind()))?;
     Ok(())
 }
 
@@ -163,42 +163,61 @@ pub(super) fn apply_landlock(
     exec_grants: &[std::path::PathBuf],
     read_grants: &[std::path::PathBuf],
 ) -> Result<(), String> {
-    let fail = |stage: &str, e: &dyn std::fmt::Display| format!("landlock {stage}: {e}");
+    let ruleset_kind = |error: &landlock::RulesetError| match error {
+        landlock::RulesetError::HandleAccesses(_) => "HandleAccesses",
+        landlock::RulesetError::CreateRuleset(_) => "CreateRuleset",
+        landlock::RulesetError::AddRules(_) => "AddRules",
+        landlock::RulesetError::RestrictSelf(_) => "RestrictSelf",
+        landlock::RulesetError::Scope(_) => "Scope",
+        landlock::RulesetError::RestrictSelfFlags(_) => "RestrictSelfFlags",
+        _ => "Unknown",
+    };
+    let path_fd_kind = |error: landlock::PathFdError| match error {
+        landlock::PathFdError::OpenCall { source, .. } => source.kind(),
+    };
+    let fail = |stage: &str, kind: &str| format!("landlock {stage}: {kind}");
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(AccessFs::from_all(LANDLOCK_ABI))
-        .map_err(|e| fail("handle_access", &e))?
+        .map_err(|e| fail("handle_access", ruleset_kind(&e)))?
         .create()
-        .map_err(|e| fail("create", &e))?;
+        .map_err(|e| fail("create", ruleset_kind(&e)))?;
     ruleset = ruleset
         .add_rule(PathBeneath::new(
-            PathFd::new(jail).map_err(|e| fail("open jail", &e))?,
+            PathFd::new(jail)
+                .map_err(|e| format!("landlock jail directory: {:?}", path_fd_kind(e)))?,
             AccessFs::from_all(LANDLOCK_ABI),
         ))
-        .map_err(|e| fail("jail rule", &e))?;
+        .map_err(|e| fail("jail directory rule", ruleset_kind(&e)))?;
     ruleset = ruleset
         .add_rule(PathBeneath::new(
-            PathFd::new(worker).map_err(|e| fail("open worker", &e))?,
+            PathFd::new(worker)
+                .map_err(|e| format!("landlock worker binary: {:?}", path_fd_kind(e)))?,
             AccessFs::Execute | AccessFs::ReadFile,
         ))
-        .map_err(|e| fail("worker rule", &e))?;
-    for path in exec_grants {
+        .map_err(|e| fail("worker binary rule", ruleset_kind(&e)))?;
+    for (index, path) in exec_grants.iter().enumerate() {
+        let label = format!("executable grant {} of {}", index + 1, exec_grants.len());
         ruleset = ruleset
             .add_rule(PathBeneath::new(
-                PathFd::new(path).map_err(|e| fail("open exec grant", &e))?,
+                PathFd::new(path)
+                    .map_err(|e| format!("landlock {label}: {:?}", path_fd_kind(e)))?,
                 AccessFs::Execute | AccessFs::ReadFile,
             ))
-            .map_err(|e| fail("exec grant rule", &e))?;
+            .map_err(|e| fail(&format!("{label} rule"), ruleset_kind(&e)))?;
     }
-    for path in read_grants {
+    for (index, path) in read_grants.iter().enumerate() {
+        let label = format!("read grant {} of {}", index + 1, read_grants.len());
         ruleset = ruleset
             .add_rule(PathBeneath::new(
-                PathFd::new(path).map_err(|e| fail("open read grant", &e))?,
+                PathFd::new(path)
+                    .map_err(|e| format!("landlock {label}: {:?}", path_fd_kind(e)))?,
                 AccessFs::ReadFile.into(),
             ))
-            .map_err(|e| fail("read grant rule", &e))?;
+            .map_err(|e| fail(&format!("{label} rule"), ruleset_kind(&e)))?;
     }
-    for path in RUNTIME_READ_PATHS {
+    let runtime_total = RUNTIME_READ_PATHS.len();
+    for (index, path) in RUNTIME_READ_PATHS.iter().enumerate() {
         if !Path::new(path).exists() {
             continue;
         }
@@ -209,14 +228,25 @@ pub(super) fn apply_landlock(
         };
         ruleset = ruleset
             .add_rule(PathBeneath::new(
-                PathFd::new(path).map_err(|e| fail("open runtime path", &e))?,
+                PathFd::new(path).map_err(|e| {
+                    format!(
+                        "landlock runtime grant {} of {runtime_total}: {:?}",
+                        index + 1,
+                        path_fd_kind(e)
+                    )
+                })?,
                 access,
             ))
-            .map_err(|e| fail("runtime rule", &e))?;
+            .map_err(|e| {
+                fail(
+                    &format!("runtime grant {} of {runtime_total} rule", index + 1),
+                    ruleset_kind(&e),
+                )
+            })?;
     }
     let status = ruleset
         .restrict_self()
-        .map_err(|e| fail("restrict_self", &e))?;
+        .map_err(|e| fail("restrict_self", ruleset_kind(&e)))?;
     if status.ruleset != RulesetStatus::FullyEnforced {
         return Err(format!(
             "landlock policy is {:?}, full enforcement is required, the kernel floor is 6.2",

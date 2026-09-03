@@ -159,8 +159,12 @@ pub fn locate_worker() -> Result<PathBuf, RunnerError> {
         code: "worker_not_found",
         message: detail,
     };
-    let current = std::env::current_exe()
-        .map_err(|e| missing(format!("cannot resolve the current executable: {e}")))?;
+    let current = std::env::current_exe().map_err(|e| {
+        missing(format!(
+            "cannot resolve the current executable: {:?}",
+            e.kind()
+        ))
+    })?;
     let Some(dir) = current.parent() else {
         return Err(missing(
             "the current executable has no directory".to_string(),
@@ -174,7 +178,7 @@ pub fn locate_worker() -> Result<PathBuf, RunnerError> {
         if candidate.is_file() {
             return candidate
                 .canonicalize()
-                .map_err(|e| missing(format!("cannot resolve the worker binary: {e}")));
+                .map_err(|e| missing(format!("cannot resolve the worker binary: {:?}", e.kind())));
         }
     }
     Err(missing(format!(
@@ -383,16 +387,19 @@ impl Runner {
                     return Err(refuse("it is a symlink"));
                 }
                 Ok(_) => return Err(refuse("it is not a regular file")),
-                Err(e) => return Err(refuse(&e.to_string())),
+                Err(e) => {
+                    let detail = format!("{:?}", e.kind());
+                    return Err(refuse(&detail));
+                }
             }
         }
         let jail_dir = tempfile::tempdir().map_err(|e| RunnerError {
             code: "adapter_spawn_error",
-            message: format!("cannot create the jail directory: {e}"),
+            message: format!("cannot create the jail directory: {:?}", e.kind()),
         })?;
         let jail_path = jail_dir.path().canonicalize().map_err(|e| RunnerError {
             code: "adapter_spawn_error",
-            message: format!("cannot canonicalize the jail directory: {e}"),
+            message: format!("cannot canonicalize the jail directory: {:?}", e.kind()),
         })?;
         for (name, bytes) in files {
             if name.contains('/') || name.contains("..") {
@@ -403,7 +410,7 @@ impl Runner {
             }
             std::fs::write(jail_path.join(name), bytes).map_err(|e| RunnerError {
                 code: "adapter_spawn_error",
-                message: format!("cannot stage input {name:?}: {e}"),
+                message: format!("cannot stage input {name:?}: {:?}", e.kind()),
             })?;
         }
 
@@ -432,7 +439,7 @@ impl Runner {
         }
         let mut child = command.spawn().map_err(|e| RunnerError {
             code: "adapter_spawn_error",
-            message: format!("cannot spawn the jailed worker: {e}"),
+            message: format!("cannot spawn the jailed worker: {:?}", e.kind()),
         })?;
 
         let request = Request {
@@ -457,7 +464,7 @@ enum StdoutEnd {
     Truncated,
     Oversized { declared: u64 },
     Trailing,
-    ReadError(String),
+    ReadError(std::io::ErrorKind),
 }
 
 /// How long the parent waits for the drains to reach EOF after the
@@ -492,13 +499,13 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
                 match reader.read(&mut probe) {
                     Ok(0) => StdoutEnd::Frame(payload),
                     Ok(_) => StdoutEnd::Trailing,
-                    Err(e) => StdoutEnd::ReadError(e.to_string()),
+                    Err(e) => StdoutEnd::ReadError(e.kind()),
                 }
             }
             Ok(FrameRead::Empty) => StdoutEnd::Empty,
             Ok(FrameRead::Truncated) => StdoutEnd::Truncated,
             Ok(FrameRead::Oversized { declared }) => StdoutEnd::Oversized { declared },
-            Err(e) => StdoutEnd::ReadError(e.to_string()),
+            Err(e) => StdoutEnd::ReadError(e.kind()),
         };
         if matches!(
             end,
@@ -663,9 +670,9 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
     if !status.success() {
         let detail = exit_detail(&status);
         let stderr_text = String::from_utf8_lossy(&stderr_kept);
-        let stderr_text = stderr_text.trim();
+        let stderr_text = scrub_stderr(&stderr_text, limits.max_stderr_bytes);
         #[cfg(unix)]
-        let refusal = helper_refusal(status.code(), stderr_text);
+        let refusal = helper_refusal(status.code(), &stderr_text);
         #[cfg(not(unix))]
         let refusal = None;
         if let Some(error) = refusal {
@@ -697,20 +704,52 @@ fn drive(child: &mut Child, limits: &Limits) -> Result<Response, RunnerError> {
         StdoutEnd::ReadError(detail) => {
             return Err(RunnerError {
                 code: "adapter_protocol_error",
-                message: format!("reading the response failed: {detail}"),
+                message: format!("reading the response failed: {detail:?}"),
             });
         }
         StdoutEnd::Oversized { .. } | StdoutEnd::Trailing => unreachable!("handled above"),
     };
-    let response: Response = serde_json::from_slice(&payload).map_err(|e| RunnerError {
+    let response: Response = serde_json::from_slice(&payload).map_err(|_| RunnerError {
         code: "adapter_protocol_error",
-        message: format!("response frame did not parse: {e}"),
+        message: "response frame did not parse".to_string(),
     })?;
     response.validate().map_err(|detail| RunnerError {
         code: "adapter_protocol_error",
         message: detail,
     })?;
     Ok(response)
+}
+
+/// Replaces each whitespace-delimited stderr token that contains `/`
+/// before the text can enter a runner message. Both helper refusals
+/// and worker crashes use this function. The returned text stays
+/// within the configured stderr byte ceiling.
+fn scrub_stderr(stderr_text: &str, max_bytes: u64) -> String {
+    const PATH_PLACEHOLDER: &str = "[path]";
+
+    let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut scrubbed = String::new();
+    for token in stderr_text.split_whitespace() {
+        let token = if token.contains('/') {
+            PATH_PLACEHOLDER
+        } else {
+            token
+        };
+        let separator = usize::from(!scrubbed.is_empty());
+        if scrubbed
+            .len()
+            .saturating_add(separator)
+            .saturating_add(token.len())
+            > max_bytes
+        {
+            break;
+        }
+        if separator == 1 {
+            scrubbed.push(' ');
+        }
+        scrubbed.push_str(token);
+    }
+    scrubbed
 }
 
 /// Interprets a helper exit code that refused before any adapter ran.
@@ -823,6 +862,54 @@ mod tests {
     }
 
     #[test]
+    fn stderr_passthrough_replaces_absolute_and_grant_paths() {
+        let absolute = "/runtime/worker";
+        let grant = "/runtime/grants/engine-cli";
+        let detail = format!("sandbox_setup_failed: open {absolute} grant {grant}: NotFound");
+        let scrubbed = scrub_stderr(&detail, 1024);
+        let refusal =
+            helper_refusal(Some(SANDBOX_SETUP_EXIT), &scrubbed).expect("a setup exit is a refusal");
+        assert!(!refusal.message.contains(absolute), "{refusal}");
+        assert!(!refusal.message.contains(grant), "{refusal}");
+        assert_eq!(refusal.message.matches("[path]").count(), 2);
+        assert!(refusal.message.len() <= 1024);
+    }
+
+    #[test]
+    fn a_missing_worker_hash_reports_only_the_error_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-worker");
+        let backend = jail::platform_backend().expect("this host has a jail backend");
+        let error = jail::policy_digest(
+            backend.as_ref(),
+            &missing,
+            &[],
+            &[],
+            RuntimeProfile::Plain,
+            None,
+        )
+        .expect_err("the missing worker cannot be hashed");
+        assert_eq!(error.code, "worker_not_found");
+        assert_eq!(
+            error.message,
+            "the worker binary cannot be hashed: NotFound"
+        );
+        for component in missing.components() {
+            let std::path::Component::Normal(component) = component else {
+                continue;
+            };
+            assert!(
+                !error
+                    .message
+                    .as_bytes()
+                    .windows(component.as_encoded_bytes().len())
+                    .any(|window| window == component.as_encoded_bytes()),
+                "a worker path component reached the message"
+            );
+        }
+    }
+
+    #[test]
     fn the_memory_verdict_kills_over_the_ceiling_and_fails_closed_on_a_query_error() {
         // Under the ceiling: no verdict.
         assert!(memory_verdict(Ok(100), 200).is_none());
@@ -855,7 +942,16 @@ mod message_audit_tests {
     ];
 
     /// The spellings a path takes when it is rendered into a message.
-    const RENDERINGS: [&str; 4] = ["display()", "to_string_lossy(", "{text", "{path"];
+    const RENDERINGS: [&str; 8] = [
+        "display()",
+        "to_string_lossy(",
+        "{text",
+        "{path",
+        "{e}",
+        "{source}",
+        "e.to_string()",
+        "source.to_string()",
+    ];
 
     /// Variables in the runner that hold a path, which no message may
     /// interpolate.
@@ -939,5 +1035,26 @@ mod message_audit_tests {
         // The audit saw the sites it exists for: the grant re-assertion
         // and the closure refusals among them.
         assert!(audited >= 40, "only {audited} sites audited");
+    }
+
+    #[test]
+    fn the_construction_site_check_rejects_error_display() {
+        let old_worker_hash = concat!(
+            "Runner",
+            r#"Error {
+            code: "worker_not_found",
+            message: format!("the worker binary cannot be hashed: "#,
+            "{e}",
+            r#""),
+        }"#
+        );
+        let sites = sites(old_worker_hash);
+        assert_eq!(sites.len(), 1);
+        assert!(
+            RENDERINGS
+                .iter()
+                .any(|rendering| sites[0].contains(rendering)),
+            "the former worker-hash construction escaped the check"
+        );
     }
 }

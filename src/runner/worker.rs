@@ -145,8 +145,8 @@ fn run_mode(mode: &str) -> Result<Response, HardExit> {
         #[cfg(feature = "test-adapters")]
         other => harness::run(other, read_request()?),
         #[cfg(not(feature = "test-adapters"))]
-        other => {
-            eprintln!("worker_unknown_mode: {other}");
+        _ => {
+            eprintln!("worker_unknown_mode");
             Err(HardExit(2))
         }
     }
@@ -510,8 +510,8 @@ mod harness {
             "harness-fd-check" => harness_fd_check(request),
             "harness-controls" => harness_controls(request),
             "harness-spawn-probe" => harness_spawn_probe(request),
-            other => {
-                eprintln!("worker_unknown_mode: {other}");
+            _ => {
+                eprintln!("worker_unknown_mode");
                 Err(HardExit(2))
             }
         }

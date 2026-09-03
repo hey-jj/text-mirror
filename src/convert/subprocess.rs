@@ -519,6 +519,12 @@ mod imp {
     struct SvgProviderLeg {
         roles: Vec<crate::runner::protocol::bodies::SvgRoleEntry>,
         runner: Result<Runner, RunnerError>,
+        /// Test-adapters-only seam. The named executable is replaced
+        /// after the parent presence preflight and immediately before
+        /// `Runner::run`, so the runner's spawn-time grant check sees
+        /// the change.
+        #[cfg(feature = "test-adapters")]
+        replace_after_preflight: Option<std::path::PathBuf>,
     }
 
     /// Ceiling on the provider response frame. The flattened raster
@@ -655,7 +661,12 @@ mod imp {
                 ))
             });
             let mut converter = ImagePixelOcr::new(limits, inventory);
-            converter.svg = Some(SvgProviderLeg { roles, runner });
+            converter.svg = Some(SvgProviderLeg {
+                roles,
+                runner,
+                #[cfg(feature = "test-adapters")]
+                replace_after_preflight: None,
+            });
             converter
         }
 
@@ -676,6 +687,25 @@ mod imp {
             );
             let mut converter = ImagePixelOcr::new_fake(limits);
             converter.svg = wired.svg;
+            converter
+        }
+
+        /// Test seam for the provider record-privacy boundary. It
+        /// replaces one already-preflighted executable with a directory
+        /// immediately before the runner starts its spawn-time checks.
+        /// The seam exists only with `test-adapters`.
+        #[cfg(all(feature = "svg-provider", feature = "test-adapters"))]
+        pub fn new_fake_with_svg_provider_spawn_recheck(
+            limits: crate::convert::ImageOcrLimits,
+            provider: &crate::convert::provider::SvgProvider,
+            replace_after_preflight: std::path::PathBuf,
+        ) -> ImagePixelOcr {
+            let mut converter = ImagePixelOcr::new_fake_with_svg_provider(limits, provider);
+            converter
+                .svg
+                .as_mut()
+                .expect("the provider leg is wired")
+                .replace_after_preflight = Some(replace_after_preflight);
             converter
         }
 
@@ -705,6 +735,23 @@ mod imp {
                         message: format!("provider component {} is not present", entry.role),
                     });
                 }
+            }
+            #[cfg(feature = "test-adapters")]
+            if let Some(path) = &leg.replace_after_preflight {
+                std::fs::remove_file(path).map_err(|e| ConvertError {
+                    code: "adapter_spawn_error",
+                    message: format!(
+                        "the provider spawn-check test seam could not remove its executable: {:?}",
+                        e.kind()
+                    ),
+                })?;
+                std::fs::create_dir_all(path).map_err(|e| ConvertError {
+                    code: "adapter_spawn_error",
+                    message: format!(
+                        "the provider spawn-check test seam could not place its directory: {:?}",
+                        e.kind()
+                    ),
+                })?;
             }
             let runner = leg.runner.as_ref().map_err(|e| runner_failure(e.clone()))?;
             let body: SvgRasterOk = call(

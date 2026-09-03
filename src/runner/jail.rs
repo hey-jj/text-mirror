@@ -268,9 +268,15 @@ pub(super) fn policy_digest(
     runtime_profile: RuntimeProfile,
     provider: Option<&ProviderJail>,
 ) -> Result<String, RunnerError> {
-    let worker_hash = hash::hash_file(worker).map_err(|e| RunnerError {
-        code: "worker_not_found",
-        message: format!("the worker binary cannot be hashed: {e}"),
+    let worker_hash = hash::hash_file(worker).map_err(|e| {
+        let kind = match e {
+            crate::Error::Io { source, .. } => source.kind(),
+            _ => std::io::ErrorKind::Other,
+        };
+        RunnerError {
+            code: "worker_not_found",
+            message: format!("the worker binary cannot be hashed: {kind:?}"),
+        }
     })?;
     let grant_lines = |label: &str, grants: &[std::path::PathBuf]| {
         grants
@@ -351,9 +357,9 @@ pub(super) fn probe_net(runner: &Runner, seccomp: bool) -> Result<(), RunnerErro
         tcp4_target,
         tcp6_target,
     })
-    .map_err(|e| RunnerError {
+    .map_err(|_| RunnerError {
         code: "sandbox_probe_failed",
-        message: format!("cannot encode probe request: {e}"),
+        message: "cannot encode probe request".to_string(),
     })?;
     let response = runner.run_unprobed("probe-net", payload, &[], seccomp)?;
     let Some(ok) = response.ok else {
@@ -366,9 +372,9 @@ pub(super) fn probe_net(runner: &Runner, seccomp: bool) -> Result<(), RunnerErro
             message: format!("network probe reported a failure: {detail}"),
         });
     };
-    let report: ProbeReport = serde_json::from_value(ok).map_err(|e| RunnerError {
+    let report: ProbeReport = serde_json::from_value(ok).map_err(|_| RunnerError {
         code: "sandbox_probe_failed",
-        message: format!("network probe response did not parse: {e}"),
+        message: "network probe response did not parse".to_string(),
     })?;
     let expected = ["ipv4_tcp", "ipv6_tcp", "unix_socket", "udp_send"];
     for name in expected {
@@ -441,6 +447,6 @@ impl UnixProbeListener {
 fn probe_bind_error(e: std::io::Error) -> RunnerError {
     RunnerError {
         code: "sandbox_probe_failed",
-        message: format!("cannot stand up the Unix probe listener: {e}"),
+        message: format!("cannot stand up the Unix probe listener: {:?}", e.kind()),
     }
 }
