@@ -105,20 +105,26 @@ impl Rules {
         Self::assemble(table, registry, None, false, None)
     }
 
-    /// Rules in the shape a build without the provider feature takes
-    /// when it is handed a provider configuration: nothing wired, the
-    /// numeric version, and every vector source marked as unable to
-    /// run the leg. Exists so the feature-off checkpoint arm can be
-    /// exercised from a build that carries the feature.
+    /// Test seam. Rules in the shape a build without the provider
+    /// feature takes when it is handed a provider configuration:
+    /// nothing wired, the numeric version, and every vector source
+    /// marked as unable to run the leg. Exists so the feature-off
+    /// checkpoint arm can be exercised from a build that carries the
+    /// feature, and lives behind the crate's test-only feature with
+    /// the fake engines.
+    #[cfg(feature = "test-adapters")]
     pub fn from_parts_provider_not_built(table: FormatTable, registry: Registry) -> Result<Self> {
         Self::assemble(table, registry, None, true, None)
     }
 
-    /// Rules with the provider configured as `from_parts_with_runtime`
-    /// wires it, but with the jail identity's template hash replaced by
-    /// the given value, as if the profile template had been edited.
-    /// Exists so a test can run a source under one template identity
-    /// and then another and prove the checkpoint does not carry across.
+    /// Test seam. Rules with the provider configured as
+    /// `from_parts_with_runtime` wires it, but with the jail identity's
+    /// template hash replaced by the given value, as if the profile
+    /// template had been edited. Exists so a test can run a source
+    /// under one template identity and then another and prove the
+    /// checkpoint does not carry across. Only a checkpoint key changes
+    /// through it: the jail renders the measured template whatever the
+    /// key says.
     #[cfg(feature = "test-adapters")]
     pub fn from_parts_with_runtime_under_template(
         table: FormatTable,

@@ -38,9 +38,17 @@ Versioning.
   enumerates a closure must have that closure pinned or the run is
   refused at registry construction. Every configured path is resolved
   when the configuration is read: a component or entry that cannot be
-  resolved, an entry that is a symlink, or a path written with `.` or
-  `..` is refused, the executable must lie inside one of its entries on
-  the resolved paths, and the jail grants the resolved paths. What the worker asserts about each
+  resolved, an entry that is a symlink or anything but a directory or
+  a regular file, an executable that is not a regular file, or a path
+  written with `.` or `..` is refused, the executable must lie inside
+  one of its entries on the resolved paths, and the jail grants the
+  resolved paths. A refusal from the runner or the jail names the
+  fault, and a grant or entry by its position, never a path, so no
+  deployment path can reach a record. That closes the same message
+  for every granted runtime, the audio engine's included. The two
+  `Rules` constructors that exist for tests, `from_parts_provider_not_built`
+  and `from_parts_with_runtime_under_template`, live behind the
+  `test-adapters` feature with the fake engines. What the worker asserts about each
   executable, the BLAKE3, the exact version, and the aggregate closure
   digest over every regular file and symlink target under each
   enumerated entry, is versioned

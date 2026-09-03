@@ -467,6 +467,11 @@ fn verify_role(entry: &SvgRoleEntry) -> Result<PathBuf, SvgRasterError> {
                 "a closure entry of provider component {role} is a symlink"
             )));
         }
+        if !super::provider::is_real_entry(root) {
+            return Err(drift(format!(
+                "a closure entry of provider component {role} is not a directory or a regular file"
+            )));
+        }
         real_roots.push(super::provider::canonical(root).ok_or_else(|| {
             drift(format!(
                 "a closure entry of provider component {role} cannot be resolved"
@@ -1259,6 +1264,31 @@ mod tests {
         role.closure_roots = vec![real.to_str().unwrap().to_string()];
         let error = verify_role(&role).unwrap_err();
         assert!(error.message.contains("pinned digest"), "{error:?}");
+        // An entry that is neither a directory nor a regular file is
+        // refused before the walk as well.
+        let socket = root.join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        role.closure_roots = vec![socket.to_str().unwrap().to_string()];
+        let error = verify_role(&role).unwrap_err();
+        assert_eq!(error.code, "rasterizer-hash-drift");
+        assert!(
+            error.message.contains("not a directory or a regular file"),
+            "{error:?}"
+        );
+        let fifo = root.join("fifo");
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        role.closure_roots = vec![fifo.to_str().unwrap().to_string()];
+        let error = verify_role(&role).unwrap_err();
+        assert!(
+            error.message.contains("not a directory or a regular file"),
+            "{error:?}"
+        );
     }
 
     #[test]

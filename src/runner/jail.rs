@@ -99,37 +99,39 @@ impl ProviderJail {
         // through `..` or a link never reaches the profile and the
         // shared-root refusal judges the real path.
         let mut real_closures = Vec::with_capacity(closures.len());
-        for closure in &closures {
+        // The messages name the entry by its position and the fault,
+        // never the path: a refusal here can reach a record, and no
+        // deployment path belongs in one.
+        let total = closures.len();
+        for (index, closure) in closures.iter().enumerate() {
+            let entry = format!("closure entry {} of {total}", index + 1);
             if !closure.is_absolute() {
-                return Err(refuse(format!(
-                    "closure entry {} is not absolute",
-                    closure.display()
-                )));
+                return Err(refuse(format!("{entry} is not absolute")));
             }
             if !crate::convert::provider::is_normal_form(closure) {
-                return Err(refuse(format!(
-                    "closure entry {} is not in normal form",
-                    closure.display()
-                )));
+                return Err(refuse(format!("{entry} is not in normal form")));
             }
             if crate::convert::provider::is_symlink_entry(closure) {
                 return Err(refuse(format!(
-                    "closure entry {} is a symlink, not the tree it names",
-                    closure.display()
+                    "{entry} is a symlink, not the tree it names"
+                )));
+            }
+            if crate::convert::provider::is_shared_root(closure) {
+                return Err(refuse(format!(
+                    "{entry} is a shared root, not a measured dependency"
                 )));
             }
             let Some(real) = crate::convert::provider::canonical(closure) else {
-                return Err(refuse(format!(
-                    "closure entry {} cannot be resolved",
-                    closure.display()
-                )));
+                return Err(refuse(format!("{entry} cannot be resolved")));
             };
-            if crate::convert::provider::is_shared_root(closure)
-                || crate::convert::provider::is_shared_root(&real)
-            {
+            if !crate::convert::provider::is_real_entry(closure) {
                 return Err(refuse(format!(
-                    "closure entry {} is a shared root, not a measured dependency",
-                    closure.display()
+                    "{entry} is not a directory or a regular file"
+                )));
+            }
+            if crate::convert::provider::is_shared_root(&real) {
+                return Err(refuse(format!(
+                    "{entry} resolves to a shared root, not a measured dependency"
                 )));
             }
             real_closures.push(real);
@@ -268,7 +270,7 @@ pub(super) fn policy_digest(
 ) -> Result<String, RunnerError> {
     let worker_hash = hash::hash_file(worker).map_err(|e| RunnerError {
         code: "worker_not_found",
-        message: format!("cannot hash worker binary {}: {e}", worker.display()),
+        message: format!("the worker binary cannot be hashed: {e}"),
     })?;
     let grant_lines = |label: &str, grants: &[std::path::PathBuf]| {
         grants

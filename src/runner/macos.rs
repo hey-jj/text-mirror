@@ -173,13 +173,15 @@ fn provider_profile(
         message,
     };
     let mut closures = Vec::new();
-    for path in provider.closures() {
+    let total = provider.closures().len();
+    for (index, path) in provider.closures().iter().enumerate() {
+        let entry = format!("closure entry {} of {total}", index + 1);
         let text = path
             .to_str()
-            .ok_or_else(|| refuse(format!("closure path {} is not UTF-8", path.display())))?;
+            .ok_or_else(|| refuse(format!("{entry} is not UTF-8")))?;
         if text.contains('"') || text.contains('\\') {
             return Err(refuse(format!(
-                "closure path {text:?} cannot be quoted in a jail profile"
+                "{entry} cannot be quoted in a jail profile"
             )));
         }
         // Both filter forms per entry, so one enumeration covers a
@@ -223,21 +225,23 @@ fn profile(
     runtime_profile: RuntimeProfile,
     provider: Option<&ProviderJail>,
 ) -> Result<String, RunnerError> {
-    let literal = |path: &Path| -> Result<String, RunnerError> {
+    // A refusal names which path class was refused, never the path:
+    // these messages can reach a record.
+    let literal = |label: &str, path: &Path| -> Result<String, RunnerError> {
         let text = path.to_str().ok_or_else(|| RunnerError {
             code: "sandbox_unavailable",
-            message: format!("path {} is not UTF-8", path.display()),
+            message: format!("{label} is not UTF-8"),
         })?;
         if text.contains('"') || text.contains('\\') {
             return Err(RunnerError {
                 code: "sandbox_unavailable",
-                message: format!("path {text:?} cannot be quoted in a Seatbelt profile"),
+                message: format!("{label} cannot be quoted in a Seatbelt profile"),
             });
         }
         Ok(text.to_string())
     };
-    let jail = literal(jail)?;
-    let worker = literal(worker)?;
+    let jail = literal("the jail path", jail)?;
+    let worker = literal("the worker path", worker)?;
     let runtime_reads = RUNTIME_READ_SUBPATHS
         .iter()
         .map(|path| format!("  (subpath \"{path}\")"))
@@ -274,16 +278,16 @@ fn profile(
         // FILES stay unreadable under the default denial, so nothing
         // beside names leaks from the deployment directory.
         if accelerator && let Some(parent) = path.parent() {
-            let parent = literal(parent)?;
+            let parent = literal("an executable grant's directory", parent)?;
             grant_lines.push_str(&format!("(allow file-read-data (literal \"{parent}\"))\n"));
         }
-        let path = literal(path)?;
+        let path = literal("an executable grant", path)?;
         grant_lines.push_str(&format!(
             "(allow process-exec* file-read* file-map-executable (literal \"{path}\"))\n"
         ));
     }
     for path in read_grants {
-        let path = literal(path)?;
+        let path = literal("a read grant", path)?;
         grant_lines.push_str(&format!("(allow file-read* (literal \"{path}\"))\n"));
     }
     // The accelerator device allowances, present for the one worker
@@ -364,7 +368,7 @@ impl JailBackend for SeatbeltJail {
         if !Path::new(SANDBOX_EXEC).is_file() {
             return Err(RunnerError {
                 code: "sandbox_unavailable",
-                message: format!("{SANDBOX_EXEC} is missing, refusing to run adapters"),
+                message: "the sandbox helper is missing, refusing to run adapters".to_string(),
             });
         }
         let mut command = Command::new(SANDBOX_EXEC);
@@ -689,6 +693,61 @@ mod tests {
             .expect_err("an entry that does not exist must refuse");
         assert_eq!(error.code, "sandbox_unavailable");
         assert!(error.message.contains("resolved"), "{}", error.message);
+        // The resolved shared-root comparison itself: a real directory
+        // reached through an ancestor link into a shared root.
+        let usrlink = dir.path().join("usrlink");
+        std::os::unix::fs::symlink("/usr", &usrlink).unwrap();
+        let error = ProviderJail::new(vec![usrlink.join("lib")], None, None)
+            .expect_err("a real entry carried into a shared root must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+        assert!(error.message.contains("shared root"), "{}", error.message);
+        // An entry that is neither a directory nor a regular file.
+        let socket = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let error =
+            ProviderJail::new(vec![socket], None, None).expect_err("a socket entry must refuse");
+        assert_eq!(error.code, "sandbox_unavailable");
+        assert!(
+            error.message.contains("not a directory or a regular file"),
+            "{}",
+            error.message
+        );
+        // A FIFO is refused the same way.
+        let fifo = dir.path().join("fifo");
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = ProviderJail::new(vec![fifo.clone()], None, None)
+            .expect_err("a FIFO entry must refuse");
+        assert!(
+            error.message.contains("not a directory or a regular file"),
+            "{}",
+            error.message
+        );
+        // No refusal names a path: these messages can reach a record.
+        for entry in [
+            fifo,
+            PathBuf::from("relative"),
+            PathBuf::from("/private/tmp/../tmp"),
+            dir.path().join("store"),
+            dir.path().join("sock"),
+            PathBuf::from("/deploy/closure"),
+            PathBuf::from("/usr/lib"),
+            usrlink.join("lib"),
+        ] {
+            let error = ProviderJail::new(vec![entry.clone()], None, None)
+                .expect_err("every one of these refuses");
+            assert!(
+                !error.message.contains('/'),
+                "{}: {}",
+                entry.display(),
+                error.message
+            );
+        }
         // The conforming shape builds and renders, on the resolved
         // path: an unresolved spelling of the same tree is granted as
         // the tree.

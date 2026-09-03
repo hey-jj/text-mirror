@@ -316,6 +316,15 @@ pub fn is_symlink_entry(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a path names a real directory or a real regular file after
+/// `symlink_metadata`: not a link, and not a FIFO, a socket, or a
+/// device, none of which is a tree to grant or a file to hash.
+pub fn is_real_entry(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_dir() || m.file_type().is_file())
+        .unwrap_or(false)
+}
+
 /// The tree a path really names, or `None` when it cannot be resolved.
 /// Every containment decision and every rendered grant is made on this
 /// form, never on the text as written.
@@ -443,6 +452,12 @@ impl ProviderRole {
                 self.path.display()
             ))
         })?;
+        if !std::fs::symlink_metadata(&real_path).is_ok_and(|m| m.file_type().is_file()) {
+            return Err(rules_error(format!(
+                "provider role {role:?} path {} is not a regular file",
+                self.path.display()
+            )));
+        }
         let mut real_roots = Vec::with_capacity(self.closure_roots.len());
         for root in &self.closure_roots {
             if !root.is_absolute() {
@@ -474,6 +489,15 @@ impl ProviderRole {
                     root.display()
                 ))
             })?;
+            // A directory or a regular file, judged on the entry's own
+            // metadata: a FIFO, a socket, or a device is neither a
+            // tree to grant nor a file to hash.
+            if !is_real_entry(root) {
+                return Err(rules_error(format!(
+                    "provider role {role:?} closure_roots entry {} is not a directory or a regular file",
+                    root.display()
+                )));
+            }
             if is_shared_root(&real_root) {
                 return Err(rules_error(format!(
                     "provider role {role:?} closure_roots entry {} is a shared root: enumerate the measured dependencies instead",
@@ -1251,5 +1275,64 @@ mod tests {
         );
         let error = ProviderConfig::parse(&real_link).unwrap_err().to_string();
         assert!(error.contains("is a symlink"), "{error}");
+
+        // The resolved shared-root comparison itself: the entry is a
+        // real directory, but an ancestor link carries it into a
+        // shared root, so the written path is innocent and only the
+        // resolved one is refused.
+        std::os::unix::fs::symlink("/usr", deploy.root.join("usrlink")).unwrap();
+        assert!(!is_symlink_entry(&deploy.root.join("usrlink/lib")));
+        assert!(is_real_entry(&deploy.root.join("usrlink/lib")));
+        let carried = deploy.complete().replace(
+            &deploy.encoder_roots_line(),
+            &format!("closure_roots = [\"{}\"]", deploy.at("usrlink/lib")),
+        );
+        let error = ProviderConfig::parse(&carried).unwrap_err().to_string();
+        assert!(error.contains("shared root"), "{error}");
+
+        // An entry that is neither a directory nor a regular file is
+        // refused, and so is an executable that is not a regular file:
+        // a socket is neither a tree to grant nor a file to hash.
+        let socket = deploy.root.join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(!is_real_entry(&socket));
+        let special_entry = deploy.complete().replace(
+            &deploy.encoder_roots_line(),
+            &format!("closure_roots = [\"{}\"]", deploy.at("sock")),
+        );
+        let error = ProviderConfig::parse(&special_entry)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not a directory or a regular file"),
+            "{error}"
+        );
+        let special_executable = deploy.complete().replace(
+            &deploy.raster_path_line(),
+            &format!("path = \"{}\"", deploy.at("sock")),
+        );
+        let error = ProviderConfig::parse(&special_executable)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a regular file"), "{error}");
+        // A FIFO is refused the same way.
+        let fifo = deploy.root.join("fifo");
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(!is_real_entry(&fifo));
+        let fifo_entry = deploy.complete().replace(
+            &deploy.encoder_roots_line(),
+            &format!("closure_roots = [\"{}\"]", deploy.at("fifo")),
+        );
+        let error = ProviderConfig::parse(&fifo_entry).unwrap_err().to_string();
+        assert!(
+            error.contains("not a directory or a regular file"),
+            "{error}"
+        );
     }
 }

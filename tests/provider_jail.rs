@@ -139,7 +139,9 @@ unsafe extern "C" {
 /// The per-user cache directory the platform reports for the running
 /// user, which lives under the per-user temporary root. Asked of the
 /// platform directly, so the control targets the real cache root and
-/// never a guess at it.
+/// never a guess at it. A confined test environment has been seen to
+/// answer with an I/O error; that is an environment block, and the
+/// failure says so by name so a reader classifies it correctly.
 fn user_cache_root() -> PathBuf {
     const DARWIN_USER_CACHE_DIR: std::ffi::c_int = 65538;
     let mut buffer = vec![0u8; 1024];
@@ -152,11 +154,20 @@ fn user_cache_root() -> PathBuf {
             buffer.len(),
         )
     };
+    if written == 0 || written > buffer.len() {
+        let reason = std::io::Error::last_os_error();
+        panic!(
+            "environment-blocked: the platform did not report the per-user cache directory \
+             (confstr failed: {reason}); the escape battery needs a host where the per-user \
+             temporary root is reachable, which a confined test environment may not be"
+        );
+    }
+    let reported = PathBuf::from(String::from_utf8(buffer[..written - 1].to_vec()).unwrap());
     assert!(
-        written > 1 && written <= buffer.len(),
-        "the platform reports the per-user cache directory"
+        reported.is_dir(),
+        "environment-blocked: the reported per-user cache directory does not exist"
     );
-    PathBuf::from(String::from_utf8(buffer[..written - 1].to_vec()).unwrap())
+    reported
 }
 
 /// A file in the real home that exists, for the shell-profile control:
@@ -258,6 +269,39 @@ fn every_escape_control_is_denied_by_name_under_the_provider_jail() {
     }
     let _ = fs::remove_file(home.join(".text-mirror-control-profile"));
     let _ = fs::remove_dir_all(&profile_dir);
+}
+
+#[test]
+fn a_granted_file_that_stops_being_a_regular_file_is_refused_without_being_named() {
+    // A granted executable swapped for a directory between the
+    // parent's own checks and the spawn refuses the run, and the
+    // refusal names the fault and never the path: this message is the
+    // one a record would carry.
+    let provider = FakeProvider::new(&[(64, 48)]);
+    let runner = provider_runner(&provider, brisk_limits());
+    fs::remove_file(provider.raster_path()).unwrap();
+    fs::create_dir_all(provider.raster_path()).unwrap();
+    let error = runner
+        .run("harness-spawn-probe", serde_json::json!({}), &[])
+        .expect_err("a directory in place of a granted file must refuse");
+    assert_eq!(error.code, "adapter_spawn_error");
+    assert!(
+        error
+            .message
+            .contains("executable grant 1 of 2 is not a literal regular file"),
+        "{}",
+        error.message
+    );
+    assert!(!error.message.contains('/'), "{}", error.message);
+    // A link in its place is refused the same way, and named the
+    // same way.
+    fs::remove_dir_all(provider.raster_path()).unwrap();
+    std::os::unix::fs::symlink(provider.encoder_path(), provider.raster_path()).unwrap();
+    let error = runner
+        .run("harness-spawn-probe", serde_json::json!({}), &[])
+        .expect_err("a link in place of a granted file must refuse");
+    assert_eq!(error.code, "adapter_spawn_error");
+    assert!(!error.message.contains('/'), "{}", error.message);
 }
 
 #[test]

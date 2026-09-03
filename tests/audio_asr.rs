@@ -184,6 +184,52 @@ fn a_wired_runtime_that_mismatches_its_pin_is_refused_by_the_worker() {
     );
 }
 
+#[test]
+fn a_record_never_carries_a_component_of_a_runtime_path() {
+    // The wired engine is swapped for a directory after the rules were
+    // built and before the run: the runner's own spawn-time
+    // re-assertion refuses, and the record names the grant by its
+    // position and kind, never its path.
+    let setup = setup();
+    fs::write(setup.root.join("call.wav"), tone_wav()).unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let mut inventory = RuntimeInventory::empty();
+    for role in ["asr-cli", "asr-weights", "asr-probe"] {
+        let path = runtime_dir.path().join(role);
+        fs::write(&path, format!("stand-in bytes for {role}")).unwrap();
+        inventory.set(role, path.canonicalize().unwrap()).unwrap();
+    }
+    let rules = Rules::builtin_with_inventory(&inventory).unwrap();
+    let engine = runtime_dir.path().join("asr-cli");
+    fs::remove_file(&engine).unwrap();
+    fs::create_dir_all(&engine).unwrap();
+    run_with(&setup, &rules);
+    let record = terminal(&setup, "call.wav");
+    assert_eq!(record.status, Status::Failed);
+    let error = record.error.clone().unwrap_or_default();
+    assert!(error.starts_with("adapter_spawn_error"), "{error}");
+    assert!(
+        error.contains("executable grant 1 of 2 is not a literal regular file"),
+        "{error}"
+    );
+    let mut text = error;
+    text.extend(record.warnings.iter().cloned());
+    assert!(!text.contains('/'), "{text}");
+    for component in runtime_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .filter(|c| c.len() > 3)
+    {
+        assert!(
+            !text.contains(component),
+            "{component} reached the record: {text}"
+        );
+    }
+}
+
 // --- the fake engine stage -------------------------------------------
 
 #[test]

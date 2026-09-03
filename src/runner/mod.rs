@@ -174,12 +174,11 @@ pub fn locate_worker() -> Result<PathBuf, RunnerError> {
         if candidate.is_file() {
             return candidate
                 .canonicalize()
-                .map_err(|e| missing(format!("cannot canonicalize {}: {e}", candidate.display())));
+                .map_err(|e| missing(format!("cannot resolve the worker binary: {e}")));
         }
     }
     Err(missing(format!(
-        "no {WORKER_BINARY} beside {}",
-        current.display()
+        "no {WORKER_BINARY} beside the current executable"
     )))
 }
 
@@ -349,13 +348,34 @@ impl Runner {
         // saw, so a path swapped for a directory or a symlink between
         // configuration and spawn refuses the run instead of widening
         // the jail.
-        for grant in self.exec_grants.iter().chain(self.read_grants.iter()) {
+        // The refusal names the grant by its kind and position and the
+        // fault, never the path: this message reaches the record of
+        // whatever was being converted, and a deployment path does not
+        // belong there.
+        let grants = self
+            .exec_grants
+            .iter()
+            .enumerate()
+            .map(|(index, grant)| {
+                (
+                    format!(
+                        "executable grant {} of {}",
+                        index + 1,
+                        self.exec_grants.len()
+                    ),
+                    grant,
+                )
+            })
+            .chain(self.read_grants.iter().enumerate().map(|(index, grant)| {
+                (
+                    format!("read grant {} of {}", index + 1, self.read_grants.len()),
+                    grant,
+                )
+            }));
+        for (label, grant) in grants {
             let refuse = |detail: &str| RunnerError {
                 code: "adapter_spawn_error",
-                message: format!(
-                    "grant {} is not a literal regular file: {detail}",
-                    grant.display()
-                ),
+                message: format!("{label} is not a literal regular file: {detail}"),
             };
             match std::fs::symlink_metadata(grant) {
                 Ok(metadata) if metadata.file_type().is_file() => {}
@@ -817,5 +837,107 @@ mod tests {
             .expect("a failed measurement is a verdict");
         assert_eq!(failed.code, "memory-monitor-failed");
         assert!(failed.message.contains("query broke"));
+    }
+}
+
+/// Every runner error message can reach a record, so none may carry a
+/// path. This reads the runner's own sources and refuses any error
+/// construction, or any message handed to a refusal closure, that
+/// renders a path or names a path-carrying variable. Runtime tests
+/// cover the sites a test can trigger; this covers all of them.
+#[cfg(test)]
+mod message_audit_tests {
+    const SOURCES: [(&str, &str); 4] = [
+        ("mod.rs", include_str!("mod.rs")),
+        ("jail.rs", include_str!("jail.rs")),
+        ("macos.rs", include_str!("macos.rs")),
+        ("linux.rs", include_str!("linux.rs")),
+    ];
+
+    /// The spellings a path takes when it is rendered into a message.
+    const RENDERINGS: [&str; 4] = ["display()", "to_string_lossy(", "{text", "{path"];
+
+    /// Variables in the runner that hold a path, which no message may
+    /// interpolate.
+    const PATH_VARIABLES: [&str; 8] = [
+        "{grant",
+        "{closure",
+        "{worker",
+        "{candidate",
+        "{current",
+        "{target",
+        "{jail",
+        "{dir",
+    ];
+
+    /// Every error construction site and every refusal-closure call in
+    /// one source, as the text of the site.
+    fn sites(source: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for needle in [
+            "RunnerError {",
+            "refuse(",
+            "missing(",
+            "probe_bind_error(",
+            "drift(",
+        ] {
+            let mut from = 0;
+            while let Some(at) = source[from..].find(needle) {
+                let start = from + at;
+                // The site runs to the matching close of the brace or
+                // parenthesis that opens it.
+                let open = source[start..].find(['{', '(']).map(|i| start + i).unwrap();
+                let (opener, closer) = if source.as_bytes()[open] == b'{' {
+                    ('{', '}')
+                } else {
+                    ('(', ')')
+                };
+                let mut depth = 0usize;
+                let mut end = open;
+                for (offset, ch) in source[open..].char_indices() {
+                    if ch == opener {
+                        depth += 1;
+                    } else if ch == closer {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + offset + ch.len_utf8();
+                            break;
+                        }
+                    }
+                }
+                found.push(source[start..end].to_string());
+                from = end.max(start + needle.len());
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn no_runner_error_message_renders_a_path() {
+        let mut audited = 0;
+        for (name, source) in SOURCES {
+            for site in sites(source) {
+                // The audit reads the sites, not itself.
+                if site.contains("RENDERINGS") || site.contains("PATH_VARIABLES") {
+                    continue;
+                }
+                audited += 1;
+                for rendering in RENDERINGS {
+                    assert!(
+                        !site.contains(rendering),
+                        "{name}: a runner error renders a path with {rendering}: {site}"
+                    );
+                }
+                for variable in PATH_VARIABLES {
+                    assert!(
+                        !site.contains(variable),
+                        "{name}: a runner error interpolates {variable}: {site}"
+                    );
+                }
+            }
+        }
+        // The audit saw the sites it exists for: the grant re-assertion
+        // and the closure refusals among them.
+        assert!(audited >= 40, "only {audited} sites audited");
     }
 }
